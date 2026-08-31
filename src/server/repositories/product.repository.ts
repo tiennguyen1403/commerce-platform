@@ -63,6 +63,24 @@ export const productRepository = {
     });
   },
 
+  /**
+   * Read variants by id, scoped to the tenant through the product relation
+   * (`ProductVariant` has no `tenantId` of its own). Powers the cart/checkout
+   * re-pricing: a foreign or unknown id simply doesn't come back. Includes the
+   * minimal parent-product fields the caller needs to price the line and to drop
+   * a variant whose product is no longer purchasable.
+   */
+  findVariantsForTenant(tenantId: string, ids: string[]) {
+    return prisma.productVariant.findMany({
+      where: { id: { in: ids }, product: { tenantId } },
+      include: {
+        product: {
+          select: { id: true, title: true, slug: true, status: true },
+        },
+      },
+    });
+  },
+
   /** Create a product and its variants in one atomic write. */
   async createWithVariants(tenantId: string, input: ProductInput) {
     try {
