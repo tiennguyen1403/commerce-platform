@@ -8,6 +8,16 @@ Deep references: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
 
 @AGENTS.md
 
+## Evidence-first (the meta-rule)
+
+Every claim you make must be backed by **evidence you just gathered** — the actual source
+code (read it, cite `path:line`) or a fresh web/docs lookup. Never guess, speculate, or
+answer from memory/training. **Source code is the ground truth** — it was reviewed on the
+way in and is what ships; docs and memory can be stale, so when they disagree with the
+code, the code wins. Verify any library/API/version behavior against the installed version
+(read `node_modules`/`package.json` or fetch current docs), not recollection. If you don't
+know, go read or search — don't invent. This binds every agent.
+
 ## Golden rules (non-negotiable)
 
 1. **Tenant isolation** — every business table has `tenantId`; every query is scoped by
@@ -82,8 +92,9 @@ lucide icons (no emoji) · accessible by default (labels, visible focus, AA cont
 
 ## Workflow
 
-- Trunk is `main` (**protected**: PR + green CI required). Branch per task:
-  `feat/…`, `fix/…`, `chore/…`, `docs/…`.
+- **Branches:** `development` is the working **trunk** (default branch; protected: PR +
+  green CI). `main` is **release-only** (protected). Branch per task off `development`:
+  `feat/…`, `fix/…`, `chore/…`, `docs/…`. Release = PR `development` → `main` + tag `vM<n>`.
 - **Daily loop** — `/task`: pick a GitHub issue → branch → plan → build → test →
   typecheck/lint → open PR linking the issue.
 - **Milestones** — `/milestone-start` (research → plan → issues) → build →
@@ -104,4 +115,4 @@ lucide icons (no emoji) · accessible by default (labels, visible focus, AA cont
 Don't call Prisma outside repositories · don't cross tenant boundaries · don't use floats
 for money · don't import `src/server/**` into client components · don't commit secrets or
 `.env` · don't edit applied migrations · don't add heavy dependencies without noting why ·
-don't bypass the PR/CI flow on `main`.
+don't bypass the PR/CI flow on `development` or `main`.

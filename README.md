@@ -4,8 +4,9 @@ A production-grade, **multi-tenant e-commerce platform** — storefront, admin, 
 a pluggable fulfillment engine — built end-to-end. Each store is an isolated
 tenant, so the same codebase can run one shop or many.
 
-> Status: **Phase 0 — foundations.** Storefront, checkout, and admin land in
-> Phases 1–2 (see [Roadmap](#roadmap)).
+> Status: **Phase 1 — commerce slice, shipped.** A shopper browses the catalog and
+> completes a Stripe test-mode checkout; an admin manages products behind auth.
+> Production-grade hardening is **Phase 2** (see [Roadmap](#roadmap)).
 
 ## Tech stack
 
@@ -67,6 +68,26 @@ pnpm dev                    # http://localhost:3000
 
 Health check: <http://localhost:3000/api/health>
 
+### Testing Stripe webhooks locally
+
+The webhook — not the browser redirect — is what marks an order `PAID`, so it
+needs the [Stripe CLI](https://docs.stripe.com/stripe-cli) to reach `localhost`:
+
+```bash
+stripe login                                                   # once, links the CLI to your test-mode account
+stripe listen --forward-to localhost:3000/api/webhooks/stripe  # prints a whsec_… signing secret
+```
+
+Copy the printed `whsec_…` into `STRIPE_WEBHOOK_SECRET` in `.env` and restart
+`pnpm dev`. Then drive a real test-mode checkout, or fire a synthetic event:
+
+```bash
+stripe trigger payment_intent.succeeded
+```
+
+A duplicate delivery is a safe no-op — replaying the same event leaves the order
+`PAID` and never double-processes.
+
 ## Scripts
 
 | Script            | Description                  |
@@ -83,8 +104,8 @@ Health check: <http://localhost:3000/api/health>
 ## Roadmap
 
 - **Phase 0 — Foundations** ✅ repo, CI, DB, auth skeleton, deployable.
-- **Phase 1 — Commerce slice:** catalog, storefront, cart, Stripe checkout, order
-  confirmation, basic admin.
+- **Phase 1 — Commerce slice** ✅ catalog, storefront, cart, Stripe checkout, order
+  confirmation, admin.
 - **Phase 2 — Production-grade:** RBAC, analytics dashboard, inventory, webhook
   order state machine, search, tests, observability.
 - **Phase 3 — Platform:** true multi-tenant (subdomains, theming, onboarding,
