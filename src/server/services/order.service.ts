@@ -6,6 +6,7 @@ import {
   orderRepository,
   type CreateOrderInput,
   type OrderWithItems,
+  type StockShortfall,
 } from "@/server/repositories/order.repository";
 import { EmptyCartError, OrderNumberTakenError } from "@/server/order.errors";
 import type { CartLine } from "@/lib/cart";
@@ -41,6 +42,13 @@ export type CheckoutResult = {
     ReturnType<typeof orderRepository.findByPaymentIntentForTenant>
   >;
 };
+
+/** Result of confirming payment from a webhook (see `markOrderPaid`). `"paid"`
+ *  carries the newly-paid order (for the confirmation email) and any oversell
+ *  `shortfalls` the atomic stock decrement couldn't fill. */
+export type MarkOrderPaidResult =
+  | { outcome: "paid"; order: OrderWithItems; shortfalls: StockShortfall[] }
+  | { outcome: "already-processed" | "no-order" };
 
 // Human-friendly, unambiguous order-number suffix: no 0/1/I/O to misread.
 const ORDER_NUMBER_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -210,19 +218,21 @@ export const orderService = {
   },
 
   /**
-   * Confirm payment for an order from a verified Stripe webhook: move it from
-   * PENDING to PAID. This — not the browser redirect — is the source of truth
+   * Confirm payment for an order from a verified Stripe webhook: atomically move
+   * it PENDING → PAID and decrement its lines' stock (the repository does both in
+   * one transaction). This — not the browser redirect — is the source of truth
    * for "paid." Idempotency lives in the repository's atomic status guard, so
    * calling this for a duplicate/late event (or an unknown PaymentIntent) is a
-   * safe no-op. The outcome is reported three ways so the webhook can log each
-   * distinctly:
+   * safe no-op that neither re-emails nor double-decrements. The outcome is
+   * reported three ways so the webhook can log each distinctly:
    *  - `"paid"` — this delivery made the PENDING → PAID transition. It carries
-   *    the confirmed `order` (with items): the single moment the confirmation
-   *    email (#15) hangs off. Only this one delivery sends, so Stripe's retries
-   *    never duplicate it — at most once per order (a swallowed send failure is
-   *    not retried; durable delivery is a later outbox concern).
+   *    the confirmed `order` (with items) — the single moment the confirmation
+   *    email (#15) hangs off — plus `shortfalls`: any line whose stock couldn't
+   *    cover it at capture (an oversell). The order still stands PAID; the
+   *    shortfalls are for the webhook to flag for manual refund/review. Only this
+   *    one delivery reports "paid", so Stripe's retries never duplicate it.
    *  - `"already-processed"` — the order exists but was past PENDING already
-   *    (a normal duplicate/late delivery); nothing to do.
+   *    (a normal duplicate/late delivery); nothing to do, no stock touched.
    *  - `"no-order"` — no order matches this PaymentIntent for the tenant. The
    *    order is written before the client can confirm, so a genuinely paid
    *    intent should always have one; this signals data drift worth a warning.
@@ -230,33 +240,27 @@ export const orderService = {
   async markOrderPaid(
     tenantId: string,
     paymentIntentId: string,
-  ): Promise<
-    | { outcome: "paid"; order: OrderWithItems }
-    | { outcome: "already-processed" | "no-order" }
-  > {
-    const transitioned = await orderRepository.markPaidByPaymentIntent(
+  ): Promise<MarkOrderPaidResult> {
+    const result = await orderRepository.markPaidByPaymentIntent(
       tenantId,
       paymentIntentId,
     );
 
-    // One read serves both paths: on a transition it supplies the order the
-    // webhook emails a confirmation for; on a non-transition it tells a normal
-    // duplicate (order past PENDING) apart from the anomaly of a paid intent
-    // with no order row.
-    const order = await orderRepository.findByPaymentIntentForTenant(
-      tenantId,
-      paymentIntentId,
-    );
-
-    if (transitioned) {
-      // We just moved this order to PAID, so the row is there barring a delete
-      // in the sub-millisecond gap. If it somehow vanished there's nothing to
-      // email — report it processed rather than invent a "paid" with no order.
-      return order
-        ? { outcome: "paid", order }
-        : { outcome: "already-processed" };
+    if (result.transitioned) {
+      // This delivery flipped the order to PAID and allocated its stock in one
+      // transaction; `order` is what we email, `shortfalls` any oversell to flag.
+      return {
+        outcome: "paid",
+        order: result.order,
+        shortfalls: result.shortfalls,
+      };
     }
 
-    return { outcome: order ? "already-processed" : "no-order" };
+    // Nothing moved, and the repository already told us which case from inside
+    // its transaction: a normal duplicate/late delivery (order past PENDING) or
+    // — anomalously — no order for this intent. No second read, no stock touched.
+    return {
+      outcome: result.orderExisted ? "already-processed" : "no-order",
+    };
   },
 };

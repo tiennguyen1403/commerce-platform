@@ -47,6 +47,29 @@ function mapWriteError(err: unknown): never {
   throw err;
 }
 
+/** A paid order's line that couldn't be fully allocated from stock at capture
+ *  time (an oversell): the units were sold but weren't on hand. Surfaced so the
+ *  webhook can flag it for manual refund/review — never silently dropped. */
+export type StockShortfall = {
+  variantId: string;
+  /** The line's snapshotted name, for a human-readable alert. */
+  titleSnapshot: string;
+  /** Units the paid order needs on this line. */
+  ordered: number;
+  /** Units actually on hand at capture — what the `stock >= qty` guard found
+   *  too few of (the line's stock is left untouched, so this is that figure). */
+  available: number;
+};
+
+/** Outcome of the atomic mark-paid + stock-allocation transaction.
+ *  `transitioned: false` — nothing moved; `orderExisted` tells an already-processed
+ *  order (true) apart from an unknown intent (false), sparing the caller a re-read.
+ *  `transitioned: true` — this call made the PENDING → PAID transition, carrying
+ *  the paid `order` (with items) and any `shortfalls` the decrement couldn't fill. */
+export type MarkPaidResult =
+  | { transitioned: false; orderExisted: boolean }
+  | { transitioned: true; order: OrderWithItems; shortfalls: StockShortfall[] };
+
 export const orderRepository = {
   /**
    * Create an order and its line items in one atomic write. Prisma runs the
@@ -98,24 +121,121 @@ export const orderRepository = {
   },
 
   /**
-   * Flip a tenant's order from PENDING to PAID for the given PaymentIntent, and
-   * report whether this call is the one that did it. The `status: "PENDING"`
-   * clause lives in the WHERE, so the guard and the write are a single atomic
-   * statement — this is the webhook's idempotency point. A duplicate delivery
-   * (or two deliveries racing) finds no PENDING row and updates nothing, so an
-   * order is never double-processed and can never regress out of a later state
-   * (FULFILLED/REFUNDED). Returns true only for the single delivery that moved
-   * PENDING → PAID; false for an already-processed intent or an unknown one.
+   * Confirm payment for an order and allocate its inventory, atomically. In one
+   * transaction this (a) flips the tenant's order PENDING → PAID for the given
+   * PaymentIntent and (b) decrements each line's variant stock. The
+   * `status: "PENDING"` guard on the flip is the webhook's idempotency point:
+   * only the single delivery that finds the order PENDING transitions it, so a
+   * duplicate/late/racing event flips nothing and — sharing this transaction —
+   * decrements nothing. No double-processing, no double-decrement, and the order
+   * can never regress out of a later state (FULFILLED/REFUNDED).
+   *
+   * Stock allocation lives here rather than the product repository because it
+   * must share the flip's transaction. Each line is decremented with an atomic
+   * guarded write (`stock >= quantity`), so it applies fully or not at all and
+   * stock can never go negative. If the units aren't there at capture (another
+   * shopper took the last of them during the payment window), that line is left
+   * untouched and returned as a `shortfall` — the order still stands PAID (the
+   * payment is real), and the caller surfaces the shortfall for manual review.
+   * (Automated refund/backorder and reserve-at-PENDING with an expiry sweep are
+   * follow-ups; this covers oversell at capture without ever corrupting stock.)
+   *
+   * Returns `{ transitioned: false, orderExisted }` when nothing moved —
+   * `orderExisted` separates an already-processed intent from an unknown one so
+   * the service needn't re-read — or `{ transitioned: true, order, shortfalls }`
+   * for the one delivery that made the transition (the paid order feeds the
+   * confirmation email; shortfalls flag any oversell).
    */
   async markPaidByPaymentIntent(
     tenantId: string,
     stripePaymentIntentId: string,
-  ): Promise<boolean> {
-    const { count } = await prisma.order.updateMany({
-      where: { tenantId, stripePaymentIntentId, status: "PENDING" },
-      data: { status: "PAID" },
-    });
-    return count > 0;
+  ): Promise<MarkPaidResult> {
+    return prisma.$transaction(
+      async (tx) => {
+        // Read the candidate order (with its lines) inside the transaction: the
+        // lines drive stock allocation, and the row's presence lets the service
+        // tell a real order from none. Reading PENDING here is NOT the guard — the
+        // conditional flip below is — so a concurrent delivery seeing the same
+        // PENDING row changes nothing.
+        const order = await tx.order.findFirst({
+          where: { tenantId, stripePaymentIntentId },
+          // Order the lines by variantId so the guarded decrements below always
+          // lock variant rows in a consistent global order: two orders paid at
+          // once that share variants then can't deadlock by locking the same rows
+          // in opposite orders (Postgres would abort one — self-healing via the
+          // webhook retry, but noisy and it delays the PAID/email under load).
+          include: { items: { orderBy: { variantId: "asc" } } },
+        });
+        if (!order) return { transitioned: false, orderExisted: false };
+
+        // Atomic guarded flip — the idempotency point. Under READ COMMITTED the
+        // row locks on UPDATE, so of two racing deliveries exactly one still sees
+        // `status: "PENDING"` and gets count 1; the other re-checks the committed
+        // row (now PAID), matches nothing, and gets count 0. Exactly-once decrement
+        // rests on PENDING → PAID being a one-way door: nothing resets an order to
+        // PENDING, so this guard can never re-arm and decrement stock twice.
+        const { count } = await tx.order.updateMany({
+          where: { id: order.id, tenantId, status: "PENDING" },
+          data: { status: "PAID" },
+        });
+        // The order exists but wasn't PENDING (already processed, or lost the
+        // race). Report that it existed so the service needn't re-read to tell
+        // this normal duplicate apart from a genuinely missing order.
+        if (count === 0) return { transitioned: false, orderExisted: true };
+
+        // We own the transition — allocate inventory in the same transaction. A
+        // line whose stock can't cover its quantity is collected as a shortfall
+        // (oversell) rather than forced negative.
+        const short: Array<Omit<StockShortfall, "available">> = [];
+        for (const item of order.items) {
+          const { count: decremented } = await tx.productVariant.updateMany({
+            // Tenant-scoped through the product relation (a variant carries no
+            // tenantId) — defence in depth on top of the order's tenant scope.
+            // `stock >= quantity` is the oversell guard: never decrement below 0.
+            where: {
+              id: item.variantId,
+              product: { tenantId },
+              stock: { gte: item.quantity },
+            },
+            data: { stock: { decrement: item.quantity } },
+          });
+          if (decremented === 0) {
+            short.push({
+              variantId: item.variantId,
+              titleSnapshot: item.titleSnapshot,
+              ordered: item.quantity,
+            });
+          }
+        }
+
+        // Enrich any shortfalls with the current on-hand count so the oversell
+        // alert is actionable. Only the (rare) oversell path pays for this read.
+        // Best-effort: it reads the latest committed stock (a concurrent order may
+        // have moved it since the failed guard) and only ever feeds a log line —
+        // never control flow — so an approximate figure is fine.
+        let shortfalls: StockShortfall[] = [];
+        if (short.length > 0) {
+          const variants = await tx.productVariant.findMany({
+            where: {
+              id: { in: short.map((s) => s.variantId) },
+              product: { tenantId },
+            },
+            select: { id: true, stock: true },
+          });
+          const stockById = new Map(variants.map((v) => [v.id, v.stock]));
+          shortfalls = short.map((s) => ({
+            ...s,
+            available: stockById.get(s.variantId) ?? 0,
+          }));
+        }
+
+        return { transitioned: true, order, shortfalls };
+      },
+      // Up to MAX_CART_LINES guarded decrements run sequentially in this
+      // interactive transaction; lift the default 5s cap so a large order on a
+      // high-latency managed Postgres can't time out part-way through allocation.
+      { timeout: 15_000 },
+    );
   },
 };
 
