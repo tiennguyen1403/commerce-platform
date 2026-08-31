@@ -1,36 +1,92 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Commerce Platform
 
-## Getting Started
+A production-grade, **multi-tenant e-commerce platform** — storefront, admin, and
+a pluggable fulfillment engine — built end-to-end. Each store is an isolated
+tenant, so the same codebase can run one shop or many.
 
-First, run the development server:
+> Status: **Phase 0 — foundations.** Storefront, checkout, and admin land in
+> Phases 1–2 (see [Roadmap](#roadmap)).
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## Tech stack
+
+| Layer       | Choice                                                        |
+| ----------- | ------------------------------------------------------------- |
+| Framework   | Next.js 16 (App Router) + React 19 + TypeScript               |
+| Styling     | Tailwind CSS v4                                               |
+| Database    | PostgreSQL + Prisma ORM                                       |
+| Auth        | Better Auth (email/password, RBAC)                            |
+| Payments    | Stripe (Payment Intents + webhooks)                           |
+| Fulfillment | Provider interface (Printful/POD adapter)                     |
+| Tooling     | ESLint, Prettier, Vitest/Playwright (planned), GitHub Actions |
+
+## Architecture
+
+```
+src/
+├─ app/
+│  ├─ (storefront)/        # public store routes (Phase 1)
+│  ├─ (admin)/admin/       # admin dashboard
+│  └─ api/                 # route handlers (auth, health, Stripe webhooks)
+├─ components/ui/          # UI primitives
+├─ server/                 # backend-only (never imported by client)
+│  ├─ db.ts                # Prisma singleton
+│  ├─ auth/                # Better Auth config + client
+│  ├─ repositories/        # data access — always scoped by tenantId
+│  ├─ services/            # business logic
+│  └─ fulfillment/         # provider interface + adapters
+├─ lib/                    # env, stripe, utils
+└─ config/                 # roles, constants
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+**Rules of the road**
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- Every business table carries `tenantId`; repositories always scope by it.
+- Routes/pages call **services**, services call **repositories**, repositories
+  are the only place that touches Prisma.
+- Money is stored as integer cents.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Getting started
 
-## Learn More
+```bash
+# 1. Install dependencies
+pnpm install
 
-To learn more about Next.js, take a look at the following resources:
+# 2. Configure environment
+cp .env.example .env        # then edit values
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+# 3. Start Postgres (Docker)
+docker compose up -d
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+# 4. Run migrations + seed demo data
+pnpm db:migrate
+pnpm db:seed
 
-## Deploy on Vercel
+# 5. Run the app
+pnpm dev                    # http://localhost:3000
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Health check: <http://localhost:3000/api/health>
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Scripts
+
+| Script            | Description                  |
+| ----------------- | ---------------------------- |
+| `pnpm dev`        | Start the dev server         |
+| `pnpm build`      | Production build             |
+| `pnpm lint`       | ESLint                       |
+| `pnpm typecheck`  | TypeScript, no emit          |
+| `pnpm format`     | Prettier write               |
+| `pnpm db:migrate` | Create/apply a dev migration |
+| `pnpm db:studio`  | Open Prisma Studio           |
+| `pnpm db:seed`    | Seed demo tenant + products  |
+
+## Roadmap
+
+- **Phase 0 — Foundations** ✅ repo, CI, DB, auth skeleton, deployable.
+- **Phase 1 — Commerce slice:** catalog, storefront, cart, Stripe checkout, order
+  confirmation, basic admin.
+- **Phase 2 — Production-grade:** RBAC, analytics dashboard, inventory, webhook
+  order state machine, search, tests, observability.
+- **Phase 3 — Platform:** true multi-tenant (subdomains, theming, onboarding,
+  Stripe Connect).
+- **Phase 4 — Fulfillment:** Printful/POD integration, tracking sync, polish.

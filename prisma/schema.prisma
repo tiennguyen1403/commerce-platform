@@ -1,0 +1,204 @@
+// Prisma schema — multi-tenant e-commerce platform
+// Every business table carries `tenantId`; repositories always scope by it so
+// one store can never read another store's data.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy & access control
+// ---------------------------------------------------------------------------
+
+/// One store = one tenant.
+model Tenant {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships Membership[]
+  products    Product[]
+  orders      Order[]
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  STAFF
+}
+
+/// Links a user to a tenant with a role (RBAC).
+model Membership {
+  id        String   @id @default(cuid())
+  role      Role     @default(STAFF)
+  userId    String
+  tenantId  String
+  createdAt DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tenantId])
+  @@index([tenantId])
+}
+
+// ---------------------------------------------------------------------------
+// Auth (Better Auth core models)
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id
+  name          String
+  email         String   @unique
+  emailVerified Boolean  @default(false)
+  image         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  sessions    Session[]
+  accounts    Account[]
+  memberships Membership[]
+}
+
+model Session {
+  id        String   @id
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  userId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+model Product {
+  id          String        @id @default(cuid())
+  tenantId    String
+  title       String
+  slug        String
+  description String?
+  status      ProductStatus @default(DRAFT)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  variants ProductVariant[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+}
+
+model ProductVariant {
+  id         String   @id @default(cuid())
+  productId  String
+  sku        String
+  name       String
+  // Money is stored as integer minor units (cents) to avoid float errors.
+  priceCents Int
+  currency   String   @default("usd")
+  stock      Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@unique([productId, sku])
+  @@index([productId])
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FULFILLED
+  CANCELLED
+  REFUNDED
+}
+
+model Order {
+  id                    String      @id @default(cuid())
+  tenantId              String
+  orderNumber           String
+  status                OrderStatus @default(PENDING)
+  email                 String
+  totalCents            Int
+  currency              String      @default("usd")
+  stripePaymentIntentId String?     @unique
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  tenant Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  items  OrderItem[]
+
+  @@unique([tenantId, orderNumber])
+  @@index([tenantId])
+}
+
+model OrderItem {
+  id            String @id @default(cuid())
+  orderId       String
+  variantId     String
+  // Snapshot title/price at purchase time so later catalog edits don't rewrite history.
+  titleSnapshot String
+  priceCents    Int
+  quantity      Int
+
+  order   Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+}
