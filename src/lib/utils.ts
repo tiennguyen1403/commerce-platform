@@ -13,3 +13,18 @@ export function formatMoney(cents: number, currency = "usd") {
     currency: currency.toUpperCase(),
   }).format(cents / 100);
 }
+
+/**
+ * Derive a URL-safe slug from arbitrary text: lowercase, decompose accents via
+ * NFKD, then collapse every run of non-alphanumeric characters (the leftover
+ * combining marks included) into single hyphens. Used to suggest a product slug
+ * from its title; the value stays user-editable.
+ */
+export function slugify(input: string) {
+  return input
+    .normalize("NFKD")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
