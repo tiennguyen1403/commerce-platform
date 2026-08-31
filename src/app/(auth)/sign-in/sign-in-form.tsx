@@ -18,10 +18,12 @@ export function SignInForm({ redirectTo }: { redirectTo: string }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [invalidField, setInvalidField] = useState<string | null>(null);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
+    setInvalidField(null);
 
     const form = new FormData(event.currentTarget);
     const parsed = schema.safeParse({
@@ -29,7 +31,9 @@ export function SignInForm({ redirectTo }: { redirectTo: string }) {
       password: form.get("password"),
     });
     if (!parsed.success) {
-      setError(parsed.error.issues[0]?.message ?? "Check your details.");
+      const issue = parsed.error.issues[0];
+      setInvalidField((issue?.path[0] as string) ?? null);
+      setError(issue?.message ?? "Check your details.");
       return;
     }
 
@@ -55,6 +59,7 @@ export function SignInForm({ redirectTo }: { redirectTo: string }) {
           type="email"
           autoComplete="email"
           placeholder="you@example.com"
+          aria-invalid={invalidField === "email" || undefined}
           required
         />
       </div>
@@ -65,6 +70,7 @@ export function SignInForm({ redirectTo }: { redirectTo: string }) {
           name="password"
           type="password"
           autoComplete="current-password"
+          aria-invalid={invalidField === "password" || undefined}
           required
         />
       </div>

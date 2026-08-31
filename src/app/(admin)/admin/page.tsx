@@ -21,11 +21,8 @@ export default async function AdminHome() {
           <Package />
           Manage products
         </Link>
-        <Link
-          href="/"
-          className="inline-flex w-fit items-center gap-1 text-sm font-medium underline underline-offset-4"
-        >
-          <ArrowLeft className="size-4" />
+        <Link href="/" className={buttonVariants({ variant: "ghost" })}>
+          <ArrowLeft />
           Back to storefront
         </Link>
       </div>
