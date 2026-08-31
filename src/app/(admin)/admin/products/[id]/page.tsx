@@ -41,6 +41,9 @@ export default async function EditProductPage({
       price: (v.priceCents / 100).toFixed(2),
       currency: toCurrency(v.currency),
       stock: String(v.stock),
+      // A variant already referenced by an order can't be deleted; the form
+      // disables its Remove button so the admin never hits that dead-end.
+      hasOrders: v._count.orderItems > 0,
     })),
   };
 

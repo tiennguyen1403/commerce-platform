@@ -45,6 +45,9 @@ type VariantRow = {
   price: string;
   currency: CurrencyValue;
   stock: string;
+  // True when this variant already appears in an order. Such variants can't be
+  // deleted (the server refuses it), so the row's Remove button is disabled.
+  hasOrders?: boolean;
 };
 
 export type ProductFormInitialVariant = {
@@ -54,6 +57,7 @@ export type ProductFormInitialVariant = {
   price: string;
   currency: CurrencyValue;
   stock: string;
+  hasOrders?: boolean;
 };
 
 export type ProductFormValues = {
@@ -352,21 +356,40 @@ export function ProductForm({
                 key={row.key}
                 className="border-border flex flex-col gap-4 rounded-lg border p-4"
               >
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <span className="text-muted-foreground text-sm font-medium">
                     Variant {index + 1}
                   </span>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => removeVariant(row.key)}
-                    disabled={variants.length === 1}
-                    aria-label={`Remove variant ${index + 1}`}
-                  >
-                    <Trash2 />
-                    Remove
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    {row.hasOrders ? (
+                      <span className="text-muted-foreground text-xs">
+                        Has orders
+                      </span>
+                    ) : null}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => removeVariant(row.key)}
+                      disabled={variants.length === 1 || Boolean(row.hasOrders)}
+                      // Encode the disabled reason in the accessible name: a
+                      // disabled button is out of tab order, but its name is
+                      // still exposed to screen readers browsing the form.
+                      aria-label={
+                        row.hasOrders
+                          ? `Remove variant ${index + 1} — unavailable, this variant has orders`
+                          : `Remove variant ${index + 1}`
+                      }
+                      title={
+                        row.hasOrders
+                          ? "This variant has orders and can't be removed."
+                          : undefined
+                      }
+                    >
+                      <Trash2 />
+                      Remove
+                    </Button>
+                  </div>
                 </div>
 
                 <div className="grid gap-4 sm:grid-cols-2">

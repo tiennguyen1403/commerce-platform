@@ -1,7 +1,11 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/server/db";
 import type { ProductInput } from "@/lib/validators/catalog";
-import { DuplicateSkuError, SlugTakenError } from "@/server/catalog.errors";
+import {
+  DuplicateSkuError,
+  SlugTakenError,
+  VariantInUseError,
+} from "@/server/catalog.errors";
 
 /**
  * Data-access for products. Every method is scoped by `tenantId` so a store
@@ -59,7 +63,15 @@ export const productRepository = {
   findByIdForTenant(tenantId: string, id: string) {
     return prisma.product.findFirst({
       where: { id, tenantId },
-      include: { variants: { orderBy: { createdAt: "asc" } } },
+      include: {
+        variants: {
+          orderBy: { createdAt: "asc" },
+          // `_count.orderItems` powers the editor's per-variant delete guard: a
+          // variant that already appears in an order can't be removed, so the
+          // form disables its Remove button up front instead of failing on save.
+          include: { _count: { select: { orderItems: true } } },
+        },
+      },
     });
   },
 
@@ -140,11 +152,27 @@ export const productRepository = {
           },
         });
 
-        // Delete variants the admin removed. An empty `keptIds` means every
-        // existing variant was replaced, so the filter drops them all.
-        // NOTE: this is a hard delete; `OrderItem.variant` is onDelete:Restrict,
-        // so once checkout exists a variant with orders can't be removed this
-        // way (tracked as a follow-up — variants aren't order-referenced yet).
+        // Refuse to remove a variant that already appears in an order:
+        // `OrderItem.variant` is onDelete:Restrict, so the delete below would
+        // otherwise fail with P2003 (mapped as a race backstop in mapWriteError).
+        // This pre-check runs in the same transaction and names the offending
+        // SKUs, so the admin gets a clear, field-level error — not a generic 500.
+        const removedInUse = await tx.productVariant.findMany({
+          where: {
+            productId: id,
+            ...(keptIds.length ? { id: { notIn: keptIds } } : {}),
+            orderItems: { some: {} },
+          },
+          select: { sku: true },
+          orderBy: { createdAt: "asc" },
+        });
+        if (removedInUse.length) {
+          throw new VariantInUseError(removedInUse.map((v) => v.sku));
+        }
+
+        // Delete the variants the admin removed. An empty `keptIds` means every
+        // existing variant was replaced, so the filter drops them all; only
+        // order-free variants reach here since the guard above rejected the rest.
         await tx.productVariant.deleteMany({
           where: {
             productId: id,
@@ -197,6 +225,17 @@ export const productRepository = {
         });
       });
     } catch (err) {
+      // Backstop for the pre-check above: if an order lands on a to-be-removed
+      // variant in the race between that check and the delete, Postgres refuses
+      // the delete (`OrderItem.variant` is onDelete:Restrict) and Prisma raises
+      // P2003. Only this delete path can hit a variant FK restriction, so the
+      // mapping is scoped here rather than in the shared unique-constraint mapper.
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === "P2003"
+      ) {
+        throw new VariantInUseError();
+      }
       mapWriteError(err);
     }
   },

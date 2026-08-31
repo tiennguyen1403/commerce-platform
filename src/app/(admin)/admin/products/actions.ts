@@ -8,6 +8,7 @@ import {
   DuplicateSkuError,
   ProductNotFoundError,
   SlugTakenError,
+  VariantInUseError,
 } from "@/server/services/catalog.service";
 import {
   productInputSchema,
@@ -45,6 +46,11 @@ function mapWriteError(err: unknown): ActionResult {
     return { ok: false, fieldErrors: { slug: err.message } };
   }
   if (err instanceof DuplicateSkuError) {
+    return { ok: false, fieldErrors: { variants: err.message } };
+  }
+  // A removed variant still has orders. It's no longer in the form (the admin
+  // deleted its row), so surface it on the variants section, not a single row.
+  if (err instanceof VariantInUseError) {
     return { ok: false, fieldErrors: { variants: err.message } };
   }
   if (err instanceof ProductNotFoundError) {
