@@ -118,3 +118,9 @@ export const orderRepository = {
     return count > 0;
   },
 };
+
+/** An order joined with its line items — the shape `findByPaymentIntentForTenant`
+ *  returns (never null). The one order type the webhook and email layer share. */
+export type OrderWithItems = NonNullable<
+  Awaited<ReturnType<typeof orderRepository.findByPaymentIntentForTenant>>
+>;

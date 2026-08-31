@@ -3,6 +3,8 @@ import type Stripe from "stripe";
 import { env } from "@/lib/env";
 import { getStripe } from "@/lib/stripe";
 import { orderService } from "@/server/services/order.service";
+import { emailService } from "@/server/services/email.service";
+import type { OrderWithItems } from "@/server/repositories/order.repository";
 
 /**
  * Stripe webhook — the authoritative "paid" signal.
@@ -31,6 +33,26 @@ import { orderService } from "@/server/services/order.service";
  * Copy the `whsec_...` the listener prints into `STRIPE_WEBHOOK_SECRET`.
  */
 
+/** Send the order-confirmation email without ever failing the webhook. By the
+ *  time we're here the payment has already succeeded, so a Resend outage or
+ *  misconfiguration must not turn this delivery into a retryable 500 — the PAID
+ *  order is the durable record and the email is best-effort. Log and move on. */
+async function sendConfirmationEmailSafely(
+  order: OrderWithItems,
+): Promise<void> {
+  try {
+    await emailService.sendOrderConfirmation(order);
+    console.info(
+      `Stripe webhook: confirmation email sent for order ${order.orderNumber}`,
+    );
+  } catch (err) {
+    console.error(
+      `Stripe webhook: failed to send confirmation email for order ${order.orderNumber}`,
+      err,
+    );
+  }
+}
+
 /** Move the matching Order to PAID. Best-effort logging only — the repository's
  *  guard, not this function, decides whether anything actually changed. */
 async function handlePaymentIntentSucceeded(
@@ -48,15 +70,16 @@ async function handlePaymentIntentSucceeded(
     return;
   }
 
-  const { outcome } = await orderService.markOrderPaid(
-    tenantId,
-    paymentIntent.id,
-  );
-  switch (outcome) {
+  const result = await orderService.markOrderPaid(tenantId, paymentIntent.id);
+  switch (result.outcome) {
     case "paid":
       console.info(
         `Stripe webhook: order for PaymentIntent ${paymentIntent.id} marked PAID`,
       );
+      // Hang the confirmation off this single PENDING → PAID transition: only
+      // this one delivery sends, so Stripe's retries never duplicate it (at
+      // most once per order — a swallowed send failure is not retried).
+      await sendConfirmationEmailSafely(result.order);
       break;
     case "already-processed":
       console.info(
