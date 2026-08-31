@@ -29,4 +29,4 @@ You (the main session) are the **central orchestrator**. There is no background 
 - Relay only what matters from each agent (their full output is not shown to the user).
 - Keep the human in the loop at forks: if agents surface an architectural decision, stop and ask.
 - For large, well-defined parallel build-outs, consider the **Workflow tool** (requires explicit user opt-in).
-- Respect the golden rules in `CLAUDE.md` at every step; never bypass the PR/CI flow on `main`.
+- Respect the golden rules in `CLAUDE.md` at every step; never bypass the PR/CI flow on `development`/`main`.

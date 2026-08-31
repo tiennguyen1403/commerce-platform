@@ -29,7 +29,7 @@ Stripe Connect payouts, fulfillment/POD (M4), full test suite (M2 hardening).
       client redirect), with correct line-item snapshots and total.
 - [ ] `/admin` is auth-protected; unauthenticated users are redirected.
 - [ ] Order confirmation email is sent on success.
-- [ ] `pnpm build`, `pnpm typecheck`, `pnpm lint` all green; CI passing on `main`.
+- [ ] `pnpm build`, `pnpm typecheck`, `pnpm lint` all green; CI passing on `development`.
 - [ ] Storefront pages are server-rendered with correct metadata (SEO).
 
 ## Suggested issue breakdown

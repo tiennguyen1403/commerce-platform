@@ -43,6 +43,8 @@ docs/milestones/
 
 - Milestone doc ↔ **GitHub Milestone** · Task ↔ **Issue** · Work ↔ **PR** (closes issue)
 - Exit criteria live in `GOAL.md` and the Milestone description.
+- Trunk is `development` (feature branches → PR into it). `main` is release-only:
+  release = PR `development` → `main` + tag `vM<n>`.
 
 ## Roadmap
 
