@@ -5,6 +5,7 @@ import { cartService } from "@/server/services/cart.service";
 import {
   orderRepository,
   type CreateOrderInput,
+  type OrderWithItems,
 } from "@/server/repositories/order.repository";
 import { EmptyCartError, OrderNumberTakenError } from "@/server/order.errors";
 import type { CartLine } from "@/lib/cart";
@@ -214,9 +215,11 @@ export const orderService = {
    * calling this for a duplicate/late event (or an unknown PaymentIntent) is a
    * safe no-op. The outcome is reported three ways so the webhook can log each
    * distinctly:
-   *  - `"paid"` — this delivery made the PENDING → PAID transition. The single
-   *    moment the confirmation email (#15) will hang off, so a shopper is
-   *    emailed exactly once no matter how often Stripe retries.
+   *  - `"paid"` — this delivery made the PENDING → PAID transition. It carries
+   *    the confirmed `order` (with items): the single moment the confirmation
+   *    email (#15) hangs off. Only this one delivery sends, so Stripe's retries
+   *    never duplicate it — at most once per order (a swallowed send failure is
+   *    not retried; durable delivery is a later outbox concern).
    *  - `"already-processed"` — the order exists but was past PENDING already
    *    (a normal duplicate/late delivery); nothing to do.
    *  - `"no-order"` — no order matches this PaymentIntent for the tenant. The
@@ -226,20 +229,33 @@ export const orderService = {
   async markOrderPaid(
     tenantId: string,
     paymentIntentId: string,
-  ): Promise<{ outcome: "paid" | "already-processed" | "no-order" }> {
+  ): Promise<
+    | { outcome: "paid"; order: OrderWithItems }
+    | { outcome: "already-processed" | "no-order" }
+  > {
     const transitioned = await orderRepository.markPaidByPaymentIntent(
       tenantId,
       paymentIntentId,
     );
-    if (transitioned) return { outcome: "paid" };
 
-    // No transition: tell a normal duplicate (order past PENDING) apart from the
-    // anomaly of a paid intent with no order row. One extra read, and only on
-    // the rare non-transition path — never on the hot PENDING → PAID case.
+    // One read serves both paths: on a transition it supplies the order the
+    // webhook emails a confirmation for; on a non-transition it tells a normal
+    // duplicate (order past PENDING) apart from the anomaly of a paid intent
+    // with no order row.
     const order = await orderRepository.findByPaymentIntentForTenant(
       tenantId,
       paymentIntentId,
     );
+
+    if (transitioned) {
+      // We just moved this order to PAID, so the row is there barring a delete
+      // in the sub-millisecond gap. If it somehow vanished there's nothing to
+      // email — report it processed rather than invent a "paid" with no order.
+      return order
+        ? { outcome: "paid", order }
+        : { outcome: "already-processed" };
+    }
+
     return { outcome: order ? "already-processed" : "no-order" };
   },
 };

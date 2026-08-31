@@ -10,4 +10,10 @@ export const tenantRepository = {
   findBySlug(slug: string) {
     return prisma.tenant.findUnique({ where: { slug } });
   },
+
+  /** Look up a tenant by id. Used to brand outbound email with the store's
+   *  name, where only the `tenantId` (from PaymentIntent metadata) is on hand. */
+  findById(id: string) {
+    return prisma.tenant.findUnique({ where: { id } });
+  },
 };

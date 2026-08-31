@@ -110,26 +110,55 @@ export default async function CheckoutSuccessPage({
           </div>
 
           {order && (view === "succeeded" || view === "processing") ? (
-            <dl className="border-border w-full max-w-xs rounded-lg border text-sm">
-              <div className="flex items-center justify-between gap-4 px-4 py-3">
-                <dt className="text-muted-foreground">Order</dt>
-                <dd className="font-medium tabular-nums">
-                  {order.orderNumber}
-                </dd>
-              </div>
-              <div className="border-border flex items-center justify-between gap-4 border-t px-4 py-3">
-                <dt className="text-muted-foreground">Total</dt>
-                <dd className="font-semibold tabular-nums">
-                  {formatMoney(order.totalCents, order.currency)}
-                </dd>
-              </div>
-              <div className="border-border flex items-center justify-between gap-4 border-t px-4 py-3">
-                <dt className="text-muted-foreground">Confirmation</dt>
-                <dd className="max-w-[12rem] truncate font-medium">
-                  {order.email}
-                </dd>
-              </div>
-            </dl>
+            <div className="w-full max-w-sm text-left">
+              <ul className="border-border rounded-lg border text-sm">
+                {order.items.map((item, index) => (
+                  <li
+                    key={item.id}
+                    className={`flex items-start justify-between gap-4 px-4 py-3 ${
+                      index > 0 ? "border-border border-t" : ""
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate font-medium">
+                        {item.titleSnapshot}
+                      </p>
+                      <p className="text-muted-foreground text-xs tabular-nums">
+                        Qty {item.quantity} &times;{" "}
+                        {formatMoney(item.priceCents, order.currency)}
+                      </p>
+                    </div>
+                    <span className="font-medium whitespace-nowrap tabular-nums">
+                      {formatMoney(
+                        item.priceCents * item.quantity,
+                        order.currency,
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+
+              <dl className="border-border mt-3 rounded-lg border text-sm">
+                <div className="flex items-center justify-between gap-4 px-4 py-3">
+                  <dt className="text-muted-foreground">Order</dt>
+                  <dd className="font-medium tabular-nums">
+                    {order.orderNumber}
+                  </dd>
+                </div>
+                <div className="border-border flex items-center justify-between gap-4 border-t px-4 py-3">
+                  <dt className="text-muted-foreground">Total</dt>
+                  <dd className="font-semibold tabular-nums">
+                    {formatMoney(order.totalCents, order.currency)}
+                  </dd>
+                </div>
+                <div className="border-border flex items-center justify-between gap-4 border-t px-4 py-3">
+                  <dt className="text-muted-foreground">Confirmation</dt>
+                  <dd className="max-w-[12rem] truncate font-medium">
+                    {order.email}
+                  </dd>
+                </div>
+              </dl>
+            </div>
           ) : null}
 
           {view === "failed" ? (
