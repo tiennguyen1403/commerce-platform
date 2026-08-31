@@ -82,5 +82,17 @@ AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
 - **Prisma over Drizzle** — DX and migrations; revisit only if we hit a real perf ceiling.
 - **Better Auth (self-managed) over Clerk** — demonstrates auth/session/RBAC understanding.
 - **Money as integer cents** — avoid floating-point money bugs.
+- **Stripe PaymentIntent + Payment Element (embedded), not hosted Checkout Sessions** (M1)
+  — keeps checkout on our own domain and lets the success page verify the PaymentIntent's
+  `client_secret` before showing order details; costs more client UI than a Stripe-hosted redirect.
+- **Cookie-backed cart, not a DB cart** (M1) — no auth required to shop; the cookie only
+  ever stores `{ variantId, qty }`, so price/title/stock/total are always recomputed from
+  a live DB read, never trusted from the client.
+- **Stripe webhook is the sole writer of "paid," via an idempotent atomic state machine**
+  (M1) — `PENDING → PAID` flips only inside a status-guarded transaction (a `PENDING`
+  check in the `WHERE`), so retried/duplicate/out-of-order webhook deliveries are safe
+  no-ops; the browser redirect never writes order state.
+- **Single currency per tenant** (M1) — currency lives on `Tenant`, not `ProductVariant`;
+  a store can't accidentally mix currencies in a cart or order total.
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).
