@@ -46,9 +46,10 @@ import from `src/server/**` — they go through Server Actions or services invok
 
 ## 4. Catalog
 
-`Product` → many `ProductVariant`. Variants carry `sku`, `priceCents`, `currency`,
-`stock`. Products have a `status` (`DRAFT` / `ACTIVE` / `ARCHIVED`) and a per-tenant unique
-`slug`.
+`Product` → many `ProductVariant`. Variants carry `sku`, `priceCents`, `stock`. Products
+have a `status` (`DRAFT` / `ACTIVE` / `ARCHIVED`) and a per-tenant unique `slug`. Currency is
+a **store-level** setting (`Tenant.currency`) that every variant inherits — the catalog has
+no per-variant currency, so a cart/order can never mix currencies.
 
 ## 5. Orders & payments (Phase 1)
 
@@ -57,7 +58,8 @@ import from `src/server/**` — they go through Server Actions or services invok
 - Payment via **Stripe** (Payment Intents). The source of truth for "paid" is the Stripe
   **webhook**, not the client redirect. The webhook drives an idempotent order state
   machine: `PENDING → PAID → FULFILLED` (+ `CANCELLED`, `REFUNDED`).
-- Money is integer **cents** everywhere; `currency` is stored per order/variant.
+- Money is integer **cents** everywhere. Currency is the store's (`Tenant.currency`); each
+  `Order` also snapshots it so a historical total stays correct if the store currency changes.
 
 ## 6. Fulfillment
 

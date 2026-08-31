@@ -28,8 +28,12 @@ export const metadata: Metadata = {
 export const dynamic = "force-dynamic";
 
 export default async function CartPage() {
-  const { tenantId } = await getStoreTenant();
-  const cart = await cartService.getCartView(tenantId, await readCart());
+  const { tenantId, currency } = await getStoreTenant();
+  const cart = await cartService.getCartView(
+    tenantId,
+    await readCart(),
+    currency,
+  );
 
   const itemLabel = (n: number) => `${n} ${n === 1 ? "item" : "items"}`;
 

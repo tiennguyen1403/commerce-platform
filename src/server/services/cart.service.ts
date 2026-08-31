@@ -39,9 +39,18 @@ function isPurchasable(variant: {
 }
 
 export const cartService = {
-  /** Price and reconcile the cookie's lines against live variant data. */
-  async getCartView(tenantId: string, lines: CartLine[]): Promise<CartView> {
-    if (lines.length === 0) return EMPTY_CART;
+  /**
+   * Price and reconcile the cookie's lines against live variant data, in the
+   * store's `currency`. Every line is in that one currency — the catalog has no
+   * per-variant currency (`Tenant.currency` is the single source), so a cart can
+   * never mix currencies and the total is always soundly summable and chargeable.
+   */
+  async getCartView(
+    tenantId: string,
+    lines: CartLine[],
+    currency: string,
+  ): Promise<CartView> {
+    if (lines.length === 0) return { ...EMPTY_CART, currency };
 
     const variants = await productRepository.findVariantsForTenant(
       tenantId,
@@ -52,22 +61,10 @@ export const cartService = {
     const items: CartItem[] = [];
     let removedCount = 0;
     let adjusted = false;
-    // The cart settles on the currency of its first purchasable line; any line
-    // in a different currency is set aside. M1 is single-currency in practice,
-    // but per-variant currency is allowed and a mixed total can't be summed or
-    // charged soundly. (A per-tenant currency constraint at the catalog layer is
-    // the longer-term fix — tracked as a follow-up.)
-    let cartCurrency: string | null = null;
 
     for (const line of lines) {
       const variant = byId.get(line.variantId);
       if (!variant || !isPurchasable(variant)) {
-        removedCount += 1;
-        continue;
-      }
-
-      cartCurrency ??= variant.currency;
-      if (variant.currency !== cartCurrency) {
         removedCount += 1;
         continue;
       }
@@ -81,7 +78,7 @@ export const cartService = {
         productTitle: variant.product.title,
         variantName: variant.name,
         unitPriceCents: variant.priceCents,
-        currency: variant.currency,
+        currency,
         qty,
         lineTotalCents: variant.priceCents * qty,
         stock: variant.stock,
@@ -97,7 +94,7 @@ export const cartService = {
     return {
       items,
       totalCents,
-      currency: cartCurrency ?? EMPTY_CART.currency,
+      currency,
       itemCount,
       removedCount,
       adjusted,

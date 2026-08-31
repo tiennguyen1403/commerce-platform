@@ -7,6 +7,9 @@ import { DEMO_TENANT_SLUG } from "@/config/constants";
 export interface StoreContext {
   tenantId: string;
   tenantName: string;
+  /** The store's single currency (lowercase ISO 4217). Every price shown and
+   *  every total charged is in this currency; the catalog has no other. */
+  currency: string;
 }
 
 /**
@@ -22,5 +25,9 @@ export interface StoreContext {
 export const getStoreTenant = cache(async (): Promise<StoreContext> => {
   const tenant = await tenantRepository.findBySlug(DEMO_TENANT_SLUG);
   if (!tenant) notFound();
-  return { tenantId: tenant.id, tenantName: tenant.name };
+  return {
+    tenantId: tenant.id,
+    tenantName: tenant.name,
+    currency: tenant.currency,
+  };
 });

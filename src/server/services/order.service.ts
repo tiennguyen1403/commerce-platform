@@ -110,8 +110,9 @@ export const orderService = {
     tenantId: string,
     lines: CartLine[],
     email: string,
+    currency: string,
   ): Promise<StartCheckoutResult> {
-    const cart = await cartService.getCartView(tenantId, lines);
+    const cart = await cartService.getCartView(tenantId, lines, currency);
     if (cart.items.length === 0) throw new EmptyCartError();
 
     const orderId = randomUUID();

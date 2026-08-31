@@ -19,7 +19,6 @@ export type PurchaseVariant = {
   id: string;
   name: string;
   priceCents: number;
-  currency: string;
   stock: number;
 };
 
@@ -33,7 +32,13 @@ const LOW_STOCK_THRESHOLD = 5;
  * clamps to live stock server-side, so this panel just fires it and reflects the
  * result.
  */
-export function PurchasePanel({ variants }: { variants: PurchaseVariant[] }) {
+export function PurchasePanel({
+  variants,
+  currency,
+}: {
+  variants: PurchaseVariant[];
+  currency: string;
+}) {
   // Default to the first in-stock variant so the CTA is actionable on load;
   // fall back to the first variant when the whole product is sold out.
   const firstSelectable = variants.find((v) => v.stock > 0) ?? variants[0];
@@ -63,7 +68,7 @@ export function PurchasePanel({ variants }: { variants: PurchaseVariant[] }) {
     <div className="flex flex-col gap-5">
       <div className="flex flex-col gap-2" aria-live="polite">
         <p className="text-2xl font-semibold tracking-tight tabular-nums">
-          {formatMoney(selected.priceCents, selected.currency)}
+          {formatMoney(selected.priceCents, currency)}
         </p>
         {soldOut ? (
           <Badge variant="secondary" className="w-fit">

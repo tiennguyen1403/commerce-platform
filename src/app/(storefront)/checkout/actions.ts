@@ -26,12 +26,17 @@ export async function startCheckoutAction(input: {
     };
   }
 
-  const { tenantId } = await getStoreTenant();
+  const { tenantId, currency: storeCurrency } = await getStoreTenant();
   const lines = await readCart();
 
   try {
     const { clientSecret, totalCents, currency } =
-      await orderService.startCheckout(tenantId, lines, parsed.data.email);
+      await orderService.startCheckout(
+        tenantId,
+        lines,
+        parsed.data.email,
+        storeCurrency,
+      );
     return { ok: true, clientSecret, totalCents, currency };
   } catch (err) {
     if (err instanceof EmptyCartError) {
