@@ -42,6 +42,75 @@ async function seedAdmin(tenantId: string) {
   return admin;
 }
 
+type SeedVariant = {
+  sku: string;
+  name: string;
+  priceCents: number;
+  stock: number;
+};
+
+type SeedProduct = {
+  slug: string;
+  title: string;
+  description: string;
+  status: "DRAFT" | "ACTIVE" | "ARCHIVED";
+  variants: SeedVariant[];
+};
+
+// A spread that exercises every storefront state: a plain multi-variant
+// product, a variant selector with a low-stock and a per-variant sold-out
+// option, a single-variant product, a fully sold-out product, and a DRAFT that
+// must stay hidden from the public store (ACTIVE-only listing).
+const PRODUCTS: SeedProduct[] = [
+  {
+    slug: "classic-tee",
+    title: "Classic Tee",
+    description: "A comfortable everyday t-shirt.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "TEE-S", name: "Small", priceCents: 1999, stock: 100 },
+      { sku: "TEE-M", name: "Medium", priceCents: 1999, stock: 100 },
+      { sku: "TEE-L", name: "Large", priceCents: 2199, stock: 50 },
+    ],
+  },
+  {
+    slug: "everyday-hoodie",
+    title: "Everyday Hoodie",
+    description: "Mid-weight fleece hoodie with a relaxed fit.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "HOOD-S", name: "Small", priceCents: 4900, stock: 12 },
+      { sku: "HOOD-M", name: "Medium", priceCents: 4900, stock: 3 },
+      { sku: "HOOD-L", name: "Large", priceCents: 5200, stock: 0 },
+    ],
+  },
+  {
+    slug: "canvas-tote-bag",
+    title: "Canvas Tote Bag",
+    description: "Heavy-duty cotton tote for the daily haul.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "TOTE-OS", name: "One size", priceCents: 2500, stock: 40 },
+    ],
+  },
+  {
+    slug: "enamel-mug",
+    title: "Enamel Mug",
+    description: "Camp-style enamel mug. Currently sold out.",
+    status: "ACTIVE",
+    variants: [{ sku: "MUG-12", name: "12 oz", priceCents: 1500, stock: 0 }],
+  },
+  {
+    slug: "summer-cap",
+    title: "Summer Cap",
+    description: "Unreleased draft — should never appear on the storefront.",
+    status: "DRAFT",
+    variants: [
+      { sku: "CAP-OS", name: "One size", priceCents: 2200, stock: 25 },
+    ],
+  },
+];
+
 async function main() {
   const tenant = await prisma.tenant.upsert({
     where: { slug: DEMO_TENANT_SLUG },
@@ -49,29 +118,32 @@ async function main() {
     create: { slug: DEMO_TENANT_SLUG, name: "Demo Store" },
   });
 
-  const product = await prisma.product.upsert({
-    where: { tenantId_slug: { tenantId: tenant.id, slug: "classic-tee" } },
-    update: {},
-    create: {
-      tenantId: tenant.id,
-      title: "Classic Tee",
-      slug: "classic-tee",
-      description: "A comfortable everyday t-shirt.",
-      status: "ACTIVE",
-      variants: {
-        create: [
-          { sku: "TEE-S", name: "Small", priceCents: 1999, stock: 100 },
-          { sku: "TEE-M", name: "Medium", priceCents: 1999, stock: 100 },
-          { sku: "TEE-L", name: "Large", priceCents: 2199, stock: 50 },
-        ],
+  for (const product of PRODUCTS) {
+    await prisma.product.upsert({
+      where: { tenantId_slug: { tenantId: tenant.id, slug: product.slug } },
+      update: {},
+      create: {
+        tenantId: tenant.id,
+        title: product.title,
+        slug: product.slug,
+        description: product.description,
+        status: product.status,
+        variants: {
+          create: product.variants.map((v) => ({
+            sku: v.sku,
+            name: v.name,
+            priceCents: v.priceCents,
+            stock: v.stock,
+          })),
+        },
       },
-    },
-  });
+    });
+  }
 
   const admin = await seedAdmin(tenant.id);
 
   console.log(
-    `Seeded tenant "${tenant.slug}" with product "${product.title}" and ` +
+    `Seeded tenant "${tenant.slug}" with ${PRODUCTS.length} products and ` +
       `admin "${admin.email}" (OWNER).`,
   );
 }
