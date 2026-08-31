@@ -14,6 +14,8 @@ export interface AdminContext {
   userEmail: string;
   tenantId: string;
   tenantName: string;
+  /** The store's single currency (lowercase ISO 4217); variants inherit it. */
+  currency: string;
   role: Role;
 }
 
@@ -53,6 +55,7 @@ export const requireAdminContext = cache(async (): Promise<AdminContext> => {
     userEmail: session.user.email,
     tenantId: tenant.id,
     tenantName: tenant.name,
+    currency: tenant.currency,
     role: membership.role,
   };
 });

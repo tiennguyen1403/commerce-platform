@@ -108,7 +108,6 @@ export const productRepository = {
               sku: v.sku,
               name: v.name,
               priceCents: v.priceCents,
-              currency: v.currency,
               stock: v.stock,
             })),
           },
@@ -199,7 +198,6 @@ export const productRepository = {
               sku: v.sku,
               name: v.name,
               priceCents: v.priceCents,
-              currency: v.currency,
               stock: v.stock,
             },
           });
@@ -213,7 +211,6 @@ export const productRepository = {
               sku: v.sku,
               name: v.name,
               priceCents: v.priceCents,
-              currency: v.currency,
               stock: v.stock,
             })),
           });

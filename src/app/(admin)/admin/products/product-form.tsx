@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Loader2, Plus, Trash2 } from "lucide-react";
 import {
-  CURRENCIES,
   CURRENCY_LABELS,
   PRODUCT_STATUSES,
   STATUS_LABELS,
@@ -43,7 +42,6 @@ type VariantRow = {
   sku: string;
   name: string;
   price: string;
-  currency: CurrencyValue;
   stock: string;
   // True when this variant already appears in an order. Such variants can't be
   // deleted (the server refuses it), so the row's Remove button is disabled.
@@ -55,7 +53,6 @@ export type ProductFormInitialVariant = {
   sku: string;
   name: string;
   price: string;
-  currency: CurrencyValue;
   stock: string;
   hasOrders?: boolean;
 };
@@ -72,10 +69,12 @@ type ProductFormProps = {
   mode: "create" | "edit";
   productId?: string;
   initialValues: ProductFormValues;
+  /** The store's currency (`Tenant.currency`); every variant price is in it. */
+  storeCurrency: string;
 };
 
 type VariantFieldErrors = Partial<
-  Record<"sku" | "name" | "price" | "currency" | "stock", string>
+  Record<"sku" | "name" | "price" | "stock", string>
 >;
 
 const MONEY_PATTERN = /^\d+(\.\d{1,2})?$/;
@@ -95,17 +94,25 @@ function parseWhole(value: string): number | null {
   return Number(trimmed);
 }
 
-function emptyVariant(key: string, currency: CurrencyValue): VariantRow {
-  return { key, sku: "", name: "", price: "", currency, stock: "0" };
+function emptyVariant(key: string): VariantRow {
+  return { key, sku: "", name: "", price: "", stock: "0" };
 }
 
 export function ProductForm({
   mode,
   productId,
   initialValues,
+  storeCurrency,
 }: ProductFormProps) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
+
+  // The store's single currency, shown read-only — variants have no currency of
+  // their own (they inherit `Tenant.currency`). Fall back to the raw code if it
+  // isn't one we have a friendly label for.
+  const currencyLabel =
+    CURRENCY_LABELS[storeCurrency as CurrencyValue] ??
+    storeCurrency.toUpperCase();
 
   const [title, setTitle] = useState(initialValues.title);
   const [slug, setSlug] = useState(initialValues.slug);
@@ -141,11 +148,7 @@ export function ProductForm({
   }
 
   function addVariant() {
-    const currency = variants[variants.length - 1]?.currency ?? "usd";
-    setVariants((rows) => [
-      ...rows,
-      emptyVariant(`new-${nextKey.current++}`, currency),
-    ]);
+    setVariants((rows) => [...rows, emptyVariant(`new-${nextKey.current++}`)]);
   }
 
   function removeVariant(key: string) {
@@ -175,7 +178,6 @@ export function ProductForm({
         sku: row.sku,
         name: row.name,
         priceCents: cents ?? 0,
-        currency: row.currency,
         stock: stock ?? 0,
       };
     });
@@ -339,7 +341,8 @@ export function ProductForm({
         <CardHeader>
           <CardTitle>Variants</CardTitle>
           <CardDescription>
-            Each variant needs a unique SKU. Prices are per item.
+            Each variant needs a unique SKU. Prices are per item, in{" "}
+            {currencyLabel} — the store currency.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
@@ -453,60 +456,27 @@ export function ProductForm({
                     />
                   </Field>
 
-                  <div className="grid grid-cols-2 gap-4">
-                    <Field>
-                      <FieldLabel htmlFor={`${row.key}-currency`}>
-                        Currency
-                      </FieldLabel>
-                      <Select
-                        value={row.currency}
-                        onValueChange={(value) => {
-                          if (value)
-                            updateVariant(row.key, { currency: value });
-                        }}
-                      >
-                        <SelectTrigger
-                          id={`${row.key}-currency`}
-                          className="w-full"
-                        >
-                          <SelectValue>
-                            {(value) => CURRENCY_LABELS[value as CurrencyValue]}
-                          </SelectValue>
-                        </SelectTrigger>
-                        <SelectContent>
-                          {CURRENCIES.map((value) => (
-                            <SelectItem key={value} value={value}>
-                              {CURRENCY_LABELS[value]}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </Field>
-
-                    <Field>
-                      <FieldLabel htmlFor={`${row.key}-stock`}>
-                        Stock
-                      </FieldLabel>
-                      <Input
-                        id={`${row.key}-stock`}
-                        value={row.stock}
-                        inputMode="numeric"
-                        onChange={(e) =>
-                          updateVariant(row.key, { stock: e.target.value })
-                        }
-                        aria-invalid={Boolean(rowError.stock)}
-                        placeholder="0"
-                        autoComplete="off"
-                      />
-                      <FieldError
-                        errors={
-                          rowError.stock
-                            ? [{ message: rowError.stock }]
-                            : undefined
-                        }
-                      />
-                    </Field>
-                  </div>
+                  <Field>
+                    <FieldLabel htmlFor={`${row.key}-stock`}>Stock</FieldLabel>
+                    <Input
+                      id={`${row.key}-stock`}
+                      value={row.stock}
+                      inputMode="numeric"
+                      onChange={(e) =>
+                        updateVariant(row.key, { stock: e.target.value })
+                      }
+                      aria-invalid={Boolean(rowError.stock)}
+                      placeholder="0"
+                      autoComplete="off"
+                    />
+                    <FieldError
+                      errors={
+                        rowError.stock
+                          ? [{ message: rowError.stock }]
+                          : undefined
+                      }
+                    />
+                  </Field>
                 </div>
               </div>
             );

@@ -17,9 +17,14 @@ datasource db {
 
 /// One store = one tenant.
 model Tenant {
-  id        String   @id @default(cuid())
-  slug      String   @unique
-  name      String
+  id   String @id @default(cuid())
+  slug String @unique
+  name String
+  // The store's single currency (ISO 4217, lowercase — Stripe's convention).
+  // Every variant price and order total is in this currency; the catalog has no
+  // per-variant currency, so a cart/order can never mix currencies. One store =
+  // one currency (M1 is single-tenant; a store-settings editor is a follow-up).
+  currency  String   @default("usd")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -147,9 +152,10 @@ model ProductVariant {
   productId  String
   sku        String
   name       String
-  // Money is stored as integer minor units (cents) to avoid float errors.
+  // Money is stored as integer minor units (cents) to avoid float errors. The
+  // currency is the store's (`Tenant.currency`), never per-variant — that's what
+  // keeps a cart/order total single-currency and soundly summable.
   priceCents Int
-  currency   String   @default("usd")
   stock      Int      @default(0)
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt

@@ -19,6 +19,8 @@ export const STATUS_LABELS: Record<ProductStatusValue, string> = {
   ARCHIVED: "Archived",
 };
 
+// Supported store currencies (`Tenant.currency`). Lowercase ISO 4217 to match
+// Stripe's convention. A store picks one; variants inherit it.
 export const CURRENCIES = ["usd", "eur", "gbp"] as const;
 export type CurrencyValue = (typeof CURRENCIES)[number];
 
@@ -53,7 +55,9 @@ export const variantInputSchema = z.object({
     .int({ error: "Enter a valid price." })
     .min(0, { error: "Price can't be negative." })
     .max(MAX_PRICE_CENTS, { error: "Price is too high." }),
-  currency: z.enum(CURRENCIES, { error: "Choose a currency." }),
+  // No per-variant currency: the price is always in the store's currency
+  // (`Tenant.currency`). That's what keeps a cart/order single-currency and
+  // soundly summable — enforced at the data model, not just here.
   stock: z
     .int({ error: "Enter a whole number." })
     .min(0, { error: "Stock can't be negative." })

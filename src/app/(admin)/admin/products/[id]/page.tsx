@@ -4,26 +4,17 @@ import { notFound } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 import { requireAdminContext } from "@/server/auth/admin-context";
 import { catalogService } from "@/server/services/catalog.service";
-import { CURRENCIES, type CurrencyValue } from "@/lib/validators/catalog";
 import { ProductForm, type ProductFormValues } from "../product-form";
 import { ArchiveProductButton } from "../archive-button";
 
 export const metadata: Metadata = { title: "Edit product" };
-
-/** Stored currency is a free-form column; fall back to USD if it's unexpected
- *  so the Select always has a matching option. */
-function toCurrency(value: string): CurrencyValue {
-  return (CURRENCIES as readonly string[]).includes(value)
-    ? (value as CurrencyValue)
-    : "usd";
-}
 
 export default async function EditProductPage({
   params,
 }: {
   params: Promise<{ id: string }>;
 }) {
-  const { tenantId } = await requireAdminContext();
+  const { tenantId, currency } = await requireAdminContext();
   const { id } = await params;
 
   const product = await catalogService.getAdminProduct(tenantId, id);
@@ -39,7 +30,6 @@ export default async function EditProductPage({
       sku: v.sku,
       name: v.name,
       price: (v.priceCents / 100).toFixed(2),
-      currency: toCurrency(v.currency),
       stock: String(v.stock),
       // A variant already referenced by an order can't be deleted; the form
       // disables its Remove button so the admin never hits that dead-end.
@@ -73,6 +63,7 @@ export default async function EditProductPage({
         mode="edit"
         productId={product.id}
         initialValues={initialValues}
+        storeCurrency={currency}
       />
     </div>
   );

@@ -33,20 +33,20 @@ const STATUS_BADGE: Record<
 
 /** Compact price summary for a product's variants (single price or a range). */
 function priceRange(
-  variants: { priceCents: number; currency: string }[],
+  variants: { priceCents: number }[],
+  currency: string,
 ): string {
   if (variants.length === 0) return "—";
   const prices = variants.map((v) => v.priceCents);
   const min = Math.min(...prices);
   const max = Math.max(...prices);
-  const currency = variants[0].currency;
   return min === max
     ? formatMoney(min, currency)
     : `${formatMoney(min, currency)} – ${formatMoney(max, currency)}`;
 }
 
 export default async function ProductsPage() {
-  const { tenantId } = await requireAdminContext();
+  const { tenantId, currency } = await requireAdminContext();
   const products = await catalogService.getAdminProducts(tenantId);
 
   return (
@@ -115,7 +115,7 @@ export default async function ProductsPage() {
                     {product.variants.length}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
-                    {priceRange(product.variants)}
+                    {priceRange(product.variants, currency)}
                   </TableCell>
                   <TableCell className="text-right">
                     <Link

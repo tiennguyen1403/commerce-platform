@@ -45,6 +45,9 @@ export default async function ProductDetailPage({
   const product = await getActiveProduct(slug);
   if (!product) notFound();
 
+  // Store currency — cached, since getActiveProduct already resolved the tenant.
+  const { currency } = await getStoreTenant();
+
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-10">
       <Link
@@ -73,11 +76,11 @@ export default async function ProductDetailPage({
           </div>
 
           <PurchasePanel
+            currency={currency}
             variants={product.variants.map((v) => ({
               id: v.id,
               name: v.name,
               priceCents: v.priceCents,
-              currency: v.currency,
               stock: v.stock,
             }))}
           />

@@ -12,18 +12,24 @@ type StorefrontProduct = Prisma.ProductGetPayload<{
 /** Entry price for a card: a flat price when every variant matches, otherwise
  *  "From <cheapest>" so the grid stays scannable without a full range. */
 function priceLabel(
-  variants: { priceCents: number; currency: string }[],
+  variants: { priceCents: number }[],
+  currency: string,
 ): string {
   if (variants.length === 0) return "—";
   const prices = variants.map((v) => v.priceCents);
   const min = Math.min(...prices);
-  const currency = variants[0].currency;
   return prices.every((p) => p === min)
     ? formatMoney(min, currency)
     : `From ${formatMoney(min, currency)}`;
 }
 
-export function ProductCard({ product }: { product: StorefrontProduct }) {
+export function ProductCard({
+  product,
+  currency,
+}: {
+  product: StorefrontProduct;
+  currency: string;
+}) {
   const inStock = product.variants.some((v) => v.stock > 0);
 
   return (
@@ -45,7 +51,7 @@ export function ProductCard({ product }: { product: StorefrontProduct }) {
             {product.title}
           </h2>
           <p className="text-muted-foreground text-sm tabular-nums">
-            {priceLabel(product.variants)}
+            {priceLabel(product.variants, currency)}
           </p>
         </div>
       </Card>

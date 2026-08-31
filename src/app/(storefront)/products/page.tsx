@@ -21,7 +21,7 @@ export const metadata: Metadata = {
  *  via <Suspense> without a route-level loading.tsx (which would also wrap the
  *  PDP and break its 404 — see product-grid-skeleton.tsx). */
 async function ProductGrid() {
-  const { tenantId } = await getStoreTenant();
+  const { tenantId, currency } = await getStoreTenant();
   const products = await catalogService.getStorefrontProducts(tenantId);
 
   if (products.length === 0) {
@@ -44,7 +44,7 @@ async function ProductGrid() {
     <ul className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
       {products.map((product) => (
         <li key={product.id}>
-          <ProductCard product={product} />
+          <ProductCard product={product} currency={currency} />
         </li>
       ))}
     </ul>
