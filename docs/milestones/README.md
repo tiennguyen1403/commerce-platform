@@ -48,10 +48,10 @@ docs/milestones/
 
 ## Roadmap
 
-| Milestone | Slug             | Status     |
-| --------- | ---------------- | ---------- |
-| M0        | foundations      | ✅ done    |
-| M1        | commerce-slice   | 🏗 building |
-| M2        | production-grade | planned    |
-| M3        | platform         | planned    |
-| M4        | fulfillment      | planned    |
+| Milestone | Slug             | Status  |
+| --------- | ---------------- | ------- |
+| M0        | foundations      | ✅ done |
+| M1        | commerce-slice   | ✅ done |
+| M2        | production-grade | planned |
+| M3        | platform         | planned |
+| M4        | fulfillment      | planned |

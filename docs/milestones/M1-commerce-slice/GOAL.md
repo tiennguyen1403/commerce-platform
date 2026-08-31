@@ -23,14 +23,14 @@ Stripe Connect payouts, fulfillment/POD (M4), full test suite (M2 hardening).
 
 ## Exit criteria
 
-- [ ] Admin can create a product with variants; it appears on the storefront.
-- [ ] Shopper can complete a Stripe **test-mode** checkout end-to-end.
-- [ ] A paid checkout produces an `Order` in state `PAID` via the **webhook** (not the
-      client redirect), with correct line-item snapshots and total.
-- [ ] `/admin` is auth-protected; unauthenticated users are redirected.
-- [ ] Order confirmation email is sent on success.
-- [ ] `pnpm build`, `pnpm typecheck`, `pnpm lint` all green; CI passing on `development`.
-- [ ] Storefront pages are server-rendered with correct metadata (SEO).
+- [x] Admin can create a product with variants; it appears on the storefront. (PR #20, #21)
+- [x] Shopper can complete a Stripe **test-mode** checkout end-to-end. (PR #22, #24)
+- [x] A paid checkout produces an `Order` in state `PAID` via the **webhook** (not the
+      client redirect), with correct line-item snapshots and total. (PR #24, #28)
+- [x] `/admin` is auth-protected; unauthenticated users are redirected. (PR #18)
+- [x] Order confirmation email is sent on success. (PR #29)
+- [x] `pnpm build`, `pnpm typecheck`, `pnpm lint` all green; CI passing on `development`. (CI green @ 28d24f8)
+- [x] Storefront pages are server-rendered with correct metadata (SEO). (PR #21)
 
 ## Decisions (settled at research)
 
