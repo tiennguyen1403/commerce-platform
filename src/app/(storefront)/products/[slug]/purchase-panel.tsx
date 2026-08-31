@@ -1,8 +1,10 @@
 "use client";
 
-import { useState } from "react";
-import { Check, Info, ShoppingCart } from "lucide-react";
+import { useState, useTransition } from "react";
+import Link from "next/link";
+import { Check, Info, Loader2, ShoppingCart } from "lucide-react";
 import { formatMoney } from "@/lib/utils";
+import { addToCartAction } from "@/app/(storefront)/cart/actions";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -25,17 +27,19 @@ export type PurchaseVariant = {
 const LOW_STOCK_THRESHOLD = 5;
 
 /**
- * PDP purchase controls: pick a variant, see its live price and stock, add to
- * cart. The cart itself is cookie-backed and lands in #12 — until then the CTA
- * is a working control that confirms the action is wired but has nowhere to go
- * yet (swap the click handler for the `addToCart` Server Action in #12).
+ * PDP purchase controls: pick a variant, see its live price and stock, add it to
+ * the cookie-backed cart via the `addToCart` Server Action. Each click adds one
+ * unit; quantity is edited on the cart page. The action re-checks the variant and
+ * clamps to live stock server-side, so this panel just fires it and reflects the
+ * result.
  */
 export function PurchasePanel({ variants }: { variants: PurchaseVariant[] }) {
   // Default to the first in-stock variant so the CTA is actionable on load;
   // fall back to the first variant when the whole product is sold out.
   const firstSelectable = variants.find((v) => v.stock > 0) ?? variants[0];
   const [selectedId, setSelectedId] = useState(firstSelectable?.id);
-  const [added, setAdded] = useState(false);
+  const [status, setStatus] = useState<"idle" | "added" | "error">("idle");
+  const [isPending, startTransition] = useTransition();
 
   const selected = variants.find((v) => v.id === selectedId) ?? firstSelectable;
   // A product always ships with at least one variant (zod-enforced on write).
@@ -44,6 +48,16 @@ export function PurchasePanel({ variants }: { variants: PurchaseVariant[] }) {
   const soldOut = selected.stock <= 0;
   const lowStock = !soldOut && selected.stock <= LOW_STOCK_THRESHOLD;
   const hasChoice = variants.length > 1;
+
+  function addToCart() {
+    if (!selected) return;
+    const variantId = selected.id;
+    setStatus("idle");
+    startTransition(async () => {
+      const result = await addToCartAction(variantId);
+      setStatus(result.ok ? "added" : "error");
+    });
+  }
 
   return (
     <div className="flex flex-col gap-5">
@@ -77,7 +91,7 @@ export function PurchasePanel({ variants }: { variants: PurchaseVariant[] }) {
             onValueChange={(value) => {
               if (value) {
                 setSelectedId(value);
-                setAdded(false);
+                setStatus("idle");
               }
             }}
           >
@@ -103,20 +117,34 @@ export function PurchasePanel({ variants }: { variants: PurchaseVariant[] }) {
         <Button
           type="button"
           size="lg"
-          disabled={soldOut}
-          onClick={() => setAdded(true)}
+          disabled={soldOut || isPending}
+          onClick={addToCart}
           className="w-full sm:w-auto"
         >
-          <ShoppingCart />
-          {soldOut ? "Sold out" : "Add to cart"}
+          {isPending ? <Loader2 className="animate-spin" /> : <ShoppingCart />}
+          {soldOut ? "Sold out" : isPending ? "Adding…" : "Add to cart"}
         </Button>
-        {added && !soldOut ? (
+        {status === "added" && !soldOut ? (
           <p
             role="status"
             className="text-muted-foreground inline-flex items-center gap-1.5 text-sm"
           >
+            <Check className="size-4" />
+            Added to cart ·{" "}
+            <Link
+              href="/cart"
+              className="text-foreground font-medium underline underline-offset-4"
+            >
+              View cart
+            </Link>
+          </p>
+        ) : status === "error" ? (
+          <p
+            role="alert"
+            className="text-destructive inline-flex items-center gap-1.5 text-sm"
+          >
             <Info className="size-4" />
-            Cart and checkout are coming soon.
+            Couldn&apos;t add to cart. Please try again.
           </p>
         ) : null}
       </div>
