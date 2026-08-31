@@ -13,23 +13,24 @@ export const metadata: Metadata = {
   description: "Your checkout result.",
 };
 
-// Reads `searchParams` and looks the order up by PaymentIntent id (a Prisma
-// query), so it renders per-request and must not be prerendered.
+// Retrieves the PaymentIntent from Stripe and reads the order (a Prisma query),
+// so it renders per-request and must not be prerendered.
 export const dynamic = "force-dynamic";
 
 /**
- * Stripe redirects here after `confirmPayment`, appending `payment_intent` and
- * `redirect_status`. We look the order up by its PaymentIntent id (tenant-scoped)
- * to show a real confirmation. The order is still PENDING at this point — the
- * webhook (#14) confirms payment server-side and flips it to PAID — so the copy
- * keys off Stripe's `redirect_status`, not the DB status.
+ * Stripe redirects here after `confirmPayment`, appending `payment_intent`,
+ * `payment_intent_client_secret`, and `redirect_status`. The id alone is not
+ * proof of ownership, so the service verifies the client secret against the live
+ * intent before returning any (PII-bearing) order detail, and the intent's real
+ * status — not the client-supplied `redirect_status` — drives the copy. The order
+ * is still PENDING here; the webhook (#14) confirms payment and flips it to PAID.
  */
 export default async function CheckoutSuccessPage({
   searchParams,
 }: {
   searchParams: Promise<{
     payment_intent?: string | string[];
-    redirect_status?: string | string[];
+    payment_intent_client_secret?: string | string[];
   }>;
 }) {
   const params = await searchParams;
@@ -37,50 +38,66 @@ export default async function CheckoutSuccessPage({
     typeof params.payment_intent === "string"
       ? params.payment_intent
       : undefined;
-  const redirectStatus =
-    typeof params.redirect_status === "string"
-      ? params.redirect_status
+  const clientSecret =
+    typeof params.payment_intent_client_secret === "string"
+      ? params.payment_intent_client_secret
       : undefined;
 
   const { tenantId } = await getStoreTenant();
-  const order = paymentIntentId
-    ? await orderService.getOrderByPaymentIntent(tenantId, paymentIntentId)
-    : null;
+  const result =
+    paymentIntentId && clientSecret
+      ? await orderService.getCheckoutResult(
+          tenantId,
+          paymentIntentId,
+          clientSecret,
+        )
+      : null;
 
-  const succeeded = redirectStatus === "succeeded";
-  const processing = redirectStatus === "processing";
+  // Verified state drives everything below — an unverified link shows no order.
+  const view =
+    result === null
+      ? "invalid"
+      : result.status === "succeeded"
+        ? "succeeded"
+        : result.status === "processing"
+          ? "processing"
+          : "failed";
+  const order = result?.order ?? null;
 
-  const heading = succeeded
-    ? "Payment received"
-    : processing
-      ? "Payment processing"
-      : "Payment not completed";
+  const heading = {
+    succeeded: "Payment received",
+    processing: "Payment processing",
+    failed: "Payment not completed",
+    invalid: "Order not found",
+  }[view];
 
-  const message = succeeded
-    ? "Thanks for your order — we're getting it ready."
-    : processing
-      ? "Your payment is still processing. We'll email you once it's confirmed."
-      : "We couldn't confirm your payment. Your card was not charged.";
+  const message = {
+    succeeded: "Thanks for your order — we're getting it ready.",
+    processing:
+      "Your payment is still processing. We'll email you once it's confirmed.",
+    failed: "We couldn't confirm your payment. Your card was not charged.",
+    invalid: "This confirmation link is invalid or has expired.",
+  }[view];
 
   return (
     <div className="mx-auto flex w-full max-w-lg flex-col gap-6 px-6 py-16">
-      {/* Empties the cart once, but only on a succeeded payment. */}
-      <CheckoutComplete redirectStatus={redirectStatus} />
+      {/* Empties the cart once, and only on a verified succeeded payment. */}
+      <CheckoutComplete succeeded={view === "succeeded"} />
 
       <Card>
         <CardContent className="flex flex-col items-center gap-6 py-12 text-center">
           <span
             className={
-              succeeded
+              view === "succeeded"
                 ? "bg-primary/10 text-primary flex size-14 items-center justify-center rounded-full"
-                : processing
+                : view === "processing"
                   ? "bg-muted text-muted-foreground flex size-14 items-center justify-center rounded-full"
                   : "bg-destructive/10 text-destructive flex size-14 items-center justify-center rounded-full"
             }
           >
-            {succeeded ? (
+            {view === "succeeded" ? (
               <CircleCheck className="size-7" />
-            ) : processing ? (
+            ) : view === "processing" ? (
               <Clock className="size-7" />
             ) : (
               <CircleAlert className="size-7" />
@@ -92,7 +109,7 @@ export default async function CheckoutSuccessPage({
             <p className="text-muted-foreground text-sm">{message}</p>
           </div>
 
-          {order && (succeeded || processing) ? (
+          {order && (view === "succeeded" || view === "processing") ? (
             <dl className="border-border w-full max-w-xs rounded-lg border text-sm">
               <div className="flex items-center justify-between gap-4 px-4 py-3">
                 <dt className="text-muted-foreground">Order</dt>
@@ -115,13 +132,13 @@ export default async function CheckoutSuccessPage({
             </dl>
           ) : null}
 
-          {succeeded || processing ? (
-            <Button nativeButton={false} render={<Link href="/products" />}>
-              Continue shopping
-            </Button>
-          ) : (
+          {view === "failed" ? (
             <Button nativeButton={false} render={<Link href="/checkout" />}>
               Back to checkout
+            </Button>
+          ) : (
+            <Button nativeButton={false} render={<Link href="/products" />}>
+              Continue shopping
             </Button>
           )}
         </CardContent>

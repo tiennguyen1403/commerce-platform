@@ -1,4 +1,5 @@
 import { randomInt, randomUUID } from "node:crypto";
+import type Stripe from "stripe";
 import { getStripe } from "@/lib/stripe";
 import { cartService } from "@/server/services/cart.service";
 import {
@@ -29,6 +30,15 @@ export type StartCheckoutResult = {
   orderNumber: string;
   totalCents: number;
   currency: string;
+};
+
+export type CheckoutResult = {
+  /** The PaymentIntent's live status — authoritative for the success-page copy. */
+  status: Stripe.PaymentIntent.Status;
+  /** The persisted order (with items), or null if it can't be found. */
+  order: Awaited<
+    ReturnType<typeof orderRepository.findByPaymentIntentForTenant>
+  >;
 };
 
 // Human-friendly, unambiguous order-number suffix: no 0/1/I/O to misread.
@@ -158,11 +168,42 @@ export const orderService = {
     }
   },
 
-  /** The order behind a Stripe PaymentIntent, scoped to the tenant (or null). */
-  getOrderByPaymentIntent(tenantId: string, paymentIntentId: string) {
-    return orderRepository.findByPaymentIntentForTenant(
+  /**
+   * Resolve a checkout result for the success page. The PaymentIntent id and
+   * client secret both arrive as URL params on Stripe's redirect; the id alone
+   * is not proof of ownership (it can leak via Referer/history/logs), so we
+   * retrieve the intent and require its `client_secret` to match the one from
+   * the URL before returning any order detail. The intent's live `status` is the
+   * source of truth for the page copy — not the client-supplied `redirect_status`.
+   * Returns null when the id is unknown or the secret doesn't match.
+   */
+  async getCheckoutResult(
+    tenantId: string,
+    paymentIntentId: string,
+    clientSecret: string,
+  ): Promise<CheckoutResult | null> {
+    let paymentIntent: Stripe.Response<Stripe.PaymentIntent>;
+    try {
+      paymentIntent =
+        await getStripe().paymentIntents.retrieve(paymentIntentId);
+    } catch {
+      // Unknown or malformed PaymentIntent id.
+      return null;
+    }
+
+    // The client secret is handed only to the browser that created the intent,
+    // so matching it is what authorizes showing the order's (PII-bearing) detail.
+    if (
+      !paymentIntent.client_secret ||
+      paymentIntent.client_secret !== clientSecret
+    ) {
+      return null;
+    }
+
+    const order = await orderRepository.findByPaymentIntentForTenant(
       tenantId,
       paymentIntentId,
     );
+    return { status: paymentIntent.status, order };
   },
 };
