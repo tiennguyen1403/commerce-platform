@@ -76,6 +76,22 @@ async function handlePaymentIntentSucceeded(
       console.info(
         `Stripe webhook: order for PaymentIntent ${paymentIntent.id} marked PAID`,
       );
+      // Oversell alert: payment is captured, but the atomic decrement couldn't
+      // fully allocate one or more lines (another shopper took the last units
+      // during the payment window). We don't auto-refund/backorder yet — surface
+      // it loudly with the order + shortfall detail so an operator can act. The
+      // order still stands PAID (the money is real); only inventory fell short.
+      if (result.shortfalls.length > 0) {
+        const detail = result.shortfalls
+          .map(
+            (s) =>
+              `${s.titleSnapshot} (ordered ${s.ordered}, available ${s.available})`,
+          )
+          .join("; ");
+        console.error(
+          `Stripe webhook: OVERSELL on order ${result.order.orderNumber} (PaymentIntent ${paymentIntent.id}) — payment captured but stock was insufficient for: ${detail}. Manual refund/review needed.`,
+        );
+      }
       // Hang the confirmation off this single PENDING → PAID transition: only
       // this one delivery sends, so Stripe's retries never duplicate it (at
       // most once per order — a swallowed send failure is not retried).
