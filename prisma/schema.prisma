@@ -83,7 +83,10 @@ model Session {
 }
 
 model Account {
-  id                    String    @id
+  id String @id
+  // Better Auth 1.7 scopes account identity by `issuer`; the (issuer,
+  // accountId) pair is unique. Required to match the installed adapter's writes.
+  issuer                String
   accountId             String
   providerId            String
   userId                String
@@ -99,6 +102,7 @@ model Account {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([issuer, accountId])
   @@index([userId])
 }
 
