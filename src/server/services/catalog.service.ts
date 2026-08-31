@@ -16,6 +16,7 @@ export {
   DuplicateSkuError,
   ProductNotFoundError,
   SlugTakenError,
+  VariantInUseError,
 } from "@/server/catalog.errors";
 
 export const catalogService = {

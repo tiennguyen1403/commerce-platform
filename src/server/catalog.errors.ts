@@ -29,3 +29,27 @@ export class ProductNotFoundError extends Error {
     this.name = "ProductNotFoundError";
   }
 }
+
+/**
+ * One or more variants an admin tried to remove already appear in an order, so
+ * they can't be deleted — `OrderItem.variant` is `onDelete: Restrict` and order
+ * history is permanent. Carries the offending SKUs when the service caught it
+ * up front (so the form can name them); falls back to a generic message on the
+ * race backstop, where the DB is the one that refused and the SKUs aren't known.
+ */
+export class VariantInUseError extends Error {
+  constructor(skus?: string[]) {
+    super(VariantInUseError.messageFor(skus));
+    this.name = "VariantInUseError";
+  }
+
+  private static messageFor(skus?: string[]): string {
+    if (!skus?.length) {
+      return "A variant with existing orders can't be removed.";
+    }
+    const quoted = skus.map((sku) => `"${sku}"`).join(", ");
+    return skus.length === 1
+      ? `Variant ${quoted} has orders and can't be removed.`
+      : `Variants ${quoted} have orders and can't be removed.`;
+  }
+}
