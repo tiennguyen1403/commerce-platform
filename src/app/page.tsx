@@ -41,18 +41,24 @@ export default function Home() {
       </div>
 
       <div className="flex flex-wrap gap-3 text-sm">
-        <a
-          href="/api/health"
+        <Link
+          href="/products"
           className="bg-foreground text-background rounded-full px-4 py-2 font-medium"
         >
-          Health check
-        </a>
+          Shop the store
+        </Link>
         <Link
           href="/admin"
           className="rounded-full border border-black/10 px-4 py-2 font-medium hover:bg-black/[.04] dark:border-white/15 dark:hover:bg-white/[.06]"
         >
           Admin
         </Link>
+        <a
+          href="/api/health"
+          className="rounded-full border border-black/10 px-4 py-2 font-medium hover:bg-black/[.04] dark:border-white/15 dark:hover:bg-white/[.06]"
+        >
+          Health check
+        </a>
       </div>
     </main>
   );
