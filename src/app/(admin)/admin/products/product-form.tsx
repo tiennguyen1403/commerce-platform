@@ -17,6 +17,7 @@ import {
 import { slugify } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Card,
   CardContent,
@@ -288,13 +289,13 @@ export function ProductForm({
 
           <Field>
             <FieldLabel htmlFor="description">Description</FieldLabel>
-            <textarea
+            <Textarea
               id="description"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={4}
               placeholder="Optional. Shown on the product page."
-              className="border-input focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:bg-input/30 min-h-20 w-full rounded-lg border bg-transparent px-2.5 py-1.5 text-base transition-colors outline-none focus-visible:ring-3 disabled:pointer-events-none disabled:opacity-50 md:text-sm"
+              aria-invalid={Boolean(errors.description)}
             />
             <FieldError
               errors={
