@@ -206,4 +206,40 @@ export const orderService = {
     );
     return { status: paymentIntent.status, order };
   },
+
+  /**
+   * Confirm payment for an order from a verified Stripe webhook: move it from
+   * PENDING to PAID. This — not the browser redirect — is the source of truth
+   * for "paid." Idempotency lives in the repository's atomic status guard, so
+   * calling this for a duplicate/late event (or an unknown PaymentIntent) is a
+   * safe no-op. The outcome is reported three ways so the webhook can log each
+   * distinctly:
+   *  - `"paid"` — this delivery made the PENDING → PAID transition. The single
+   *    moment the confirmation email (#15) will hang off, so a shopper is
+   *    emailed exactly once no matter how often Stripe retries.
+   *  - `"already-processed"` — the order exists but was past PENDING already
+   *    (a normal duplicate/late delivery); nothing to do.
+   *  - `"no-order"` — no order matches this PaymentIntent for the tenant. The
+   *    order is written before the client can confirm, so a genuinely paid
+   *    intent should always have one; this signals data drift worth a warning.
+   */
+  async markOrderPaid(
+    tenantId: string,
+    paymentIntentId: string,
+  ): Promise<{ outcome: "paid" | "already-processed" | "no-order" }> {
+    const transitioned = await orderRepository.markPaidByPaymentIntent(
+      tenantId,
+      paymentIntentId,
+    );
+    if (transitioned) return { outcome: "paid" };
+
+    // No transition: tell a normal duplicate (order past PENDING) apart from the
+    // anomaly of a paid intent with no order row. One extra read, and only on
+    // the rare non-transition path — never on the hot PENDING → PAID case.
+    const order = await orderRepository.findByPaymentIntentForTenant(
+      tenantId,
+      paymentIntentId,
+    );
+    return { outcome: order ? "already-processed" : "no-order" };
+  },
 };

@@ -67,6 +67,26 @@ pnpm dev                    # http://localhost:3000
 
 Health check: <http://localhost:3000/api/health>
 
+### Testing Stripe webhooks locally
+
+The webhook — not the browser redirect — is what marks an order `PAID`, so it
+needs the [Stripe CLI](https://docs.stripe.com/stripe-cli) to reach `localhost`:
+
+```bash
+stripe login                                                   # once, links the CLI to your test-mode account
+stripe listen --forward-to localhost:3000/api/webhooks/stripe  # prints a whsec_… signing secret
+```
+
+Copy the printed `whsec_…` into `STRIPE_WEBHOOK_SECRET` in `.env` and restart
+`pnpm dev`. Then drive a real test-mode checkout, or fire a synthetic event:
+
+```bash
+stripe trigger payment_intent.succeeded
+```
+
+A duplicate delivery is a safe no-op — replaying the same event leaves the order
+`PAID` and never double-processes.
+
 ## Scripts
 
 | Script            | Description                  |

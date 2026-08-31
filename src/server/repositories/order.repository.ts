@@ -96,4 +96,25 @@ export const orderRepository = {
       include: { items: true },
     });
   },
+
+  /**
+   * Flip a tenant's order from PENDING to PAID for the given PaymentIntent, and
+   * report whether this call is the one that did it. The `status: "PENDING"`
+   * clause lives in the WHERE, so the guard and the write are a single atomic
+   * statement — this is the webhook's idempotency point. A duplicate delivery
+   * (or two deliveries racing) finds no PENDING row and updates nothing, so an
+   * order is never double-processed and can never regress out of a later state
+   * (FULFILLED/REFUNDED). Returns true only for the single delivery that moved
+   * PENDING → PAID; false for an already-processed intent or an unknown one.
+   */
+  async markPaidByPaymentIntent(
+    tenantId: string,
+    stripePaymentIntentId: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: { tenantId, stripePaymentIntentId, status: "PENDING" },
+      data: { status: "PAID" },
+    });
+    return count > 0;
+  },
 };
