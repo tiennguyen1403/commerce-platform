@@ -21,8 +21,11 @@ export const metadata: Metadata = {
   description: "Review the items in your cart before checkout.",
 };
 
-// Reading the cart cookie opts this route into dynamic rendering, so no explicit
-// `dynamic` config is needed (unlike the plain-Prisma-read product listing).
+// Force dynamic so Next never prerenders this route at build. It resolves the
+// tenant (a Prisma read) before it ever reads the cart cookie, so the cookie's
+// dynamic-bailout can't kick in first — a build with no database (CI) would hit
+// the DB and fail. This matches the product listing's `force-dynamic`.
+export const dynamic = "force-dynamic";
 
 export default async function CartPage() {
   const { tenantId } = await getStoreTenant();
