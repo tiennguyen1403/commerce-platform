@@ -1,6 +1,7 @@
 import Link from "next/link";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Package } from "lucide-react";
 import { requireAdminContext } from "@/server/auth/admin-context";
+import { buttonVariants } from "@/components/ui/button";
 
 export default async function AdminHome() {
   // Reuses the layout's cached context — no second DB round-trip — to show that
@@ -15,13 +16,19 @@ export default async function AdminHome() {
         <span className="text-foreground font-medium">{userName}</span> ({role}
         ).
       </p>
-      <Link
-        href="/"
-        className="inline-flex w-fit items-center gap-1 text-sm font-medium underline underline-offset-4"
-      >
-        <ArrowLeft className="size-4" />
-        Back to storefront
-      </Link>
+      <div className="flex flex-wrap items-center gap-3">
+        <Link href="/admin/products" className={buttonVariants()}>
+          <Package />
+          Manage products
+        </Link>
+        <Link
+          href="/"
+          className="inline-flex w-fit items-center gap-1 text-sm font-medium underline underline-offset-4"
+        >
+          <ArrowLeft className="size-4" />
+          Back to storefront
+        </Link>
+      </div>
     </div>
   );
 }
