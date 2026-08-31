@@ -3,7 +3,7 @@ import Link from "next/link";
 import { CircleAlert, CircleCheck, Clock } from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
 import { orderService } from "@/server/services/order.service";
-import { formatMoney } from "@/lib/utils";
+import { cn, formatMoney } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { CheckoutComplete } from "./checkout-complete";
@@ -87,13 +87,14 @@ export default async function CheckoutSuccessPage({
       <Card>
         <CardContent className="flex flex-col items-center gap-6 py-12 text-center">
           <span
-            className={
+            className={cn(
+              "flex size-14 items-center justify-center rounded-full",
               view === "succeeded"
-                ? "bg-primary/10 text-primary flex size-14 items-center justify-center rounded-full"
+                ? "bg-primary/10 text-primary"
                 : view === "processing"
-                  ? "bg-muted text-muted-foreground flex size-14 items-center justify-center rounded-full"
-                  : "bg-destructive/10 text-destructive flex size-14 items-center justify-center rounded-full"
-            }
+                  ? "bg-muted text-muted-foreground"
+                  : "bg-destructive/10 text-destructive",
+            )}
           >
             {view === "succeeded" ? (
               <CircleCheck className="size-7" />
@@ -115,9 +116,10 @@ export default async function CheckoutSuccessPage({
                 {order.items.map((item, index) => (
                   <li
                     key={item.id}
-                    className={`flex items-start justify-between gap-4 px-4 py-3 ${
-                      index > 0 ? "border-border border-t" : ""
-                    }`}
+                    className={cn(
+                      "flex items-start justify-between gap-4 px-4 py-3",
+                      index > 0 && "border-border border-t",
+                    )}
                   >
                     <div className="min-w-0">
                       <p className="truncate font-medium">

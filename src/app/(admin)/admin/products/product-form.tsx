@@ -507,7 +507,11 @@ export function ProductForm({
           {pending ? <Loader2 className="animate-spin" /> : null}
           {mode === "edit" ? "Save changes" : "Create product"}
         </Button>
-        <Button variant="ghost" render={<Link href="/admin/products" />}>
+        <Button
+          variant="ghost"
+          nativeButton={false}
+          render={<Link href="/admin/products" />}
+        >
           Cancel
         </Button>
       </div>

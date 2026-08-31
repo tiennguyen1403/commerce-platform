@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { loadStripe } from "@stripe/stripe-js";
 import {
   Elements,
@@ -43,13 +43,32 @@ export function CheckoutForm() {
   const [email, setEmail] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [emailInvalid, setEmailInvalid] = useState(false);
+  // Match the embedded Stripe card to the OS color scheme so it isn't a
+  // light widget stranded on a dark checkout page (the app follows
+  // prefers-color-scheme). Subscribed so a live OS theme switch re-themes it.
+  const [prefersDark, setPrefersDark] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches,
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (event: MediaQueryListEvent) =>
+      setPrefersDark(event.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
 
   async function onStart(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
+    setEmailInvalid(false);
 
     const parsed = checkoutInputSchema.safeParse({ email });
     if (!parsed.success) {
+      setEmailInvalid(true);
       setError(
         parsed.error.issues[0]?.message ?? "Enter a valid email address.",
       );
@@ -82,7 +101,7 @@ export function CheckoutForm() {
           stripe={stripePromise}
           options={{
             clientSecret: started.clientSecret,
-            appearance: { theme: "stripe" },
+            appearance: { theme: prefersDark ? "night" : "stripe" },
           }}
         >
           <PaymentStep
@@ -105,6 +124,7 @@ export function CheckoutForm() {
           type="email"
           autoComplete="email"
           placeholder="you@example.com"
+          aria-invalid={emailInvalid || undefined}
           value={email}
           onChange={(event) => setEmail(event.target.value)}
           required

@@ -31,7 +31,7 @@ export default async function StorefrontLayout({
             href="/products"
             className="inline-flex items-center gap-2 font-semibold tracking-tight"
           >
-            <Store className="size-5" />
+            <Store className="text-primary size-5" />
             {tenantName}
           </Link>
           <nav className="flex items-center gap-4 text-sm">
