@@ -13,6 +13,11 @@ jobs:
       BETTER_AUTH_SECRET: ci-secret-ci-secret-ci-secret-1234
       BETTER_AUTH_URL: http://localhost:3000
       NEXT_PUBLIC_APP_URL: http://localhost:3000
+      # Dummy Stripe values: env.ts now requires these, but the build never calls
+      # Stripe (getStripe is lazy), so any non-empty placeholder satisfies it.
+      STRIPE_SECRET_KEY: sk_test_ci_dummy
+      STRIPE_WEBHOOK_SECRET: whsec_ci_dummy
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: pk_test_ci_dummy
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6

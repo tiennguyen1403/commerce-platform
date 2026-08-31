@@ -7,8 +7,11 @@ const schema = z.object({
   DATABASE_URL: z.string().min(1),
   BETTER_AUTH_SECRET: z.string().min(1),
   BETTER_AUTH_URL: z.string().min(1),
-  STRIPE_SECRET_KEY: z.string().optional(),
-  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+  // Required from Phase 1 checkout on: the app can't take payments without them.
+  // The publishable key is deliberately absent — it's a `NEXT_PUBLIC_*` value the
+  // client reads straight from `process.env`, never through this server-only file.
+  STRIPE_SECRET_KEY: z.string().min(1),
+  STRIPE_WEBHOOK_SECRET: z.string().min(1),
   NODE_ENV: z
     .enum(["development", "test", "production"])
     .default("development"),

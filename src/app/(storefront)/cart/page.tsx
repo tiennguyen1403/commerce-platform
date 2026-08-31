@@ -133,12 +133,16 @@ export default async function CartPage() {
               </div>
             </CardContent>
             <CardFooter className="flex-col items-stretch gap-2">
-              {/* Checkout lands in #13; the CTA is present but inert until then. */}
-              <Button size="lg" className="w-full" disabled>
+              <Button
+                size="lg"
+                className="w-full"
+                nativeButton={false}
+                render={<Link href="/checkout" />}
+              >
                 Checkout
               </Button>
               <p className="text-muted-foreground text-center text-xs">
-                Secure checkout arrives in the next update.
+                You won&apos;t be charged until you confirm payment.
               </p>
             </CardFooter>
           </Card>
