@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { loadStripe } from "@stripe/stripe-js";
 import {
   Elements,
@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { startCheckoutAction } from "./actions";
+import { buildCheckoutAppearance } from "./checkout-appearance";
 
 /**
  * Payment Element checkout. The Element can only mount once a PaymentIntent
@@ -61,6 +62,15 @@ export function CheckoutForm() {
     return () => mq.removeEventListener("change", onChange);
   }, []);
 
+  // Theme the Payment Element from our design tokens (emerald accent, radius,
+  // borders) rather than Stripe's default blue presets. Recomputed when the OS
+  // scheme flips so the embedded widget re-themes with the rest of the page;
+  // `<Elements>` applies a changed appearance live (no remount needed).
+  const appearance = useMemo(
+    () => buildCheckoutAppearance(prefersDark),
+    [prefersDark],
+  );
+
   async function onStart(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
@@ -101,7 +111,7 @@ export function CheckoutForm() {
           stripe={stripePromise}
           options={{
             clientSecret: started.clientSecret,
-            appearance: { theme: prefersDark ? "night" : "stripe" },
+            appearance,
           }}
         >
           <PaymentStep
