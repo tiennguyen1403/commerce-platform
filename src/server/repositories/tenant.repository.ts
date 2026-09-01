@@ -16,4 +16,13 @@ export const tenantRepository = {
   findById(id: string) {
     return prisma.tenant.findUnique({ where: { id } });
   },
+
+  /** Set the store's single currency (`Tenant.currency`). Scoped by the tenant's
+   *  own id — the isolation root — so there's no cross-tenant reach. Touches
+   *  only the currency column: existing `priceCents` are reinterpreted, never
+   *  converted, and `Order.currency` snapshots stay historical (see the
+   *  settings service). */
+  updateCurrency(id: string, currency: string) {
+    return prisma.tenant.update({ where: { id }, data: { currency } });
+  },
 };
