@@ -3,6 +3,7 @@
 import { getStoreTenant } from "@/server/store-context";
 import { readCart } from "@/server/cart-cookie";
 import { orderService, EmptyCartError } from "@/server/services/order.service";
+import { reportError } from "@/server/observability/error-reporter";
 import { checkoutInputSchema } from "@/lib/validators/checkout";
 
 /**
@@ -45,8 +46,10 @@ export async function startCheckoutAction(input: {
         error: "Your cart is empty. Add an item before checking out.",
       };
     }
-    // Don't leak internals (Stripe/DB errors) to the client; log for the server.
-    console.error("startCheckout failed", err);
+    // Unexpected (Stripe/DB) failure — never leak internals to the client. This
+    // Server Action swallows the error and returns a friendly message, so Next's
+    // onRequestError hook never sees it: report it here at the catch site.
+    await reportError(err, { action: "startCheckout", tenantId });
     return {
       ok: false,
       error: "Something went wrong starting checkout. Please try again.",

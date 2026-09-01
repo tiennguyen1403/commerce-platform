@@ -35,6 +35,13 @@ const schema = z.object({
   // sender in friendly-name form `"Store <sender@domain>"` (a bare address works too).
   RESEND_API_KEY: optionalEnvString,
   EMAIL_FROM: optionalEnvString,
+  // Optional error-alert webhook (a Slack/Discord incoming-webhook URL). When set,
+  // `reportError` POSTs a compact summary of each reported error here so alerts
+  // outlive Vercel Hobby's 1-hour log retention. Best-effort, validated at use and
+  // never at boot (same reasoning as the Resend keys above): unset/blank disables
+  // the POST — logs still emit — and a bad URL only fails that one fire-and-forget
+  // fetch, which must never keep the app from booting.
+  ERROR_WEBHOOK_URL: optionalEnvString,
   NODE_ENV: z
     .enum(["development", "test", "production"])
     .default("development"),
