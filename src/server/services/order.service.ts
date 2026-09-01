@@ -203,6 +203,16 @@ const REUSABLE_PI_STATUSES = new Set<Stripe.PaymentIntent.Status>([
   "requires_confirmation",
 ]);
 
+/** In-flight PI statuses that are routine to meet mid-sweep (a payment genuinely in
+ *  progress) — the sweep logs these at info. `succeeded` (webhook lag) and any other
+ *  non-cancellable status (a cancel that lost the race, or an unknown one) are noisier
+ *  signals the sweep logs at error/warn instead. */
+const EXPECTED_IN_FLIGHT_STATUSES = new Set<Stripe.PaymentIntent.Status>([
+  "processing",
+  "requires_capture",
+  "requires_action",
+]);
+
 const sweepLog = logger.child({ component: "order-sweep" });
 
 /** Aggregate a set of lines into `variantId → total quantity`, so two carts with
@@ -334,6 +344,80 @@ async function cancelPaymentIntentReporting(
   }
 }
 
+/** How a PENDING order's PaymentIntent stands relative to being safely retired.
+ *  Money is captured on the intent, not the order row, so an order is flipped to
+ *  CANCELLED only when its intent is provably `canceled`. Shared by the abandoned
+ *  sweep (#25) and the admin cancel (#81), which act on the verdict differently
+ *  (skip-and-log vs. refuse-with-a-typed-error). */
+type PaymentIntentDisposition =
+  /** Now `canceled` (it already was, or this call canceled it) — no charge can land,
+   *  so the order may be flipped to CANCELLED. */
+  | { kind: "canceled" }
+  /** Payment is captured, capturing, or authenticating — or a cancel just lost the
+   *  race to one — so the intent is NOT canceled and the order must be left for the
+   *  webhook (#14). `status` is the last-known intent status, for the caller's
+   *  log/message. */
+  | { kind: "payment-in-flight"; status: Stripe.PaymentIntent.Status }
+  /** The intent couldn't be read (unknown/deleted, or Stripe unreachable), so its
+   *  state can't be verified — the caller must not cancel blindly. */
+  | { kind: "unreadable" };
+
+/**
+ * Retire a PENDING order's chargeable PaymentIntent as far as is money-safe, and
+ * report the disposition. Retrieves the intent, then:
+ *  - captured/capturing/authenticating (`succeeded`/`processing`/`requires_capture`/
+ *    `requires_action`) → `payment-in-flight` — never cancel a paying/paid intent;
+ *  - `canceled` → `canceled` — already retired; reconcile the order, no cancel call;
+ *  - `requires_payment_method`/`requires_confirmation` → cancel it, then `canceled`
+ *    if the cancel took, else `payment-in-flight` (it raced a real payment);
+ *  - an unknown/future status → `payment-in-flight` — never cancel what we can't
+ *    classify;
+ *  - unreadable → `unreadable`.
+ * The caller flips the order to CANCELLED only on `canceled`. This is the single
+ * money-safe primitive behind both the sweep and the admin cancel.
+ */
+async function disposeChargeableIntent(
+  paymentIntentId: string,
+): Promise<PaymentIntentDisposition> {
+  let paymentIntent: Stripe.PaymentIntent;
+  try {
+    paymentIntent = await getStripe().paymentIntents.retrieve(paymentIntentId);
+  } catch {
+    return { kind: "unreadable" };
+  }
+
+  switch (paymentIntent.status) {
+    // Captured, capturing, or awaiting customer authentication (3DS) — payment is in
+    // flight or done; the webhook owns it. Never cancel.
+    case "succeeded":
+    case "processing":
+    case "requires_capture":
+    case "requires_action":
+      return { kind: "payment-in-flight", status: paymentIntent.status };
+
+    // Already retired at Stripe (a prior sweep/cancel canceled the intent but didn't
+    // finish the DB flip, or it was canceled in the dashboard) — reconcile only.
+    case "canceled":
+      return { kind: "canceled" };
+
+    // Abandoned and still chargeable: cancel it, and report `canceled` only if the
+    // cancel confirms it took. A cancel that lost the race to a real payment comes
+    // back false → `payment-in-flight`, so the order is left for the webhook.
+    case "requires_payment_method":
+    case "requires_confirmation": {
+      const canceled = await cancelPaymentIntentReporting(paymentIntentId);
+      return canceled
+        ? { kind: "canceled" }
+        : { kind: "payment-in-flight", status: paymentIntent.status };
+    }
+
+    // An unknown/future status we can't classify — treat as in-flight and never
+    // cancel/flip it.
+    default:
+      return { kind: "payment-in-flight", status: paymentIntent.status };
+  }
+}
+
 /**
  * Sweep one abandoned-checkout order (#25). The DB flip
  * (`cancelPendingAndRelease`) is the arbiter of the order's terminal state —
@@ -367,95 +451,59 @@ async function sweepOne(order: StalePendingOrder): Promise<SweepOutcome> {
     return flip();
   }
 
-  let paymentIntent: Stripe.PaymentIntent;
-  try {
-    paymentIntent = await getStripe().paymentIntents.retrieve(
-      order.stripePaymentIntentId,
-    );
-  } catch (err) {
-    // Can't read the intent (unknown/deleted, or Stripe is down) — we can't prove
-    // it's uncharged, so leave the order for a later run rather than cancel blindly.
-    sweepLog.warn(
-      { err, orderId: order.id, paymentIntentId: order.stripePaymentIntentId },
-      "sweep: could not retrieve PaymentIntent; leaving order for a later run",
-    );
-    return "skipped";
-  }
-
-  switch (paymentIntent.status) {
-    // Payment captured or capturing — the webhook owns this order; never cancel.
-    case "succeeded":
-      // A *succeeded* intent whose order is still PENDING past the grace window
-      // means the webhook is lagging or was lost — surface it loudly; the order is
-      // real and must not be cancelled.
-      sweepLog.error(
-        {
-          orderId: order.id,
-          paymentIntentId: paymentIntent.id,
-          tenantId: order.tenantId,
-        },
-        "sweep: PaymentIntent SUCCEEDED but order still PENDING — webhook may be lost; NOT cancelling",
-      );
-      return "skipped";
-    case "processing":
-    case "requires_capture":
-      sweepLog.info(
-        {
-          orderId: order.id,
-          paymentIntentId: paymentIntent.id,
-          status: paymentIntent.status,
-        },
-        "sweep: payment in progress; leaving order for the webhook",
-      );
-      return "skipped";
-
-    // The shopper started a payment that still needs authentication (3DS). In
-    // flight — don't cancel. If they abandon it, Stripe returns the intent to
-    // requires_payment_method and a later run sweeps it.
-    case "requires_action":
-      sweepLog.info(
-        { orderId: order.id, paymentIntentId: paymentIntent.id },
-        "sweep: payment awaiting customer action; leaving for a later run",
-      );
-      return "skipped";
-
-    // Already canceled at Stripe (e.g. a prior run canceled the intent but didn't
-    // finish the DB flip before dying) — reconcile the order now; no cancel needed.
+  const disposition = await disposeChargeableIntent(
+    order.stripePaymentIntentId,
+  );
+  switch (disposition.kind) {
+    // The intent can no longer be charged (we canceled it, or it already was) —
+    // reconcile the order. The guarded flip no-ops if a racing webhook won → skipped.
     case "canceled":
       return flip();
 
-    // requires_payment_method | requires_confirmation: an abandoned, still-chargeable
-    // intent. Cancel it, and flip the order ONLY if the cancel confirms it's now
-    // canceled — so a shopper who pays in the race window (cancel fails) keeps their
-    // order PENDING for the webhook to complete.
-    case "requires_payment_method":
-    case "requires_confirmation": {
-      const canceled = await cancelPaymentIntentReporting(paymentIntent.id);
-      if (!canceled) {
+    // Couldn't read/cancel the intent (unknown/deleted, or Stripe down) — can't prove
+    // it's uncharged, so leave the order for a later run rather than cancel blindly.
+    case "unreadable":
+      sweepLog.warn(
+        { orderId: order.id, paymentIntentId: order.stripePaymentIntentId },
+        "sweep: could not retrieve/cancel PaymentIntent; leaving order for a later run",
+      );
+      return "skipped";
+
+    // Payment is in flight or captured — never cancel. Log severity tracks how
+    // surprising the status is: a *succeeded* intent whose order is still PENDING
+    // past the grace window means the webhook is lagging or was lost (error); a
+    // genuinely in-progress payment is routine (info); anything else — a cancel that
+    // lost the race to a real payment (a `requires_*` status survived the cancel), or
+    // an unrecognised Stripe status — is a near-miss worth eyeballing (warn).
+    case "payment-in-flight":
+      if (disposition.status === "succeeded") {
+        sweepLog.error(
+          {
+            orderId: order.id,
+            paymentIntentId: order.stripePaymentIntentId,
+            tenantId: order.tenantId,
+          },
+          "sweep: PaymentIntent SUCCEEDED but order still PENDING — webhook may be lost; NOT cancelling",
+        );
+      } else if (EXPECTED_IN_FLIGHT_STATUSES.has(disposition.status)) {
+        sweepLog.info(
+          {
+            orderId: order.id,
+            paymentIntentId: order.stripePaymentIntentId,
+            status: disposition.status,
+          },
+          "sweep: payment in progress; leaving order for the webhook",
+        );
+      } else {
         sweepLog.warn(
           {
             orderId: order.id,
-            paymentIntentId: paymentIntent.id,
-            status: paymentIntent.status,
+            paymentIntentId: order.stripePaymentIntentId,
+            status: disposition.status,
           },
-          "sweep: PaymentIntent cancel did not take (likely paid mid-sweep); leaving order for the webhook",
+          "sweep: intent not cancellable (cancel raced a payment, or unexpected status); leaving order for the webhook",
         );
-        return "skipped";
       }
-      return flip();
-    }
-
-    // An unknown/future status we don't understand — be conservative and never
-    // cancel what we can't classify; surface it and leave the order for review.
-    default:
-      sweepLog.warn(
-        {
-          orderId: order.id,
-          paymentIntentId: paymentIntent.id,
-          status: paymentIntent.status,
-        },
-        "sweep: unexpected PaymentIntent status; leaving order untouched",
-      );
       return "skipped";
   }
 }
@@ -657,19 +705,60 @@ export const orderService = {
   },
 
   /**
-   * Cancel a PENDING order (admin action): release its inventory hold and move it
-   * to CANCELLED. Delegates the atomic guarded transition to the repository and
-   * translates a no-op into a typed error the action boundary maps to a message —
-   * `OrderNotFoundError` (no such order) or `OrderTransitionError` (it exists but
-   * isn't PENDING: already paid/cancelled/fulfilled).
+   * Cancel a PENDING order (admin action): retire its Stripe PaymentIntent, release
+   * its inventory hold, and move it to CANCELLED.
+   *
+   * Money-safety (#81): the order's PaymentIntent is left chargeable until this runs,
+   * so cancelling the order without cancelling the intent could strand a shopper who
+   * pays in the window before the webhook flips PENDING → PAID — capturing funds
+   * against a CANCELLED order. So the intent is retired FIRST (money is captured on
+   * the intent, not the row) and the order is flipped only once the intent is
+   * provably `canceled` (`disposeChargeableIntent`, the same primitive the sweep
+   * uses). If payment is in flight or captured, the cancel is REFUSED with an
+   * `OrderTransitionError` — the webhook stays the sole writer of PAID, and the admin
+   * can refresh and refund once it lands.
+   *
+   * The repository's guarded `cancelPendingAndRelease` remains the authoritative
+   * arbiter of the flip (its `status: PENDING` guard turns any race into a no-op).
+   * Translates a no-op / bad state into a typed error the action boundary maps to a
+   * message — `OrderNotFoundError` (no such order) or `OrderTransitionError` (not
+   * PENDING: already paid/cancelled/fulfilled, or a payment is completing).
    *
    * This is a STAFF+ operation. The role is enforced by the calling admin Server
    * Action with `assertRole(ROLES.STAFF)` before it calls in — services stay
    * role-agnostic and tenant-scoped, matching the codebase's boundary-gating
-   * pattern (see membership.service). The admin orders UI that wires this action
-   * lands with #40; this method is its tested backend.
+   * pattern (see membership.service).
    */
   async cancelOrder(tenantId: string, orderId: string): Promise<void> {
+    // Pre-read to get the linked PaymentIntent and fail fast on an absent / non-PENDING
+    // order before any Stripe call. The guarded transition below is still authoritative.
+    const order = await orderRepository.findByIdForTenant(tenantId, orderId);
+    if (!order) throw new OrderNotFoundError();
+    if (order.status !== "PENDING") failTransition("cancelled", order.status);
+
+    if (order.stripePaymentIntentId) {
+      const disposition = await disposeChargeableIntent(
+        order.stripePaymentIntentId,
+      );
+      if (disposition.kind === "payment-in-flight") {
+        // The shopper is completing (or just completed) payment in the window before
+        // the webhook flips PENDING → PAID. Refuse rather than cancel a paying/paid
+        // order; the webhook stays the sole writer of PAID.
+        throw new OrderTransitionError(
+          "This order can't be cancelled because a payment is being completed. Refresh in a moment to see its updated status.",
+        );
+      }
+      if (disposition.kind === "unreadable") {
+        // Couldn't verify the intent (Stripe unreachable / unknown intent). Don't
+        // cancel an order whose payment state we can't confirm — surface it; retry.
+        throw new Error(
+          `Could not verify the PaymentIntent for order ${orderId}; cancel not applied.`,
+        );
+      }
+      // disposition.kind === "canceled": the intent can no longer be charged — safe
+      // to flip the order below.
+    }
+
     const result = await orderRepository.cancelPendingAndRelease(
       tenantId,
       orderId,
