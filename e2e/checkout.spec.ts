@@ -30,11 +30,13 @@ import { postPaymentIntentSucceeded, stripeClient } from "./support/stripe";
 // `prisma/seed.ts`.
 const PRODUCT = { slug: "canvas-tote-bag", sku: "TOTE-OS" } as const;
 
-// Stripe's canonical "charge succeeds immediately" test card — no 3DS step.
+// Stripe's canonical "charge succeeds immediately" test card — no 3DS step. The
+// country is pinned (below) so a ZIP field always renders; postal is any 5 digits.
 const TEST_CARD = {
   number: "4242 4242 4242 4242",
   expiry: "12 / 34",
   cvc: "123",
+  postal: "12345",
 } as const;
 
 // Real network to Stripe (mount + confirm + redirect) plus a webhook round-trip:
@@ -92,8 +94,6 @@ test("checkout pays a seeded product; the webhook marks it PAID and decrements s
   // iframe. Several `__privateStripeFrame`s exist and their `title`s shift over the
   // element's lifecycle, so target the one frame by its stable asset path — the
   // accordion rows and card fields both live in `elements-inner-accessory-target`.
-  // Open the "Card" row (a `<div role="button">`), then fill the card fields — this
-  // test account collects no postal code, so number/expiry/CVC is the whole form.
   await page.getByRole("button", { name: /^Pay/ }).waitFor();
   const payFrame = page.frameLocator(
     'iframe[src*="elements-inner-accessory-target"]',
@@ -104,9 +104,17 @@ test("checkout pays a seeded product; the webhook marks it PAID and decrements s
   // The accordion starts collapsed; expand Card only if its fields aren't shown yet
   // (guards against a future default-expanded layout, where a click would collapse).
   if (!(await cardNumber.isVisible())) await cardRow.click();
+  await cardNumber.waitFor();
+
+  // Pin the billing country to US BEFORE filling, so the card form is identical
+  // whatever the runner's geo: Stripe geolocates the browser, and a US-hosted CI
+  // runner shows a required ZIP field that a non-US locale (e.g. a local dev box)
+  // doesn't. Forcing US makes the ZIP always present and the fill deterministic.
+  await payFrame.locator('select[name="country"]').selectOption("US");
   await cardNumber.fill(TEST_CARD.number);
   await payFrame.getByPlaceholder("MM / YY").fill(TEST_CARD.expiry);
   await payFrame.getByPlaceholder("CVC").fill(TEST_CARD.cvc);
+  await payFrame.locator('input[name="postalCode"]').fill(TEST_CARD.postal);
 
   await page.getByRole("button", { name: /^Pay/ }).click();
 
