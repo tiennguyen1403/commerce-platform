@@ -7,6 +7,7 @@ import { tenantRepository } from "@/server/repositories/tenant.repository";
 import { membershipRepository } from "@/server/repositories/membership.repository";
 import { DEMO_TENANT_SLUG } from "@/config/constants";
 import { ROLES, hasAtLeast, type Role } from "@/config/roles";
+import { InsufficientRoleError } from "@/server/auth/rbac.errors";
 
 export interface AdminContext {
   userId: string;
@@ -59,3 +60,30 @@ export const requireAdminContext = cache(async (): Promise<AdminContext> => {
     role: membership.role,
   };
 });
+
+/**
+ * Page-level role gate. Resolves the admin context (redirecting a visitor who
+ * isn't a STAFF+ member, per `requireAdminContext`), then redirects a member
+ * below `min` back to `/admin` — a signed-in member who simply lacks the
+ * privilege, not someone to bounce to a sign-in form. Reuses the cached context,
+ * so gating a page adds no extra query. For use in Server Components; Server
+ * Actions use `assertRole`.
+ */
+export async function requireRole(min: Role): Promise<AdminContext> {
+  const ctx = await requireAdminContext();
+  if (!hasAtLeast(ctx.role, min)) redirect("/admin");
+  return ctx;
+}
+
+/**
+ * Server Action role gate. Same resolution as `requireRole`, but throws
+ * `InsufficientRoleError` instead of redirecting (a redirect is meaningless in
+ * an action's JSON response). Render-time nav gating is not a security boundary,
+ * so every privileged action must re-check here — Server Actions are public
+ * endpoints. The boundary maps the error to a friendly message.
+ */
+export async function assertRole(min: Role): Promise<AdminContext> {
+  const ctx = await requireAdminContext();
+  if (!hasAtLeast(ctx.role, min)) throw new InsufficientRoleError();
+  return ctx;
+}

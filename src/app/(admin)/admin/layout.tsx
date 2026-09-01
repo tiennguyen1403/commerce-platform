@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import Link from "next/link";
 import { Store } from "lucide-react";
 import { requireAdminContext } from "@/server/auth/admin-context";
+import { ROLES, hasAtLeast } from "@/config/roles";
 import { SignOutButton } from "./sign-out-button";
 
 export default async function AdminLayout({
@@ -11,7 +12,10 @@ export default async function AdminLayout({
 }) {
   // Gates the entire /admin subtree; also resolves the tenant context that
   // child pages read via the same cached call.
-  const { tenantName, userEmail } = await requireAdminContext();
+  const { tenantName, userEmail, role } = await requireAdminContext();
+  // Member management is OWNER-only. Hiding the link is UX, not a security
+  // boundary — the page itself re-checks with `requireRole(OWNER)`.
+  const canManageMembers = hasAtLeast(role, ROLES.OWNER);
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -35,6 +39,14 @@ export default async function AdminLayout({
               >
                 Products
               </Link>
+              {canManageMembers ? (
+                <Link
+                  href="/admin/members"
+                  className="text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  Members
+                </Link>
+              ) : null}
             </nav>
           </div>
           <div className="flex items-center gap-3">
