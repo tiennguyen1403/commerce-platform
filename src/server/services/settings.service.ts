@@ -1,3 +1,4 @@
+import "server-only";
 import { tenantRepository } from "@/server/repositories/tenant.repository";
 import type { CurrencyValue } from "@/lib/validators/catalog";
 

@@ -1,3 +1,4 @@
+import "server-only";
 import { productRepository } from "@/server/repositories/product.repository";
 import type { ProductInput } from "@/lib/validators/catalog";
 import { ProductNotFoundError, SlugTakenError } from "@/server/catalog.errors";
