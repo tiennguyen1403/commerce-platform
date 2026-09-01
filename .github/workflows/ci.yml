@@ -91,3 +91,77 @@ jobs:
       # keeps the DB-touching suites serial so the lock-based backstop test sees
       # only its own contention.
       - run: pnpm test:integration
+
+  # Full-checkout E2E (issue #50): drives the REAL Stripe test-mode Payment Element
+  # in a browser against a production build, then hand-signs the
+  # `payment_intent.succeeded` webhook and asserts the order is PAID with stock
+  # decremented (a direct Prisma read). `needs: verify` so a browser + Stripe run is
+  # never spent on a build that lint/typecheck/unit already condemned.
+  e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dropshipping
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dropshipping
+      BETTER_AUTH_SECRET: ci-secret-ci-secret-ci-secret-1234
+      BETTER_AUTH_URL: http://localhost:3000
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      # REAL Stripe TEST-mode keys (repository secrets). Set at the job level so they
+      # cover every step — critically `pnpm build`, where NEXT_PUBLIC_* is inlined
+      # (an empty publishable key there makes the Payment Element never mount). The
+      # secret key lets the test retrieve the live PaymentIntent, and the success
+      # page verify it. Add these under Settings → Secrets → Actions.
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_TEST_SECRET_KEY }}
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.STRIPE_TEST_PUBLISHABLE_KEY }}
+      # A plain literal is fine: the test hand-signs the webhook with this exact
+      # value and the server verifies with the same one — it's never checked against
+      # Stripe, so no real signing secret (or `stripe listen`) is needed.
+      STRIPE_WEBHOOK_SECRET: whsec_e2e_dummy_secret
+      # Email intentionally UNCONFIGURED for e2e (unlike the build-only jobs above):
+      # this is the one job that actually reaches the runtime send path — the PAID
+      # flip dispatches the order confirmation. A blank key short-circuits to
+      # EmailNotConfiguredError (swallowed, so the webhook still 200s) instead of a
+      # doomed Resend call that adds latency and a red-herring error to every run.
+      RESEND_API_KEY: ""
+      EMAIL_FROM: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm prisma generate
+      # Apply every migration to the fresh service database, then seed the demo
+      # store (products + admin) the storefront flow and the auth-gate spec need.
+      - run: pnpm db:deploy
+      - run: pnpm db:seed
+      # Chromium only — the config's single project. `--with-deps` pulls the OS libs.
+      - run: pnpm exec playwright install --with-deps chromium
+      # NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY is inlined at this step (job env covers it).
+      - run: pnpm build
+      # Playwright boots `pnpm start` (prod build) itself and runs the whole e2e/
+      # suite: the checkout flow above plus the admin auth-gate spec.
+      - run: pnpm test:e2e
+      - uses: actions/upload-artifact@v4
+        # Upload the report on failures too (it's how a red run is diagnosed), but
+        # not when the job was cancelled.
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
