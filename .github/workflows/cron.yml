@@ -1,0 +1,63 @@
+name: Cron
+
+# Frequent primary trigger for the background-work harness (issue #53). Hits the
+# secret-protected GET /api/cron/* routes on the deployed app. Vercel Cron
+# (vercel.json) is the durable backstop — GitHub disables scheduled workflows
+# after 60 days of repo inactivity, and Vercel covers that gap.
+#
+# To enable, configure on the repository (Settings → Secrets and variables →
+# Actions):
+#   • variable  CRON_TARGET_URL — the deployed base URL, e.g. https://your-app.vercel.app
+#   • secret    CRON_SECRET     — the same value set on the Vercel deployment
+# Until both exist the scheduled run is a no-op skip (never a red ✗). Scheduled
+# runs use the workflow file on the default branch.
+on:
+  schedule:
+    - cron: "*/10 * * * *" # every 10 minutes (UTC)
+  workflow_dispatch: {} # manual "run now" from the Actions tab
+
+# The job only makes outbound HTTP calls; it needs no access to the repo.
+permissions:
+  contents: read
+
+# A slow run must never overlap the next tick.
+concurrency:
+  group: cron
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger cron endpoints
+        env:
+          BASE_URL: ${{ vars.CRON_TARGET_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "${BASE_URL}" ] || [ -z "${CRON_SECRET}" ]; then
+            echo "::notice::CRON_TARGET_URL variable or CRON_SECRET secret not set — skipping. Configure both to enable the scheduled cron (see this workflow's header)."
+            exit 0
+          fi
+
+          set -euo pipefail
+          base="${BASE_URL%/}" # tolerate a trailing slash so we never build //api
+          status=0
+          for path in dispatch-outbox sweep-orders; do
+            url="${base}/api/cron/${path}"
+            echo "→ GET ${url}"
+            # Secret comes from the step env (not hard-coded; GitHub masks it in
+            # logs); -m 70 sits just above the routes' maxDuration=60. A non-2xx is
+            # a real failure, so capture the status and fail the step on it — and
+            # fall back to 000 if curl can't connect at all.
+            code=$(curl -sS -m 70 -o /tmp/cron-body -w '%{http_code}' \
+              -H "Authorization: Bearer ${CRON_SECRET}" "${url}") || code=000
+            echo "  HTTP ${code}"
+            sed 's/^/  /' /tmp/cron-body 2>/dev/null || true
+            echo
+            if [ "${code}" != "200" ]; then
+              echo "::error::${url} returned HTTP ${code}"
+              status=1
+            fi
+          done
+          exit ${status}
