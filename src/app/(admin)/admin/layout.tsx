@@ -13,9 +13,9 @@ export default async function AdminLayout({
   // Gates the entire /admin subtree; also resolves the tenant context that
   // child pages read via the same cached call.
   const { tenantName, userEmail, role } = await requireAdminContext();
-  // Member management is OWNER-only. Hiding the link is UX, not a security
-  // boundary — the page itself re-checks with `requireRole(OWNER)`.
-  const canManageMembers = hasAtLeast(role, ROLES.OWNER);
+  // Member management and store settings are OWNER-only. Hiding the links is
+  // UX, not a security boundary — each page re-checks with `requireRole(OWNER)`.
+  const isOwner = hasAtLeast(role, ROLES.OWNER);
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -39,13 +39,21 @@ export default async function AdminLayout({
               >
                 Products
               </Link>
-              {canManageMembers ? (
-                <Link
-                  href="/admin/members"
-                  className="text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  Members
-                </Link>
+              {isOwner ? (
+                <>
+                  <Link
+                    href="/admin/members"
+                    className="text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    Members
+                  </Link>
+                  <Link
+                    href="/admin/settings"
+                    className="text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    Settings
+                  </Link>
+                </>
               ) : null}
             </nav>
           </div>
