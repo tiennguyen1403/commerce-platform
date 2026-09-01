@@ -36,4 +36,8 @@ jobs:
       - run: pnpm db:check-migrations
       - run: pnpm lint
       - run: pnpm typecheck
+      # Infra-free tests (pure logic + sync DOM) — the `test` script is
+      # `vitest run --project unit --project dom`. The integration project needs a
+      # real Postgres and runs in a separate job (later milestone), so it's excluded.
+      - run: pnpm test
       - run: pnpm build
