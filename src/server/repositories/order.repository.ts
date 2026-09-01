@@ -1,6 +1,9 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/server/db";
-import { OrderNumberTakenError } from "@/server/order.errors";
+import {
+  OrderNumberTakenError,
+  InsufficientStockError,
+} from "@/server/order.errors";
 
 /**
  * Data-access for orders. Every method is scoped by `tenantId` so a store can
@@ -70,35 +73,119 @@ export type MarkPaidResult =
   | { transitioned: false; orderExisted: boolean }
   | { transitioned: true; order: OrderWithItems; shortfalls: StockShortfall[] };
 
+/**
+ * The single global order in which every variant-touching loop (reserve,
+ * allocate, release) locks rows. Two transactions that share variants then
+ * always acquire those row locks in the same sequence, so Postgres can't catch
+ * them in a lock cycle and deadlock-abort one. Sorting in JS (not relying on a
+ * query's collation) makes that order identical across all three loops.
+ */
+function byVariantId(
+  a: { variantId: string },
+  b: { variantId: string },
+): number {
+  return a.variantId < b.variantId ? -1 : a.variantId > b.variantId ? 1 : 0;
+}
+
+/**
+ * Release the reservations a set of order lines hold, flooring each variant's
+ * `reserved` at 0 (`GREATEST(reserved - qty, 0)`). Runs inside the caller's
+ * transaction; lines ordered by `variantId` for the deadlock-avoidance above.
+ * Best-effort by construction — an unguarded, tenant-scoped UPDATE that can't
+ * fail on a row count, so a double-fire or counter drift simply no-ops at the
+ * floor. The shared reservation-release primitive: used by the PAID reconcile
+ * below, and by the CANCELLED transition (#56) and the abandoned-PENDING sweep
+ * (#25) once those land.
+ */
+async function releaseReserved(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  items: Array<{ variantId: string; quantity: number }>,
+): Promise<void> {
+  for (const item of [...items].sort(byVariantId)) {
+    // Parameterized tagged-template raw SQL (never `$executeRawUnsafe`): the
+    // `${}` are bound params. Tenant-scoped through Product — a variant carries
+    // no tenantId — so one store's release can never touch another's rows.
+    await tx.$executeRaw`
+      UPDATE "ProductVariant" AS v
+      SET "reserved" = GREATEST(v."reserved" - ${item.quantity}, 0),
+          "updatedAt" = NOW()
+      FROM "Product" AS p
+      WHERE v."id" = ${item.variantId}
+        AND v."productId" = p."id"
+        AND p."tenantId" = ${tenantId}
+    `;
+  }
+}
+
 export const orderRepository = {
   /**
-   * Create an order and its line items in one atomic write. Prisma runs the
-   * parent + nested `create` inside a single transaction, so an order never
-   * exists without its items. A duplicate `orderNumber` surfaces as
-   * `OrderNumberTakenError` for the service to retry.
+   * Create a PENDING order and its line items, reserving inventory for each line
+   * — all in one transaction, so an order never exists without both its items and
+   * its inventory hold. Each line's `reserved` is bumped under an atomic guard
+   * (`stock - reserved >= qty`); if any line can't be covered the whole
+   * transaction rolls back with `InsufficientStockError` (no partial hold, no
+   * orphan order). A duplicate `orderNumber` still surfaces as
+   * `OrderNumberTakenError` for the service to retry — the retry re-runs the
+   * transaction, so the rolled-back reservations are simply re-taken.
+   *
+   * Reserving BEFORE the insert is deliberate: it takes each variant's exclusive
+   * row lock (in `variantId` order) up front, so the KEY-SHARE locks the nested
+   * item inserts then take are already held. Every variant-locking path here
+   * (this reserve, the PAID decrement, the release) uses `byVariantId`, so
+   * concurrent checkouts and confirmations acquire locks in one global order and
+   * can't deadlock.
    */
   async createWithItems(input: CreateOrderInput) {
     try {
-      return await prisma.order.create({
-        data: {
-          id: input.id,
-          tenantId: input.tenantId,
-          orderNumber: input.orderNumber,
-          status: "PENDING",
-          email: input.email,
-          totalCents: input.totalCents,
-          currency: input.currency,
-          stripePaymentIntentId: input.stripePaymentIntentId,
-          items: {
-            create: input.items.map((item) => ({
-              variantId: item.variantId,
-              titleSnapshot: item.titleSnapshot,
-              priceCents: item.priceCents,
-              quantity: item.quantity,
-            })),
-          },
+      return await prisma.$transaction(
+        async (tx) => {
+          for (const item of [...input.items].sort(byVariantId)) {
+            // Atomic reserve guard. Parameterized tagged-template raw SQL (never
+            // `$executeRawUnsafe`) because Prisma's query builder can't compare
+            // two columns; the `${}` are bound params. Tenant-scoped through
+            // Product (a variant has no tenantId). Zero rows affected = the
+            // sellable units aren't there → roll the order back as a sold-out.
+            const reserved = await tx.$executeRaw`
+              UPDATE "ProductVariant" AS v
+              SET "reserved" = v."reserved" + ${item.quantity},
+                  "updatedAt" = NOW()
+              FROM "Product" AS p
+              WHERE v."id" = ${item.variantId}
+                AND v."productId" = p."id"
+                AND p."tenantId" = ${input.tenantId}
+                AND v."stock" - v."reserved" >= ${item.quantity}
+            `;
+            if (reserved === 0) throw new InsufficientStockError();
+          }
+
+          return await tx.order.create({
+            data: {
+              id: input.id,
+              tenantId: input.tenantId,
+              orderNumber: input.orderNumber,
+              status: "PENDING",
+              email: input.email,
+              totalCents: input.totalCents,
+              currency: input.currency,
+              stripePaymentIntentId: input.stripePaymentIntentId,
+              items: {
+                create: input.items.map((item) => ({
+                  variantId: item.variantId,
+                  titleSnapshot: item.titleSnapshot,
+                  priceCents: item.priceCents,
+                  quantity: item.quantity,
+                })),
+              },
+            },
+          });
         },
-      });
+        // Reserve loop (one guarded UPDATE per line) + the order insert run in one
+        // interactive transaction; lift Prisma's 5s default so a large cart on a
+        // high-latency managed Postgres can't time out mid-reserve (mirrors
+        // markPaidByPaymentIntent / product updateWithVariants).
+        { timeout: 15_000 },
+      );
     } catch (err) {
       mapWriteError(err);
     }
@@ -145,12 +232,15 @@ export const orderRepository = {
    * Stock allocation lives here rather than the product repository because it
    * must share the flip's transaction. Each line is decremented with an atomic
    * guarded write (`stock >= quantity`), so it applies fully or not at all and
-   * stock can never go negative. If the units aren't there at capture (another
-   * shopper took the last of them during the payment window), that line is left
-   * untouched and returned as a `shortfall` — the order still stands PAID (the
-   * payment is real), and the caller surfaces the shortfall for manual review.
-   * (Automated refund/backorder and reserve-at-PENDING with an expiry sweep are
-   * follow-ups; this covers oversell at capture without ever corrupting stock.)
+   * stock can never go negative. The order's inventory was already held at
+   * PENDING (see `createWithItems`), so right after the decrement this releases
+   * that hold — `reserved` drops by the same amount `stock` did, keeping
+   * `available = stock - reserved` correct. If the units aren't there at capture
+   * (an admin cut `stock` below the reserved count in the payment window), that
+   * line is left untouched and returned as a `shortfall` — the order still stands
+   * PAID (the payment is real), and the caller surfaces the shortfall for manual
+   * review. (Automated refund/backorder is a follow-up; this covers oversell at
+   * capture without ever corrupting stock.)
    *
    * Returns `{ transitioned: false, orderExisted }` when nothing moved —
    * `orderExisted` separates an already-processed intent from an unknown one so
@@ -171,11 +261,10 @@ export const orderRepository = {
         // PENDING row changes nothing.
         const order = await tx.order.findFirst({
           where: { tenantId, stripePaymentIntentId },
-          // Order the lines by variantId so the guarded decrements below always
-          // lock variant rows in a consistent global order: two orders paid at
-          // once that share variants then can't deadlock by locking the same rows
-          // in opposite orders (Postgres would abort one — self-healing via the
-          // webhook retry, but noisy and it delays the PAID/email under load).
+          // Read the lines sorted for a deterministic returned shape; the
+          // decrement and release loops below re-sort by `byVariantId`, which is
+          // the authoritative global lock order shared with the reserve path — so
+          // two transactions that share variants can never deadlock.
           include: { items: { orderBy: { variantId: "asc" } } },
         });
         if (!order) return { transitioned: false, orderExisted: false };
@@ -215,9 +304,12 @@ export const orderRepository = {
 
         // We own the transition — allocate inventory in the same transaction. A
         // line whose stock can't cover its quantity is collected as a shortfall
-        // (oversell) rather than forced negative.
+        // (oversell) rather than forced negative. Reservation makes this rare —
+        // the units were held at PENDING — but an admin cutting `stock` below the
+        // reserved count between reserve and capture can still under-fill a line,
+        // so the guard stays authoritative.
         const short: Array<Omit<StockShortfall, "available">> = [];
-        for (const item of order.items) {
+        for (const item of [...order.items].sort(byVariantId)) {
           const { count: decremented } = await tx.productVariant.updateMany({
             // Tenant-scoped through the product relation (a variant carries no
             // tenantId) — defence in depth on top of the order's tenant scope.
@@ -237,6 +329,15 @@ export const orderRepository = {
             });
           }
         }
+
+        // Reconcile reservations: the order is now PAID (terminal), so free every
+        // line's hold. `stock` already dropped for the lines that decremented, so
+        // releasing the matching `reserved` leaves `available = stock - reserved`
+        // exactly right; a shortfall line's hold is released too (its `stock`
+        // stayed put, so those units return to sellable for a re-stock/refund).
+        // Separate and best-effort — floored at 0, never guarded — so it can't
+        // disturb the tested decrement/shortfall logic above.
+        await releaseReserved(tx, tenantId, order.items);
 
         // Enrich any shortfalls with the current on-hand count so the oversell
         // alert is actionable. Only the (rare) oversell path pays for this read.

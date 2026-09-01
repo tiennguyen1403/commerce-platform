@@ -19,7 +19,8 @@ export type PurchaseVariant = {
   id: string;
   name: string;
   priceCents: number;
-  stock: number;
+  /** Sellable units (`stock - reserved`) — drives the sold-out/low-stock UI. */
+  available: number;
 };
 
 /** Below this many units we nudge the shopper with an exact count. */
@@ -41,7 +42,7 @@ export function PurchasePanel({
 }) {
   // Default to the first in-stock variant so the CTA is actionable on load;
   // fall back to the first variant when the whole product is sold out.
-  const firstSelectable = variants.find((v) => v.stock > 0) ?? variants[0];
+  const firstSelectable = variants.find((v) => v.available > 0) ?? variants[0];
   const [selectedId, setSelectedId] = useState(firstSelectable?.id);
   const [status, setStatus] = useState<"idle" | "added" | "error">("idle");
   const [isPending, startTransition] = useTransition();
@@ -50,8 +51,8 @@ export function PurchasePanel({
   // A product always ships with at least one variant (zod-enforced on write).
   if (!selected) return null;
 
-  const soldOut = selected.stock <= 0;
-  const lowStock = !soldOut && selected.stock <= LOW_STOCK_THRESHOLD;
+  const soldOut = selected.available <= 0;
+  const lowStock = !soldOut && selected.available <= LOW_STOCK_THRESHOLD;
   const hasChoice = variants.length > 1;
 
   function addToCart() {
@@ -76,7 +77,7 @@ export function PurchasePanel({
           </Badge>
         ) : lowStock ? (
           <span className="text-sm font-medium">
-            Only {selected.stock} left
+            Only {selected.available} left
           </span>
         ) : (
           <span className="text-muted-foreground inline-flex items-center gap-1.5 text-sm">
@@ -107,8 +108,8 @@ export function PurchasePanel({
             </SelectTrigger>
             <SelectContent>
               {variants.map((v) => (
-                <SelectItem key={v.id} value={v.id} disabled={v.stock <= 0}>
-                  {v.stock <= 0 ? `${v.name} — sold out` : v.name}
+                <SelectItem key={v.id} value={v.id} disabled={v.available <= 0}>
+                  {v.available <= 0 ? `${v.name} — sold out` : v.name}
                 </SelectItem>
               ))}
             </SelectContent>

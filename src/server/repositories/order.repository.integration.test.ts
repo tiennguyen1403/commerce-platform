@@ -1,5 +1,12 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
-import { orderRepository } from "@/server/repositories/order.repository";
+import {
+  orderRepository,
+  type CreateOrderInput,
+} from "@/server/repositories/order.repository";
+import {
+  InsufficientStockError,
+  OrderNumberTakenError,
+} from "@/server/order.errors";
 import {
   createTestTenant,
   deleteTenantDeep,
@@ -37,7 +44,12 @@ afterAll(async () => {
 /** Seed a product with a single variant and return that variant. */
 async function seedVariant(
   tenantId: string,
-  opts: { stock: number; priceCents?: number; name?: string },
+  opts: {
+    stock: number;
+    reserved?: number;
+    priceCents?: number;
+    name?: string;
+  },
 ) {
   const product = await prisma.product.create({
     data: {
@@ -51,6 +63,7 @@ async function seedVariant(
           name: opts.name ?? "Blue",
           priceCents: opts.priceCents ?? 1000,
           stock: opts.stock,
+          reserved: opts.reserved ?? 0,
         },
       },
     },
@@ -91,6 +104,33 @@ async function seedPendingOrder(
       },
     },
   });
+}
+
+/** Build a `CreateOrderInput` (the shape `createWithItems` reserves + writes). */
+function orderInput(
+  tenantId: string,
+  lines: SeedLine[],
+  overrides: {
+    id?: string;
+    orderNumber?: string;
+    stripePaymentIntentId?: string;
+  } = {},
+): CreateOrderInput {
+  return {
+    id: overrides.id ?? uniqueId("order-id"),
+    tenantId,
+    orderNumber: overrides.orderNumber ?? uniqueId("order"),
+    email: "shopper@example.com",
+    totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
+    currency: "usd",
+    stripePaymentIntentId: overrides.stripePaymentIntentId ?? uniqueId("pi"),
+    items: lines.map((l) => ({
+      variantId: l.variantId,
+      titleSnapshot: l.titleSnapshot ?? "Tee / Blue",
+      priceCents: l.priceCents,
+      quantity: l.qty,
+    })),
+  };
 }
 
 describe("orderRepository.markPaidByPaymentIntent (integration)", () => {
@@ -323,5 +363,259 @@ describe("orderRepository.markPaidByPaymentIntent (integration)", () => {
       where: { tenantId: tenant.id, stripePaymentIntentId: intent },
     });
     expect(persisted.status).toBe("PAID");
+  });
+
+  it("releases the reservation when it reconciles the sale at PAID", async () => {
+    const tenant = await freshTenant();
+    // 10 on hand, 3 held by this order's PENDING reservation.
+    const variant = await seedVariant(tenant.id, { stock: 10, reserved: 3 });
+    const intent = uniqueId("pi");
+    await seedPendingOrder(tenant.id, intent, [
+      { variantId: variant.id, qty: 3, priceCents: 1000 },
+    ]);
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    // `stock` drops by the sold 3 and the 3-unit hold is released together, so
+    // `available = stock - reserved` stays correct (7 - 0 = 7 sellable).
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.stock).toBe(7);
+    expect(after.reserved).toBe(0);
+  });
+
+  it("floors the reservation release at 0 on PAID (drift-safe)", async () => {
+    const tenant = await freshTenant();
+    // Only 1 unit held though the line is for 3 (a drift edge): the release must
+    // not drive `reserved` negative.
+    const variant = await seedVariant(tenant.id, { stock: 10, reserved: 1 });
+    const intent = uniqueId("pi");
+    await seedPendingOrder(tenant.id, intent, [
+      { variantId: variant.id, qty: 3, priceCents: 1000 },
+    ]);
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.stock).toBe(7); // decremented: stock 10 >= 3
+    expect(after.reserved).toBe(0); // GREATEST(1 - 3, 0)
+  });
+});
+
+describe("orderRepository.createWithItems (reservation, integration)", () => {
+  it("reserves each line and writes the PENDING order + items", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 10 });
+
+    const created = await orderRepository.createWithItems(
+      orderInput(tenant.id, [
+        { variantId: variant.id, qty: 3, priceCents: 1000 },
+      ]),
+    );
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: created.id },
+      include: { items: true },
+    });
+    expect(persisted.status).toBe("PENDING");
+    expect(persisted.items).toHaveLength(1);
+
+    // Inventory is held: `reserved` bumped, physical `stock` untouched.
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.stock).toBe(10);
+    expect(after.reserved).toBe(3);
+  });
+
+  it("rejects and writes nothing when a line exceeds sellable stock", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 2 });
+
+    await expect(
+      orderRepository.createWithItems(
+        orderInput(tenant.id, [
+          { variantId: variant.id, qty: 3, priceCents: 1000 },
+        ]),
+      ),
+    ).rejects.toBeInstanceOf(InsufficientStockError);
+
+    // Rolled back: no partial hold, no orphan order.
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.reserved).toBe(0);
+    expect(await prisma.order.count({ where: { tenantId: tenant.id } })).toBe(
+      0,
+    );
+  });
+
+  it("honors existing reservations — available is stock minus reserved", async () => {
+    const tenant = await freshTenant();
+    // 5 on hand, 4 already held → only 1 sellable.
+    const variant = await seedVariant(tenant.id, { stock: 5, reserved: 4 });
+
+    await expect(
+      orderRepository.createWithItems(
+        orderInput(tenant.id, [
+          { variantId: variant.id, qty: 2, priceCents: 1000 },
+        ]),
+      ),
+    ).rejects.toBeInstanceOf(InsufficientStockError);
+
+    // The last sellable unit can still be reserved.
+    await orderRepository.createWithItems(
+      orderInput(tenant.id, [
+        { variantId: variant.id, qty: 1, priceCents: 1000 },
+      ]),
+    );
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.reserved).toBe(5);
+  });
+
+  it("rolls back earlier reservations when a later line is short", async () => {
+    const tenant = await freshTenant();
+    const ample = await seedVariant(tenant.id, { stock: 10, name: "Ample" });
+    const scarce = await seedVariant(tenant.id, { stock: 1, name: "Scarce" });
+
+    await expect(
+      orderRepository.createWithItems(
+        orderInput(tenant.id, [
+          { variantId: ample.id, qty: 2, priceCents: 1000 },
+          { variantId: scarce.id, qty: 3, priceCents: 2000 },
+        ]),
+      ),
+    ).rejects.toBeInstanceOf(InsufficientStockError);
+
+    // The whole transaction rolled back — neither line holds a reservation.
+    const ampleAfter = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: ample.id },
+    });
+    const scarceAfter = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: scarce.id },
+    });
+    expect(ampleAfter.reserved).toBe(0);
+    expect(scarceAfter.reserved).toBe(0);
+    expect(await prisma.order.count({ where: { tenantId: tenant.id } })).toBe(
+      0,
+    );
+  });
+
+  it("reserves the last unit exactly once under concurrent checkouts", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 1 });
+
+    // Two shoppers race for the single unit. The atomic reserve guard
+    // (`stock - reserved >= qty`) under row locking must let exactly one win —
+    // the other re-checks the committed row, matches 0 rows, and is turned away.
+    const results = await Promise.allSettled([
+      orderRepository.createWithItems(
+        orderInput(tenant.id, [
+          { variantId: variant.id, qty: 1, priceCents: 1000 },
+        ]),
+      ),
+      orderRepository.createWithItems(
+        orderInput(tenant.id, [
+          { variantId: variant.id, qty: 1, priceCents: 1000 },
+        ]),
+      ),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(
+      InsufficientStockError,
+    );
+
+    // Reserved exactly once (never oversold), and exactly one order written.
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.reserved).toBe(1);
+    expect(await prisma.order.count({ where: { tenantId: tenant.id } })).toBe(
+      1,
+    );
+  });
+
+  it("reserve → pay conserves availability (full lifecycle)", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 5 });
+    const pi = uniqueId("pi");
+
+    await orderRepository.createWithItems(
+      orderInput(
+        tenant.id,
+        [{ variantId: variant.id, qty: 2, priceCents: 1000 }],
+        { stripePaymentIntentId: pi },
+      ),
+    );
+    // Held: stock 5, reserved 2 → available 3.
+    const held = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(held).toMatchObject({ stock: 5, reserved: 2 });
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, pi);
+    // Sold: stock 3, reserved 0 → available 3 (conserved across the sale).
+    const settled = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(settled).toMatchObject({ stock: 3, reserved: 0 });
+  });
+
+  it("re-reserves cleanly after an orderNumber collision — no leaked hold", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 10 });
+
+    // Occupy an orderNumber (unique per [tenantId, orderNumber]) so the first
+    // attempt's insert collides. This bare order holds no items → reserved is 0.
+    const taken = uniqueId("order");
+    await prisma.order.create({
+      data: {
+        tenantId: tenant.id,
+        orderNumber: taken,
+        status: "PENDING",
+        email: "prior@example.com",
+        totalCents: 1000,
+        currency: "usd",
+        stripePaymentIntentId: uniqueId("pi"),
+      },
+    });
+
+    // First attempt reserves, then the insert hits the unique constraint, so the
+    // whole transaction — reservation included — rolls back to OrderNumberTakenError.
+    await expect(
+      orderRepository.createWithItems(
+        orderInput(
+          tenant.id,
+          [{ variantId: variant.id, qty: 2, priceCents: 1000 }],
+          { orderNumber: taken },
+        ),
+      ),
+    ).rejects.toBeInstanceOf(OrderNumberTakenError);
+
+    const afterFail = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(afterFail.reserved).toBe(0); // rolled back — no orphaned hold
+
+    // The service's retry with a fresh number now succeeds and reserves exactly
+    // once: `reserved` is qty, never 2·qty (the failed attempt left nothing).
+    await orderRepository.createWithItems(
+      orderInput(tenant.id, [
+        { variantId: variant.id, qty: 2, priceCents: 1000 },
+      ]),
+    );
+    const afterRetry = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(afterRetry.reserved).toBe(2);
   });
 });

@@ -31,6 +31,7 @@ function variantRow(
     name?: string;
     priceCents?: number;
     stock?: number;
+    reserved?: number;
     status?: ProductStatus;
     slug?: string;
     title?: string;
@@ -44,6 +45,7 @@ function variantRow(
     name: o.name ?? "Default variant",
     priceCents: o.priceCents ?? 1000,
     stock: o.stock ?? 10,
+    reserved: o.reserved ?? 0,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     product: {
@@ -95,7 +97,7 @@ describe("cartService.getCartView", () => {
     expect(findVariants).toHaveBeenCalledWith(TENANT, ["v1"]);
     expect(view.currency).toBe("eur");
     expect(view.items).toHaveLength(1);
-    // Price/title/stock come from the DB; qty and currency are the caller's.
+    // Price/title/available come from the DB; qty and currency are the caller's.
     expect(view.items[0]).toMatchObject({
       variantId: "v1",
       productSlug: "tee",
@@ -105,7 +107,7 @@ describe("cartService.getCartView", () => {
       currency: "eur",
       qty: 2,
       lineTotalCents: 5000,
-      stock: 10,
+      available: 10,
     });
     expect(view.totalCents).toBe(5000);
     expect(view.itemCount).toBe(2);
@@ -123,6 +125,31 @@ describe("cartService.getCartView", () => {
     expect(view.items[0].qty).toBe(3);
     expect(view.items[0].lineTotalCents).toBe(3000);
     expect(view.adjusted).toBe(true);
+  });
+
+  it("clamps to sellable stock (stock - reserved), not physical stock", async () => {
+    // 10 on hand but 8 held by other in-flight orders → only 2 sellable.
+    findVariants.mockResolvedValue([
+      variantRow({ id: "v1", stock: 10, reserved: 8, priceCents: 1000 }),
+    ]);
+
+    const view = await cartService.getCartView(TENANT, [line("v1", 5)], "usd");
+
+    expect(view.items[0].qty).toBe(2);
+    expect(view.items[0].available).toBe(2);
+    expect(view.items[0].lineTotalCents).toBe(2000);
+    expect(view.adjusted).toBe(true);
+  });
+
+  it("drops a line whose units are all reserved (available 0)", async () => {
+    findVariants.mockResolvedValue([
+      variantRow({ id: "v1", stock: 5, reserved: 5 }),
+    ]);
+
+    const view = await cartService.getCartView(TENANT, [line("v1", 1)], "usd");
+
+    expect(view.items).toHaveLength(0);
+    expect(view.removedCount).toBe(1);
   });
 
   it("clamps to MAX_CART_QTY even when stock is higher", async () => {
@@ -192,6 +219,17 @@ describe("cartService.resolveLine", () => {
     });
   });
 
+  it("clamps the qty to sellable stock (stock - reserved)", async () => {
+    findVariants.mockResolvedValue([
+      variantRow({ id: "v1", stock: 5, reserved: 3 }),
+    ]);
+
+    await expect(cartService.resolveLine(TENANT, "v1", 10)).resolves.toEqual({
+      ok: true,
+      qty: 2,
+    });
+  });
+
   it("clamps the qty to MAX_CART_QTY", async () => {
     findVariants.mockResolvedValue([variantRow({ id: "v1", stock: 1000 })]);
 
@@ -221,6 +259,16 @@ describe("cartService.resolveLine", () => {
 
   it("rejects an out-of-stock variant", async () => {
     findVariants.mockResolvedValue([variantRow({ id: "v1", stock: 0 })]);
+
+    await expect(cartService.resolveLine(TENANT, "v1", 1)).resolves.toEqual({
+      ok: false,
+    });
+  });
+
+  it("rejects a variant whose units are all reserved", async () => {
+    findVariants.mockResolvedValue([
+      variantRow({ id: "v1", stock: 5, reserved: 5 }),
+    ]);
 
     await expect(cartService.resolveLine(TENANT, "v1", 1)).resolves.toEqual({
       ok: false,

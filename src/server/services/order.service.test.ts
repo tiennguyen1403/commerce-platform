@@ -8,7 +8,11 @@ import {
   orderRepository,
   type OrderWithItems,
 } from "@/server/repositories/order.repository";
-import { EmptyCartError, OrderNumberTakenError } from "@/server/order.errors";
+import {
+  EmptyCartError,
+  OrderNumberTakenError,
+  InsufficientStockError,
+} from "@/server/order.errors";
 import type { CartItem } from "@/lib/cart";
 
 /**
@@ -59,7 +63,7 @@ function cartItem(o: Partial<CartItem> = {}): CartItem {
     currency: "usd",
     qty: 2,
     lineTotalCents: 3000,
-    stock: 10,
+    available: 10,
     ...o,
   };
 }
@@ -236,6 +240,30 @@ describe("orderService.startCheckout", () => {
     ).rejects.toBeInstanceOf(OrderNumberTakenError);
 
     expect(createWithItems).toHaveBeenCalledTimes(MAX_ORDER_NUMBER_ATTEMPTS);
+    expect(paymentIntents.cancel).toHaveBeenCalledWith("pi_1");
+  });
+
+  it("propagates InsufficientStockError and cancels the intent without retrying", async () => {
+    getCartView.mockResolvedValue(cartView());
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    paymentIntents.cancel.mockResolvedValue({});
+    // The reserve guard inside createWithItems turned the order away (sold out).
+    createWithItems.mockRejectedValue(new InsufficientStockError());
+
+    await expect(
+      orderService.startCheckout(
+        TENANT,
+        [{ variantId: "v1", qty: 2 }],
+        EMAIL,
+        "usd",
+      ),
+    ).rejects.toBeInstanceOf(InsufficientStockError);
+
+    // Not an order-number collision → no retry; the orphaned intent is cancelled.
+    expect(createWithItems).toHaveBeenCalledTimes(1);
     expect(paymentIntents.cancel).toHaveBeenCalledWith("pi_1");
   });
 

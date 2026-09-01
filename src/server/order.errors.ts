@@ -25,3 +25,18 @@ export class OrderNumberTakenError extends Error {
     this.name = "OrderNumberTakenError";
   }
 }
+
+/**
+ * A line couldn't be reserved at checkout because its sellable stock
+ * (`stock - reserved`) fell short — someone else took the last units during the
+ * shopper's session. Raised inside `createWithItems`'s transaction when the
+ * atomic reserve guard matches zero rows, which rolls back the whole order (no
+ * partial reservation). The checkout action maps it to a "sold out" message and
+ * the orphaned PaymentIntent is cancelled by the service's existing catch.
+ */
+export class InsufficientStockError extends Error {
+  constructor() {
+    super("Some items just sold out.");
+    this.name = "InsufficientStockError";
+  }
+}
