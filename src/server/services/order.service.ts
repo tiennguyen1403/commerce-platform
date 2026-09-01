@@ -1,6 +1,7 @@
 import "server-only";
 import { randomInt, randomUUID } from "node:crypto";
 import type Stripe from "stripe";
+import type { OrderStatus } from "@prisma/client";
 import { getStripe } from "@/lib/stripe";
 import { cartService } from "@/server/services/cart.service";
 import {
@@ -9,7 +10,12 @@ import {
   type OrderWithItems,
   type StockShortfall,
 } from "@/server/repositories/order.repository";
-import { EmptyCartError, OrderNumberTakenError } from "@/server/order.errors";
+import {
+  EmptyCartError,
+  OrderNumberTakenError,
+  OrderNotFoundError,
+  OrderTransitionError,
+} from "@/server/order.errors";
 import type { CartLine } from "@/lib/cart";
 
 /**
@@ -24,8 +30,14 @@ import type { CartLine } from "@/lib/cart";
  * Stripe webhook (#14) owns the PENDING → PAID transition.
  */
 
-// Re-export so the Server Action boundary imports checkout errors from one place.
-export { EmptyCartError, InsufficientStockError } from "@/server/order.errors";
+// Re-export so the Server Action boundary imports checkout + lifecycle errors
+// from one place.
+export {
+  EmptyCartError,
+  InsufficientStockError,
+  OrderNotFoundError,
+  OrderTransitionError,
+} from "@/server/order.errors";
 
 export type StartCheckoutResult = {
   clientSecret: string;
@@ -104,6 +116,20 @@ async function cancelPaymentIntentQuietly(
   } catch {
     // Intentionally ignored.
   }
+}
+
+/** Translate a refused order transition into the right typed error for the
+ *  action boundary: no such order → `OrderNotFoundError`; wrong source state →
+ *  `OrderTransitionError` naming the order's current (lowercased) status, e.g.
+ *  "This order can't be cancelled because its status is paid." */
+function failTransition(
+  action: string,
+  currentStatus: OrderStatus | null,
+): never {
+  if (currentStatus === null) throw new OrderNotFoundError();
+  throw new OrderTransitionError(
+    `This order can't be ${action} because its status is ${currentStatus.toLowerCase()}.`,
+  );
 }
 
 export const orderService = {
@@ -263,5 +289,40 @@ export const orderService = {
     return {
       outcome: result.orderExisted ? "already-processed" : "no-order",
     };
+  },
+
+  /**
+   * Cancel a PENDING order (admin action): release its inventory hold and move it
+   * to CANCELLED. Delegates the atomic guarded transition to the repository and
+   * translates a no-op into a typed error the action boundary maps to a message —
+   * `OrderNotFoundError` (no such order) or `OrderTransitionError` (it exists but
+   * isn't PENDING: already paid/cancelled/fulfilled).
+   *
+   * This is a STAFF+ operation. The role is enforced by the calling admin Server
+   * Action with `assertRole(ROLES.STAFF)` before it calls in — services stay
+   * role-agnostic and tenant-scoped, matching the codebase's boundary-gating
+   * pattern (see membership.service). The admin orders UI that wires this action
+   * lands with #40; this method is its tested backend.
+   */
+  async cancelOrder(tenantId: string, orderId: string): Promise<void> {
+    const result = await orderRepository.cancelPendingAndRelease(
+      tenantId,
+      orderId,
+    );
+    if (!result.transitioned) failTransition("cancelled", result.currentStatus);
+  },
+
+  /**
+   * Mark a PAID order FULFILLED (admin action): a manual status attestation only
+   * — no shipping address, no provider call (that's M4). Delegates the atomic
+   * guarded transition to the repository and translates a no-op into
+   * `OrderNotFoundError` (no such order) or `OrderTransitionError` (it exists but
+   * isn't PAID). STAFF+, gated by the calling Server Action as above.
+   */
+  async fulfillOrder(tenantId: string, orderId: string): Promise<void> {
+    const result = await orderRepository.markFulfilled(tenantId, orderId);
+    if (!result.transitioned) {
+      failTransition("marked fulfilled", result.currentStatus);
+    }
   },
 };

@@ -56,6 +56,7 @@ function order(o: Partial<Order> = {}): Order {
     totalCents: 10000,
     currency: "usd",
     stripePaymentIntentId: "pi_1",
+    oversold: false,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     ...o,

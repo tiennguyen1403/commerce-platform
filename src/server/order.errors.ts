@@ -40,3 +40,31 @@ export class InsufficientStockError extends Error {
     this.name = "InsufficientStockError";
   }
 }
+
+/**
+ * A state-machine action named an order that doesn't exist for the tenant.
+ * Thrown by the order service's cancel/fulfil methods when the repository
+ * reports no matching row (`currentStatus: null`). The action boundary maps it
+ * to a friendly "order not found" message.
+ */
+export class OrderNotFoundError extends Error {
+  constructor() {
+    super("Order not found.");
+    this.name = "OrderNotFoundError";
+  }
+}
+
+/**
+ * A guarded order transition was refused because the order isn't in the required
+ * source state — e.g. cancelling an order that's already PAID, or fulfilling one
+ * still PENDING. Thrown by the order service when the repository's atomic guard
+ * matches zero rows on an order that does exist. The message is composed with the
+ * order's current status so the boundary can show a precise reason; the state
+ * machine's correctness rests on the DB guard, not this message.
+ */
+export class OrderTransitionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OrderTransitionError";
+  }
+}

@@ -100,6 +100,7 @@ function orderWithItems(o: Partial<OrderWithItems> = {}): OrderWithItems {
     totalCents: 2500,
     currency: "usd",
     stripePaymentIntentId: "pi_1",
+    oversold: false,
     createdAt: NOW,
     updatedAt: NOW,
     items: [orderItem()],
