@@ -7,6 +7,8 @@ import { cartService } from "@/server/services/cart.service";
 import {
   orderRepository,
   type CreateOrderInput,
+  type ListOrdersParams,
+  type OrdersPage,
   type OrderWithItems,
   type StockShortfall,
 } from "@/server/repositories/order.repository";
@@ -301,6 +303,31 @@ export const orderService = {
     return {
       outcome: result.orderExisted ? "already-processed" : "no-order",
     };
+  },
+
+  /**
+   * A tenant's orders for the admin list — newest first, optionally filtered to a
+   * single `status`, paginated. A thin pass-through to the tenant-scoped
+   * repository read (the admin page calls the service, never Prisma, per the
+   * layering rule); the calling boundary zod-validates `status`/`page` first.
+   */
+  async listOrders(
+    tenantId: string,
+    params: ListOrdersParams,
+  ): Promise<OrdersPage> {
+    return orderRepository.listByTenant(tenantId, params);
+  },
+
+  /**
+   * One order with its line items for the admin detail page, scoped to the
+   * tenant — or null when no such order exists for it (the page maps that to a
+   * real 404). Thin pass-through to the repository, keeping pages off Prisma.
+   */
+  async getOrder(
+    tenantId: string,
+    orderId: string,
+  ): Promise<OrderWithItems | null> {
+    return orderRepository.findByIdForTenant(tenantId, orderId);
   },
 
   /**

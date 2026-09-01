@@ -51,14 +51,31 @@ function escapeHtml(value: string): string {
 
 type RenderedEmail = { subject: string; html: string; text: string };
 
-/** Render the confirmation as a minimal, email-client-safe HTML document (tables
- *  + inline styles) with a plain-text alternative for deliverability. */
+/**
+ * Render the order email as a minimal, email-client-safe HTML document (tables +
+ * inline styles) with a plain-text alternative for deliverability.
+ *
+ * The copy adapts to `order.oversold` (#40). A normally-allocated order gets the
+ * standard confirmation. An oversold one — the payment was captured, but the
+ * atomic stock decrement at PENDING → PAID couldn't fill one or more lines
+ * (someone took the last units in the payment window) — must NOT get a
+ * reassuring "your order is confirmed / we're getting it ready" message for a
+ * line that can't ship. Instead it gets a distinct "we can't fulfil part of this
+ * order, a refund is being arranged" message. We only know *that* the order
+ * oversold (a durable boolean on the row — the per-line shortfall detail isn't
+ * persisted, only logged at capture), so the copy stays order-level and honest
+ * rather than naming quantities we can't reconstruct here.
+ *
+ * Inline hex (not design tokens) is deliberate and matches the existing template:
+ * email clients don't support CSS custom properties or external stylesheets.
+ */
 function renderOrderConfirmation(
   order: OrderWithItems,
   storeName: string,
 ): RenderedEmail {
   const currency = order.currency;
   const total = formatMoney(order.totalCents, currency);
+  const oversold = order.oversold;
 
   const rows = order.items
     .map((item) => {
@@ -75,6 +92,30 @@ function renderOrderConfirmation(
     })
     .join("");
 
+  const subject = oversold
+    ? `Update on your order ${order.orderNumber}`
+    : `Order ${order.orderNumber} confirmed`;
+  const heading = oversold
+    ? "There’s a problem with part of your order"
+    : "Thanks for your order";
+  const intro = oversold
+    ? "Your payment went through, but after checkout we found one or more items are no longer in stock, so we can’t fulfil this order in full. We’ll refund anything we can’t ship — you don’t need to do anything."
+    : "Your payment was received and your order is confirmed.";
+
+  // An unmissable callout for the oversold case, above the line items. Muted
+  // warm tint (kept AA-legible), not the alarm-red of a hard error.
+  const notice = oversold
+    ? `
+          <div style="margin:0 0 24px;border:1px solid #f0c9c0;background:#fdf3f1;border-radius:8px;padding:14px 16px;">
+            <div style="font-weight:600;color:#9a3412;">We can’t fulfil part of this order</div>
+            <div style="color:#7c2d12;font-size:13px;margin-top:2px;">Some items sold out between checkout and payment. We’ll refund anything we can’t ship; reply to this email with any questions.</div>
+          </div>`
+    : "";
+
+  const footer = oversold
+    ? `This message was sent to ${escapeHtml(order.email)}. Reply to this email if you have any questions.`
+    : `This confirmation was sent to ${escapeHtml(order.email)}. Reply to this email if you have any questions.`;
+
   const html = `<!doctype html>
 <html lang="en">
   <body style="margin:0;background:#f6f6f6;padding:24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827;">
@@ -82,9 +123,9 @@ function renderOrderConfirmation(
       <tr>
         <td style="padding:32px;">
           <div style="font-size:13px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:#6b7280;">${escapeHtml(storeName)}</div>
-          <h1 style="margin:8px 0 4px;font-size:22px;">Thanks for your order</h1>
-          <p style="margin:0 0 24px;color:#6b7280;font-size:14px;">Your payment was received and your order is confirmed.</p>
-
+          <h1 style="margin:8px 0 4px;font-size:22px;">${heading}</h1>
+          <p style="margin:0 0 24px;color:#6b7280;font-size:14px;">${intro}</p>
+${notice}
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;margin-bottom:8px;">
             <tr>
               <td style="color:#6b7280;">Order number</td>
@@ -99,7 +140,7 @@ function renderOrderConfirmation(
             </tr>
           </table>
 
-          <p style="margin:32px 0 0;color:#6b7280;font-size:13px;">This confirmation was sent to ${escapeHtml(order.email)}. Reply to this email if you have any questions.</p>
+          <p style="margin:32px 0 0;color:#6b7280;font-size:13px;">${footer}</p>
         </td>
       </tr>
     </table>
@@ -107,9 +148,11 @@ function renderOrderConfirmation(
 </html>`;
 
   const text = [
-    `${storeName} — order confirmation`,
+    oversold
+      ? `${storeName} — order update`
+      : `${storeName} — order confirmation`,
     "",
-    "Thanks for your order. Your payment was received and your order is confirmed.",
+    intro,
     "",
     `Order number: ${order.orderNumber}`,
     "",
@@ -120,21 +163,22 @@ function renderOrderConfirmation(
     "",
     `Total: ${total}`,
     "",
-    `This confirmation was sent to ${order.email}.`,
+    oversold
+      ? `This message was sent to ${order.email}.`
+      : `This confirmation was sent to ${order.email}.`,
   ].join("\n");
 
-  return {
-    subject: `Order ${order.orderNumber} confirmed`,
-    html,
-    text,
-  };
+  return { subject, html, text };
 }
 
 export const emailService = {
   /**
-   * Email a shopper their order confirmation. Branded with the tenant's store
-   * name (looked up from `order.tenantId`, since the webhook only carries the
-   * id), falling back to a neutral label if the tenant can't be resolved.
+   * Email a shopper their order confirmation — or, for an oversold order, the
+   * distinct "we can't fulfil part of this / a refund is being arranged" message
+   * (#40; the copy is chosen from `order.oversold` in `renderOrderConfirmation`).
+   * Branded with the tenant's store name (looked up from `order.tenantId`, since
+   * the webhook only carries the id), falling back to a neutral label if the
+   * tenant can't be resolved.
    * Throws on a Resend failure so the caller can log it; never called on a path
    * where that throw would fail the webhook.
    *

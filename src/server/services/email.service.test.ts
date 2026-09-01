@@ -224,3 +224,63 @@ describe("emailService.sendOrderConfirmation", () => {
     ).rejects.toBeInstanceOf(EmailNotConfiguredError);
   });
 });
+
+/**
+ * #40: an oversold order — payment captured, but the atomic stock decrement
+ * couldn't fill one or more lines — must NOT get a reassuring "order confirmed"
+ * email. The copy is chosen from the persisted `order.oversold` flag.
+ */
+describe("emailService.sendOrderConfirmation — oversold order (#40)", () => {
+  it("sends a distinct 'can't fulfil / refund' message, never a confirmation", async () => {
+    await emailService.sendOrderConfirmation(
+      orderWithItems({ orderNumber: "20250101-ABCDEF", oversold: true }),
+    );
+
+    const email = lastEmail();
+    // Neither subject nor body may tell the shopper the order is confirmed.
+    expect(email.subject).toBe("Update on your order 20250101-ABCDEF");
+    expect(email.subject).not.toContain("confirmed");
+    expect(email.html).not.toContain("your order is confirmed");
+    expect(email.text).not.toContain("your order is confirmed");
+
+    // It explains the shortfall and the refund instead.
+    expect(email.html).toContain("fulfil part of this order");
+    expect(email.html).toContain("no longer in stock");
+    expect(email.html.toLowerCase()).toContain("refund");
+    expect(email.text).toContain("no longer in stock");
+    expect(email.text.toLowerCase()).toContain("refund");
+  });
+
+  it("still lists the ordered items and total for reference", async () => {
+    await emailService.sendOrderConfirmation(
+      orderWithItems({
+        oversold: true,
+        totalCents: 7500,
+        currency: "usd",
+        items: [
+          orderItem({
+            titleSnapshot: "Widget — Blue",
+            priceCents: 2500,
+            quantity: 3,
+          }),
+        ],
+      }),
+    );
+
+    const email = lastEmail();
+    expect(email.html).toContain("Widget — Blue");
+    expect(email.html).toContain("$75.00");
+    expect(email.text).toContain("Total: $75.00");
+  });
+
+  it("keeps the standard confirmation for a normally-allocated order", async () => {
+    await emailService.sendOrderConfirmation(
+      orderWithItems({ orderNumber: "20250101-ZZZZZZ", oversold: false }),
+    );
+
+    const email = lastEmail();
+    expect(email.subject).toBe("Order 20250101-ZZZZZZ confirmed");
+    expect(email.html).toContain("your order is confirmed");
+    expect(email.html).not.toContain("fulfil part of this order");
+  });
+});

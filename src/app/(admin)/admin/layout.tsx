@@ -39,6 +39,12 @@ export default async function AdminLayout({
               >
                 Products
               </Link>
+              <Link
+                href="/admin/orders"
+                className="text-muted-foreground hover:text-foreground transition-colors"
+              >
+                Orders
+              </Link>
               {isOwner ? (
                 <>
                   <Link

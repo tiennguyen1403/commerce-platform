@@ -14,6 +14,30 @@ export function formatMoney(cents: number, currency = "usd") {
   }).format(cents / 100);
 }
 
+/** Format a date for admin display — a medium date, optionally with a short
+ *  time (e.g. order detail). Rendered server-side only (Server Components), so
+ *  the fixed `en-US` locale is deterministic with no hydration mismatch. */
+export function formatDate(value: Date | string, withTime = false) {
+  const date = typeof value === "string" ? new Date(value) : value;
+  return new Intl.DateTimeFormat(
+    "en-US",
+    withTime
+      ? // Spell out the components: `timeZoneName` can't be combined with
+        // `dateStyle`/`timeStyle` (ECMA-402 throws "Invalid option"). Labelling
+        // the zone (the runtime's — UTC in prod, local in dev) keeps an operator
+        // from misreading a bare wall-clock time.
+        {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          timeZoneName: "short",
+        }
+      : { dateStyle: "medium" },
+  ).format(date);
+}
+
 /**
  * Derive a URL-safe slug from arbitrary text: lowercase, decompose accents via
  * NFKD, then collapse every run of non-alphanumeric characters (the leftover
