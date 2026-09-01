@@ -38,6 +38,56 @@ jobs:
       - run: pnpm typecheck
       # Infra-free tests (pure logic + sync DOM) — the `test` script is
       # `vitest run --project unit --project dom`. The integration project needs a
-      # real Postgres and runs in a separate job (later milestone), so it's excluded.
+      # real Postgres and runs in the separate `test-db` job below, so it's excluded.
       - run: pnpm test
       - run: pnpm build
+
+  # Repository integration tests (issue #48): the atomic order/stock and
+  # variant-reconciliation guards exercised against a real Postgres — meaningless
+  # against mocks. Runs in parallel with `verify` on its own throwaway database.
+  test-db:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dropshipping
+        ports:
+          - 5432:5432
+        # Wait for Postgres to accept connections before the job steps run.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Points at the service container. `connection_limit` is lifted so the
+      # concurrency backstop test can hold two transactions open while a third
+      # connection polls pg_locks (the default pool can be as small as 3 on a
+      # 2-vCPU runner).
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/dropshipping?connection_limit=10
+      BETTER_AUTH_SECRET: ci-secret-ci-secret-ci-secret-1234
+      BETTER_AUTH_URL: http://localhost:3000
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      STRIPE_SECRET_KEY: sk_test_ci_dummy
+      STRIPE_WEBHOOK_SECRET: whsec_ci_dummy
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: pk_test_ci_dummy
+      RESEND_API_KEY: re_ci_dummy
+      EMAIL_FROM: "CI <onboarding@resend.dev>"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm prisma generate
+      # Apply every migration to the fresh service database (forward-only).
+      - run: pnpm db:deploy
+      # Integration project only; `--no-file-parallelism` (baked into the script)
+      # keeps the DB-touching suites serial so the lock-based backstop test sees
+      # only its own contention.
+      - run: pnpm test:integration
