@@ -1,3 +1,9 @@
+// Run via `pnpm db:seed`, which (see package.json → prisma.seed) invokes this with
+// `node --conditions=react-server --import tsx`. That condition is required: this
+// script pulls `src/server/**`, whose modules `import "server-only"`, and that
+// package throws unless the runtime resolves its `react-server` export condition —
+// plain `tsx`/Node doesn't set it. It's the seed's counterpart to the Vitest
+// harness's `server-only` alias shim.
 import { prisma } from "../src/server/db";
 import { auth } from "../src/server/auth";
 import { DEMO_TENANT_SLUG } from "../src/config/constants";
