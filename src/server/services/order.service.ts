@@ -63,6 +63,18 @@ export type MarkOrderPaidResult =
   | { outcome: "paid"; order: OrderWithItems; shortfalls: StockShortfall[] }
   | { outcome: "already-processed" | "no-order" };
 
+/** Result of applying a refund from a verified `refund.*` webhook (see
+ *  `markOrderRefunded`), reported three ways so the webhook can log each case
+ *  distinctly: `"refunded"` — this delivery made the PAID|FULFILLED → REFUNDED
+ *  transition; `"already-processed"` — an order exists but wasn't in a refundable
+ *  state (carries its `currentStatus`, so a normal duplicate that's already
+ *  REFUNDED reads apart from an anomaly like a refund on a still-PENDING order);
+ *  `"no-order"` — no order matches this PaymentIntent for the tenant. */
+export type MarkOrderRefundedResult =
+  | { outcome: "refunded" }
+  | { outcome: "already-processed"; currentStatus: OrderStatus }
+  | { outcome: "no-order" };
+
 // Human-friendly, unambiguous order-number suffix: no 0/1/I/O to misread.
 const ORDER_NUMBER_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const ORDER_NUMBER_SUFFIX_LEN = 6;
@@ -324,5 +336,89 @@ export const orderService = {
     if (!result.transitioned) {
       failTransition("marked fulfilled", result.currentStatus);
     }
+  },
+
+  /**
+   * Initiate a full refund for a captured order (admin action): look up the
+   * order, verify it's refundable (PAID or FULFILLED), and ask Stripe to refund
+   * its PaymentIntent in full (`amount` omitted). Stamps `{ tenantId, orderId }`
+   * on the refund so the `refund.*` webhook can flip the order to REFUNDED and
+   * scope the tenant — exactly as the PaymentIntent metadata drives PENDING →
+   * PAID at checkout.
+   *
+   * Makes NO database write: the verified webhook is the SOLE writer of REFUNDED,
+   * so status only moves once Stripe confirms the money was actually returned
+   * (initiation succeeding is not the refund succeeding). A refused state maps to
+   * the same typed errors as the other transitions — `OrderNotFoundError` (no
+   * such order) or `OrderTransitionError` naming the current status (it exists
+   * but isn't PAID/FULFILLED: still pending, cancelled, or already refunded).
+   *
+   * This is an ADMIN+ operation. The role is enforced by the calling admin Server
+   * Action with `assertRole(ROLES.ADMIN)` before it calls in — services stay
+   * role-agnostic and tenant-scoped, matching cancel/fulfil above. The admin
+   * orders UI that wires this action lands with #58; this is its tested backend.
+   */
+  async refundOrder(tenantId: string, orderId: string): Promise<void> {
+    const order = await orderRepository.findByIdForTenant(tenantId, orderId);
+    if (!order) throw new OrderNotFoundError();
+    if (order.status !== "PAID" && order.status !== "FULFILLED") {
+      // Reuse the shared refusal message ("…because its status is X").
+      failTransition("refunded", order.status);
+    }
+
+    const { stripePaymentIntentId } = order;
+    if (!stripePaymentIntentId) {
+      // Every checkout links a PaymentIntent, so a captured order without one is
+      // a data anomaly we can't refund through Stripe — surface it, don't guess.
+      throw new Error(
+        `Order ${orderId} is ${order.status} but has no linked PaymentIntent; cannot refund.`,
+      );
+    }
+
+    await getStripe().refunds.create(
+      {
+        payment_intent: stripePaymentIntentId,
+        // A merchant-initiated refund is recorded as customer-requested — the
+        // other Stripe reasons (duplicate/fraudulent) describe the original
+        // charge, not an admin issuing a goodwill/return refund. Full refund:
+        // `amount` is omitted.
+        reason: "requested_by_customer",
+        // The refund webhook reads these to resolve tenant + order, mirroring the
+        // PaymentIntent metadata that drives PENDING → PAID.
+        metadata: { tenantId, orderId },
+      },
+      // Same key across a network retry or a double-submit in the window before
+      // the refund webhook flips the order → at most one refund is ever created
+      // (mirrors the `idempotencyKey` on the checkout PaymentIntent). One full
+      // refund per order, so the order id is the natural key.
+      { idempotencyKey: `refund_${orderId}` },
+    );
+  },
+
+  /**
+   * Apply a refund to an order from a verified Stripe `refund.*` webhook: move it
+   * PAID|FULFILLED → REFUNDED via the repository's atomic guarded transition.
+   * This — not the admin initiation — is the source of truth for "refunded".
+   * Idempotency lives in the repository's status guard, so a duplicate / late /
+   * racing `refund.succeeded` (or an unknown PaymentIntent) is a safe no-op. The
+   * outcome is reported three ways (see `MarkOrderRefundedResult`) so the webhook
+   * can log each distinctly.
+   */
+  async markOrderRefunded(
+    tenantId: string,
+    paymentIntentId: string,
+  ): Promise<MarkOrderRefundedResult> {
+    const result = await orderRepository.markRefundedByPaymentIntent(
+      tenantId,
+      paymentIntentId,
+    );
+    if (result.transitioned) return { outcome: "refunded" };
+    // Nothing moved — the repository already told us which case: an unknown
+    // intent (currentStatus null) or an order that wasn't PAID/FULFILLED.
+    if (result.currentStatus === null) return { outcome: "no-order" };
+    return {
+      outcome: "already-processed",
+      currentStatus: result.currentStatus,
+    };
   },
 };

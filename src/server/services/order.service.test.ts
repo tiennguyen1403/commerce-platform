@@ -34,24 +34,30 @@ vi.mock("@/server/repositories/order.repository", () => ({
     createWithItems: vi.fn(),
     markPaidByPaymentIntent: vi.fn(),
     findByPaymentIntentForTenant: vi.fn(),
+    findByIdForTenant: vi.fn(),
     cancelPendingAndRelease: vi.fn(),
     markFulfilled: vi.fn(),
+    markRefundedByPaymentIntent: vi.fn(),
   },
 }));
 
-// A minimal Stripe stand-in — only the PaymentIntent calls the service makes.
+// A minimal Stripe stand-in — only the PaymentIntent + Refund calls the service
+// makes.
 const paymentIntents = {
   create: vi.fn(),
   retrieve: vi.fn(),
   cancel: vi.fn(),
 };
-const fakeStripe = { paymentIntents } as unknown as Stripe;
+const refunds = { create: vi.fn() };
+const fakeStripe = { paymentIntents, refunds } as unknown as Stripe;
 
 const getCartView = vi.mocked(cartService.getCartView);
 const createWithItems = vi.mocked(orderRepository.createWithItems);
 const markPaid = vi.mocked(orderRepository.markPaidByPaymentIntent);
+const findById = vi.mocked(orderRepository.findByIdForTenant);
 const cancelRepo = vi.mocked(orderRepository.cancelPendingAndRelease);
 const fulfillRepo = vi.mocked(orderRepository.markFulfilled);
+const markRefunded = vi.mocked(orderRepository.markRefundedByPaymentIntent);
 
 const TENANT = "tenant_1";
 const EMAIL = "shopper@example.com";
@@ -431,5 +437,123 @@ describe("orderService.fulfillOrder", () => {
     await expect(orderService.fulfillOrder(TENANT, "order_1")).rejects.toThrow(
       /pending/i,
     );
+  });
+});
+
+describe("orderService.refundOrder", () => {
+  it("initiates a full Stripe refund (no amount) with tenant/order metadata for a PAID order", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ status: "PAID", stripePaymentIntentId: "pi_1" }),
+    );
+    refunds.create.mockResolvedValue({ id: "re_1", status: "pending" });
+
+    await expect(
+      orderService.refundOrder(TENANT, "order_1"),
+    ).resolves.toBeUndefined();
+
+    expect(findById).toHaveBeenCalledWith(TENANT, "order_1");
+    expect(refunds.create).toHaveBeenCalledWith(
+      {
+        payment_intent: "pi_1",
+        reason: "requested_by_customer",
+        metadata: { tenantId: TENANT, orderId: "order_1" },
+      },
+      // Idempotency key mirrors the checkout PaymentIntent — at most one refund.
+      { idempotencyKey: "refund_order_1" },
+    );
+    // Omitting `amount` is what makes it a *full* refund — assert it's absent.
+    expect(refunds.create.mock.calls[0][0]).not.toHaveProperty("amount");
+  });
+
+  it("also refunds a FULFILLED order", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ status: "FULFILLED", stripePaymentIntentId: "pi_9" }),
+    );
+    refunds.create.mockResolvedValue({ id: "re_2", status: "succeeded" });
+
+    await orderService.refundOrder(TENANT, "order_1");
+
+    expect(refunds.create).toHaveBeenCalledWith(
+      expect.objectContaining({ payment_intent: "pi_9" }),
+      expect.objectContaining({ idempotencyKey: "refund_order_1" }),
+    );
+  });
+
+  it("makes no DB write on initiation — the webhook is the sole writer", async () => {
+    findById.mockResolvedValue(orderWithItems({ status: "PAID" }));
+    refunds.create.mockResolvedValue({ id: "re_3", status: "pending" });
+
+    await orderService.refundOrder(TENANT, "order_1");
+
+    expect(markRefunded).not.toHaveBeenCalled();
+  });
+
+  it("throws OrderNotFoundError and never calls Stripe when the order doesn't exist", async () => {
+    findById.mockResolvedValue(null);
+
+    await expect(
+      orderService.refundOrder(TENANT, "order_x"),
+    ).rejects.toBeInstanceOf(OrderNotFoundError);
+    expect(refunds.create).not.toHaveBeenCalled();
+  });
+
+  it("throws OrderTransitionError naming the status when the order isn't refundable", async () => {
+    findById.mockResolvedValue(orderWithItems({ status: "PENDING" }));
+
+    await expect(
+      orderService.refundOrder(TENANT, "order_1"),
+    ).rejects.toBeInstanceOf(OrderTransitionError);
+    // The refusal message names the blocking status so the admin sees why.
+    await expect(orderService.refundOrder(TENANT, "order_1")).rejects.toThrow(
+      /pending/i,
+    );
+    expect(refunds.create).not.toHaveBeenCalled();
+  });
+
+  it("throws without calling Stripe when a captured order has no PaymentIntent", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ status: "PAID", stripePaymentIntentId: null }),
+    );
+
+    await expect(orderService.refundOrder(TENANT, "order_1")).rejects.toThrow(
+      /no linked PaymentIntent/i,
+    );
+    expect(refunds.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("orderService.markOrderRefunded", () => {
+  it("reports 'refunded' on the transition", async () => {
+    markRefunded.mockResolvedValue({ transitioned: true });
+
+    await expect(
+      orderService.markOrderRefunded(TENANT, "pi_1"),
+    ).resolves.toEqual({ outcome: "refunded" });
+    expect(markRefunded).toHaveBeenCalledWith(TENANT, "pi_1");
+  });
+
+  it("reports 'already-processed' with the current status when the order exists but didn't move", async () => {
+    markRefunded.mockResolvedValue({
+      transitioned: false,
+      currentStatus: "REFUNDED",
+    });
+
+    await expect(
+      orderService.markOrderRefunded(TENANT, "pi_1"),
+    ).resolves.toEqual({
+      outcome: "already-processed",
+      currentStatus: "REFUNDED",
+    });
+  });
+
+  it("reports 'no-order' when no order matches the intent", async () => {
+    markRefunded.mockResolvedValue({
+      transitioned: false,
+      currentStatus: null,
+    });
+
+    await expect(
+      orderService.markOrderRefunded(TENANT, "pi_1"),
+    ).resolves.toEqual({ outcome: "no-order" });
   });
 });

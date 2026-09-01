@@ -103,6 +103,122 @@ async function handlePaymentIntentSucceeded(
   }
 }
 
+/**
+ * Apply a `refund.*` event to the matching order. Stripe sends `refund.created`,
+ * `refund.updated`, and `refund.failed` — all carrying a `Refund` — so we branch
+ * on `refund.status`, not the event name. Only `succeeded` transitions the order
+ * (PAID|FULFILLED → REFUNDED, via the service's atomic guard; the webhook is the
+ * sole writer of REFUNDED). `failed` is alerted for manual follow-up — the money
+ * was NOT returned — and any interim status (`pending`/`requires_action`/
+ * `canceled`) is acknowledged and left for a later `refund.updated`.
+ *
+ * The tenant is resolved from the refund's metadata, stamped at initiation (see
+ * `orderService.refundOrder`), exactly like the PaymentIntent metadata on the
+ * paid path — so a refund we didn't initiate (e.g. straight from the Stripe
+ * dashboard) carries none of ours and is acknowledged-and-ignored rather than
+ * guessed at. Best-effort logging only; the service's guard, not this function,
+ * decides whether anything actually changed.
+ */
+async function handleRefundEvent(
+  refund: Stripe.Refund,
+  log: Logger,
+): Promise<void> {
+  const tenantId = refund.metadata?.tenantId;
+  const orderId = refund.metadata?.orderId;
+  if (!tenantId) {
+    log.warn(
+      { refundId: refund.id },
+      "refund event has no tenantId metadata; ignoring",
+    );
+    return;
+  }
+
+  // A Refund's `payment_intent` is `string | PaymentIntent | null` — unexpanded
+  // in webhook payloads (a string id), but normalize defensively to the id we key
+  // the order lookup on.
+  const paymentIntentId =
+    typeof refund.payment_intent === "string"
+      ? refund.payment_intent
+      : (refund.payment_intent?.id ?? null);
+
+  if (refund.status === "failed") {
+    // The refund did not go through — funds were NOT returned. We don't retry or
+    // auto-act; surface it loudly (with the failure reason) so an operator can,
+    // mirroring the oversell alert on the paid path.
+    log.error(
+      {
+        refundId: refund.id,
+        paymentIntentId,
+        orderId,
+        tenantId,
+        failureReason: refund.failure_reason,
+      },
+      "REFUND FAILED: funds were not returned — manual follow-up needed",
+    );
+    return;
+  }
+
+  if (refund.status !== "succeeded") {
+    // pending / requires_action / canceled: an interim state that doesn't move
+    // the order. Acknowledge (200) so Stripe stops retrying; the terminal status
+    // arrives on a later `refund.updated`.
+    log.info(
+      { refundId: refund.id, status: refund.status, orderId },
+      "refund not in a terminal state; no-op",
+    );
+    return;
+  }
+
+  if (!paymentIntentId) {
+    // A succeeded refund with no PaymentIntent to key on — shouldn't happen for
+    // our PaymentIntent-based refunds, so surface it rather than silently drop.
+    log.warn(
+      { refundId: refund.id, orderId, tenantId },
+      "succeeded refund has no payment_intent; cannot resolve order",
+    );
+    return;
+  }
+
+  const result = await orderService.markOrderRefunded(
+    tenantId,
+    paymentIntentId,
+  );
+  switch (result.outcome) {
+    case "refunded":
+      log.info(
+        { refundId: refund.id, paymentIntentId, orderId },
+        "order marked REFUNDED",
+      );
+      break;
+    case "already-processed":
+      if (result.currentStatus === "REFUNDED") {
+        // Normal duplicate/late `refund.succeeded` (or a lost race) — already done.
+        log.info(
+          { refundId: refund.id, paymentIntentId, orderId },
+          "order already REFUNDED; no-op",
+        );
+      } else {
+        // A refund succeeded for an order we don't think was captured — anomalous.
+        log.warn(
+          {
+            refundId: refund.id,
+            paymentIntentId,
+            orderId,
+            currentStatus: result.currentStatus,
+          },
+          "refund succeeded but order is not in a refundable state; no-op",
+        );
+      }
+      break;
+    case "no-order":
+      log.warn(
+        { refundId: refund.id, paymentIntentId, orderId, tenantId },
+        "no order matches refunded payment_intent; no-op",
+      );
+      break;
+  }
+}
+
 export async function POST(request: Request): Promise<NextResponse> {
   const log = logger.child({ component: "stripe-webhook" });
 
@@ -141,6 +257,12 @@ export async function POST(request: Request): Promise<NextResponse> {
     switch (event.type) {
       case "payment_intent.succeeded":
         await handlePaymentIntentSucceeded(event.data.object, eventLog);
+        break;
+      case "refund.created":
+      case "refund.updated":
+      case "refund.failed":
+        // All three carry a `Refund`; the handler branches on `refund.status`.
+        await handleRefundEvent(event.data.object, eventLog);
         break;
       default:
         // Acknowledged but not acted on — Stripe sends many event types and a

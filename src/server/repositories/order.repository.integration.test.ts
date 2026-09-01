@@ -967,6 +967,185 @@ describe("orderRepository.markFulfilled (integration)", () => {
   });
 });
 
+describe("orderRepository.markRefundedByPaymentIntent (integration)", () => {
+  it("flips a PAID order → REFUNDED by its PaymentIntent", async () => {
+    const tenant = await freshTenant();
+    const intent = uniqueId("pi");
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      stripePaymentIntentId: intent,
+    });
+
+    const result = await orderRepository.markRefundedByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+    expect(result).toEqual({ transitioned: true });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("REFUNDED");
+  });
+
+  it("flips a FULFILLED order → REFUNDED too", async () => {
+    const tenant = await freshTenant();
+    const intent = uniqueId("pi");
+    const order = await seedOrder(tenant.id, {
+      status: "FULFILLED",
+      stripePaymentIntentId: intent,
+    });
+
+    const result = await orderRepository.markRefundedByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+    expect(result).toEqual({ transitioned: true });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("REFUNDED");
+  });
+
+  it("is a no-op on an order that isn't PAID/FULFILLED, reporting its status", async () => {
+    const tenant = await freshTenant();
+    const intent = uniqueId("pi");
+    const order = await seedOrder(tenant.id, {
+      status: "PENDING",
+      stripePaymentIntentId: intent,
+    });
+
+    const result = await orderRepository.markRefundedByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: "PENDING" });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PENDING");
+  });
+
+  it("is a no-op on a CANCELLED order, reporting its status", async () => {
+    const tenant = await freshTenant();
+    const intent = uniqueId("pi");
+    // A refund arriving for a cancelled order is the realistic anomaly the guard
+    // must reject: CANCELLED is not a refundable source state.
+    const order = await seedOrder(tenant.id, {
+      status: "CANCELLED",
+      stripePaymentIntentId: intent,
+    });
+
+    const result = await orderRepository.markRefundedByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: "CANCELLED" });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("CANCELLED");
+  });
+
+  it("reports currentStatus:null for an unknown PaymentIntent", async () => {
+    const tenant = await freshTenant();
+    const result = await orderRepository.markRefundedByPaymentIntent(
+      tenant.id,
+      uniqueId("pi-missing"),
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: null });
+  });
+
+  it("does not cross the tenant boundary — a foreign intent is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const intent = uniqueId("pi");
+    const order = await seedOrder(owner.id, {
+      status: "PAID",
+      stripePaymentIntentId: intent,
+    });
+
+    // Same intent id, wrong tenant: it must resolve as unknown and touch nothing.
+    const result = await orderRepository.markRefundedByPaymentIntent(
+      other.id,
+      intent,
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: null });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("is idempotent — a duplicate succeeded delivery flips once, then no-ops as REFUNDED", async () => {
+    const tenant = await freshTenant();
+    const intent = uniqueId("pi");
+    await seedOrder(tenant.id, {
+      status: "PAID",
+      stripePaymentIntentId: intent,
+    });
+
+    const first = await orderRepository.markRefundedByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+    const second = await orderRepository.markRefundedByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+
+    expect(first).toEqual({ transitioned: true });
+    // The order is now REFUNDED → the second delivery matches nothing.
+    expect(second).toEqual({ transitioned: false, currentStatus: "REFUNDED" });
+  });
+
+  it("transitions exactly once under a concurrent double-delivery (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const intent = uniqueId("pi");
+    await seedOrder(tenant.id, {
+      status: "PAID",
+      stripePaymentIntentId: intent,
+    });
+
+    // Two refund-webhook deliveries land at once. Row locking on the guarded
+    // `updateMany({ status: { in: [PAID, FULFILLED] } })` must let exactly one win.
+    const [a, b] = await Promise.all([
+      orderRepository.markRefundedByPaymentIntent(tenant.id, intent),
+      orderRepository.markRefundedByPaymentIntent(tenant.id, intent),
+    ]);
+
+    const transitioned = [a, b].filter((r) => r.transitioned);
+    expect(transitioned).toHaveLength(1);
+    const loser = [a, b].find((r) => !r.transitioned);
+    expect(loser).toEqual({ transitioned: false, currentStatus: "REFUNDED" });
+  });
+
+  it("does not touch stock or reservations (refund restock is manual)", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 7, reserved: 2 });
+    const intent = uniqueId("pi");
+    await seedOrder(tenant.id, {
+      status: "PAID",
+      stripePaymentIntentId: intent,
+      lines: [{ variantId: variant.id, qty: 3, priceCents: 1000 }],
+    });
+
+    await orderRepository.markRefundedByPaymentIntent(tenant.id, intent);
+
+    // Refunding is a pure status flip: restock is left to the manual product-edit
+    // form (goodwill vs return is ambiguous), so inventory is untouched.
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.stock).toBe(7);
+    expect(after.reserved).toBe(2);
+  });
+});
+
 describe("orderRepository.listByTenant (integration)", () => {
   it("returns a tenant's orders newest-first with a total", async () => {
     const tenant = await freshTenant();

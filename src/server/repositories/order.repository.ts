@@ -545,6 +545,51 @@ export const orderRepository = {
     });
     return { transitioned: false, currentStatus: existing?.status ?? null };
   },
+
+  /**
+   * Mark a PAID or FULFILLED order REFUNDED by its Stripe PaymentIntent — the
+   * REFUND leg of the state machine, driven solely by the verified `refund.*`
+   * webhook (the admin initiation only calls Stripe; it never writes). The
+   * `status: { in: ["PAID", "FULFILLED"] }` guard is the one-way door: only a
+   * captured order refunds, so a duplicate / late / racing `refund.succeeded`
+   * delivery flips nothing (exactly one delivery gets count 1) and the order can
+   * never regress into REFUNDED from PENDING/CANCELLED. No inventory work:
+   * restock on refund is deliberately manual (goodwill vs return is ambiguous),
+   * so a REFUNDED order's stock is left exactly as the sale left it. A single
+   * guarded `updateMany` is itself atomic — no surrounding transaction, mirroring
+   * `markFulfilled`.
+   *
+   * Scoped by `tenantId` (golden rule #1) even though `stripePaymentIntentId` is
+   * globally unique — defence in depth that also keeps a foreign intent invisible.
+   * Returns `{ transitioned: true }` for the delivery that made the move, else
+   * `{ transitioned: false, currentStatus }`: `null` for no order matching the
+   * intent in this tenant, a non-null status for one that wasn't PAID/FULFILLED
+   * (already REFUNDED, or — anomalously — still PENDING/CANCELLED). The status is
+   * re-read on the no-op path so the webhook's log stays truthful after a lost
+   * race.
+   */
+  async markRefundedByPaymentIntent(
+    tenantId: string,
+    stripePaymentIntentId: string,
+  ): Promise<OrderTransitionResult> {
+    const { count } = await prisma.order.updateMany({
+      where: {
+        tenantId,
+        stripePaymentIntentId,
+        status: { in: ["PAID", "FULFILLED"] },
+      },
+      data: { status: "REFUNDED" },
+    });
+    if (count === 1) return { transitioned: true };
+
+    // Nothing moved: tell an unknown intent apart from a wrong-state order so the
+    // webhook logs the right level. This read runs only on the no-op path.
+    const existing = await prisma.order.findFirst({
+      where: { tenantId, stripePaymentIntentId },
+      select: { status: true },
+    });
+    return { transitioned: false, currentStatus: existing?.status ?? null };
+  },
 };
 
 /** An order joined with its line items — the shape `findByPaymentIntentForTenant`
