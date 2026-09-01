@@ -8,6 +8,8 @@ import {
   EmailNotConfiguredError,
 } from "@/server/services/email.service";
 import type { OrderWithItems } from "@/server/repositories/order.repository";
+import { logger, type Logger } from "@/server/observability/logger";
+import { reportError } from "@/server/observability/error-reporter";
 
 /**
  * Stripe webhook — the authoritative "paid" signal.
@@ -42,25 +44,29 @@ import type { OrderWithItems } from "@/server/repositories/order.repository";
  *  order is the durable record and the email is best-effort. Log and move on. */
 async function sendConfirmationEmailSafely(
   order: OrderWithItems,
+  log: Logger,
 ): Promise<void> {
   try {
     await emailService.sendOrderConfirmation(order);
-    console.info(
-      `Stripe webhook: confirmation email sent for order ${order.orderNumber}`,
-    );
+    log.info({ orderNumber: order.orderNumber }, "confirmation email sent");
   } catch (err) {
     // Email unconfigured is an expected state (the store hasn't set up Resend),
     // not something to alarm on — log it as a warning. Any other send failure is
     // a real problem, so keep that at error level. Either way the webhook 200s.
     if (err instanceof EmailNotConfiguredError) {
-      console.warn(
-        `Stripe webhook: email not configured — skipped confirmation for order ${order.orderNumber}`,
+      log.warn(
+        { orderNumber: order.orderNumber },
+        "email not configured — skipped order confirmation",
       );
       return;
     }
-    console.error(
-      `Stripe webhook: failed to send confirmation email for order ${order.orderNumber}`,
-      err,
+    // A structured error log, not `reportError`: this is best-effort email whose
+    // failure is already swallowed, and a Resend outage would otherwise fan every
+    // order's failure out to the alert channel. Reliable delivery (outbox +
+    // retry) is issue #30's job, not this seam's.
+    log.error(
+      { err, orderNumber: order.orderNumber },
+      "failed to send order confirmation email",
     );
   }
 }
@@ -69,6 +75,7 @@ async function sendConfirmationEmailSafely(
  *  guard, not this function, decides whether anything actually changed. */
 async function handlePaymentIntentSucceeded(
   paymentIntent: Stripe.PaymentIntent,
+  log: Logger,
 ): Promise<void> {
   // We stamp `tenantId` onto every PaymentIntent at checkout (see
   // order.service.ts). Without it the lookup can't be tenant-scoped
@@ -76,8 +83,9 @@ async function handlePaymentIntentSucceeded(
   // pre-metadata intent simply isn't one of ours to act on.
   const tenantId = paymentIntent.metadata.tenantId;
   if (!tenantId) {
-    console.warn(
-      `Stripe webhook: payment_intent.succeeded ${paymentIntent.id} has no tenantId metadata; ignoring`,
+    log.warn(
+      { paymentIntentId: paymentIntent.id },
+      "payment_intent.succeeded has no tenantId metadata; ignoring",
     );
     return;
   }
@@ -85,8 +93,12 @@ async function handlePaymentIntentSucceeded(
   const result = await orderService.markOrderPaid(tenantId, paymentIntent.id);
   switch (result.outcome) {
     case "paid":
-      console.info(
-        `Stripe webhook: order for PaymentIntent ${paymentIntent.id} marked PAID`,
+      log.info(
+        {
+          paymentIntentId: paymentIntent.id,
+          orderNumber: result.order.orderNumber,
+        },
+        "order marked PAID",
       );
       // Oversell alert: payment is captured, but the atomic decrement couldn't
       // fully allocate one or more lines (another shopper took the last units
@@ -94,37 +106,40 @@ async function handlePaymentIntentSucceeded(
       // it loudly with the order + shortfall detail so an operator can act. The
       // order still stands PAID (the money is real); only inventory fell short.
       if (result.shortfalls.length > 0) {
-        const detail = result.shortfalls
-          .map(
-            (s) =>
-              `${s.titleSnapshot} (ordered ${s.ordered}, available ${s.available})`,
-          )
-          .join("; ");
-        console.error(
-          `Stripe webhook: OVERSELL on order ${result.order.orderNumber} (PaymentIntent ${paymentIntent.id}) — payment captured but stock was insufficient for: ${detail}. Manual refund/review needed.`,
+        log.error(
+          {
+            orderNumber: result.order.orderNumber,
+            paymentIntentId: paymentIntent.id,
+            shortfalls: result.shortfalls,
+          },
+          "OVERSELL: payment captured but stock was insufficient — manual refund/review needed",
         );
       }
       // Hang the confirmation off this single PENDING → PAID transition: only
       // this one delivery sends, so Stripe's retries never duplicate it (at
       // most once per order — a swallowed send failure is not retried).
-      await sendConfirmationEmailSafely(result.order);
+      await sendConfirmationEmailSafely(result.order, log);
       break;
     case "already-processed":
-      console.info(
-        `Stripe webhook: PaymentIntent ${paymentIntent.id} already processed; no-op`,
+      log.info(
+        { paymentIntentId: paymentIntent.id },
+        "payment_intent already processed; no-op",
       );
       break;
     case "no-order":
       // A paid intent with no order to match: shouldn't happen (the order is
       // written before checkout can confirm), so surface it rather than swallow.
-      console.warn(
-        `Stripe webhook: no order matches paid PaymentIntent ${paymentIntent.id} for tenant ${tenantId}; no-op`,
+      log.warn(
+        { paymentIntentId: paymentIntent.id, tenantId },
+        "no order matches paid payment_intent; no-op",
       );
       break;
   }
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
+  const log = logger.child({ component: "stripe-webhook" });
+
   const signature = request.headers.get("stripe-signature");
   if (!signature) {
     return NextResponse.json({ error: "Missing signature" }, { status: 400 });
@@ -147,14 +162,19 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   } catch (err) {
     // Bad/forged signature or malformed payload — the only case that is a 400.
-    console.error("Stripe webhook signature verification failed", err);
+    // A public endpoint sees these routinely (probes, a stale signing secret), so
+    // it's an error-level *log*, not an alert: routine 400s don't belong in the
+    // error webhook.
+    log.error({ err }, "signature verification failed");
     return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
   }
+
+  const eventLog = log.child({ eventId: event.id, eventType: event.type });
 
   try {
     switch (event.type) {
       case "payment_intent.succeeded":
-        await handlePaymentIntentSucceeded(event.data.object);
+        await handlePaymentIntentSucceeded(event.data.object, eventLog);
         break;
       default:
         // Acknowledged but not acted on — Stripe sends many event types and a
@@ -163,13 +183,15 @@ export async function POST(request: Request): Promise<NextResponse> {
     }
   } catch (err) {
     // Signature was valid but handling failed (e.g. the database was briefly
-    // down). Return non-2xx so Stripe retries with backoff; the atomic status
-    // guard makes that retry a safe no-op if the transition later succeeds,
-    // which is what keeps this webhook a reliable source of truth.
-    console.error(
-      `Stripe webhook: handler failed for ${event.type} (${event.id})`,
-      err,
-    );
+    // down). Report it — an unexpected server error the operator should see —
+    // and return non-2xx so Stripe retries with backoff; the atomic status guard
+    // makes that retry a safe no-op if the transition later succeeds, which is
+    // what keeps this webhook a reliable source of truth.
+    await reportError(err, {
+      component: "stripe-webhook",
+      eventId: event.id,
+      eventType: event.type,
+    });
     return NextResponse.json({ error: "Handler error" }, { status: 500 });
   }
 

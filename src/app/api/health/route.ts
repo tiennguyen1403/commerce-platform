@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/server/db";
+import { logger } from "@/server/observability/logger";
 
 export const dynamic = "force-dynamic";
 
@@ -13,7 +14,14 @@ export async function GET() {
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Health check failed:", error);
+    // Readiness probe: a DB blip flips this to 503 — the signal an uptime monitor
+    // already watches — so log it structured rather than routing it to
+    // `reportError`, which would fan every probe failure out to the alert channel
+    // for the duration of an outage.
+    logger.error(
+      { err: error, route: "/api/health" },
+      "health check failed: database unreachable",
+    );
     return NextResponse.json(
       { status: "degraded", db: "down" },
       { status: 503 },
