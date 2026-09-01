@@ -1,9 +1,10 @@
 /**
  * Typed email errors, thrown by the email service and handled at the caller
- * boundary (the Stripe webhook swallows them; a future outbox drain (#31) will
- * treat a permanent failure as DEAD). Kept in a dependency-free module so both
- * the service and any retrying caller can import them without depending on the
- * service itself — mirrors `order.errors.ts` / `catalog.errors.ts`.
+ * boundary — the outbox drain (#30) treats a permanent failure like this as DEAD
+ * (no retry), while a transient Resend outage backs off and retries. Kept in a
+ * dependency-free module so both the service and any retrying caller can import
+ * them without depending on the service itself — mirrors `order.errors.ts` /
+ * `catalog.errors.ts`.
  */
 
 /**

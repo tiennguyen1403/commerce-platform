@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 import { verifyCronRequest } from "@/server/cron/verify-cron-request";
+import { outboxService } from "@/server/services/outbox.service";
 import { logger } from "@/server/observability/logger";
 
-// Reads the request's Authorization header (and, once #30 lands, writes to the
-// DB), so it must never be cached or prerendered — a cron endpoint has to run
+// Reads the request's Authorization header and writes to the DB (the outbox
+// drain), so it must never be cached or prerendered — a cron endpoint has to run
 // fresh on every hit. Reading `request` already forces dynamic; this makes the
 // never-cache intent explicit (and mirrors the health routes).
 export const dynamic = "force-dynamic";
@@ -18,15 +19,18 @@ export const maxDuration = 60;
 // The outbox drain needs Node crypto + Prisma anyway.
 
 /**
- * Cron entry point for the transactional-email **outbox drain**.
+ * Cron entry point for the transactional-email **outbox drain** (issue #30).
  *
- * Harness only (issue #53): authenticate the caller, log, and return a bounded
- * no-op so both schedulers get a clean 200. The real work — recover stale claims,
- * select `PENDING` rows, send with backoff — lands in #30, where
- * `outboxService.drain()` will be called here and its counts returned in `result`.
+ * Authenticates the caller, then `outboxService.drain()` recovers stale claims,
+ * selects the `PENDING` rows whose backoff has elapsed, and sends each with an
+ * atomic claim + idempotency key so nothing is sent twice. Its per-run counts are
+ * returned in the body for observability.
  *
- * Cron delivery is best-effort and never retried by Vercel, so the eventual drain
- * is reconciliation-based: a missed or duplicated run is a safe no-op.
+ * Cron delivery is best-effort and never retried by Vercel, so the drain is
+ * reconciliation-based: a missed or duplicated run is a safe no-op (the next run
+ * picks up whatever is still due). A drain error propagates — the caller sees a
+ * non-2xx (the GitHub workflow goes red) and `onRequestError` reports it — and
+ * the next scheduled run reconciles.
  */
 export async function GET(request: Request): Promise<NextResponse> {
   if (!verifyCronRequest(request)) {
@@ -37,9 +41,8 @@ export async function GET(request: Request): Promise<NextResponse> {
   }
 
   const log = logger.child({ component: "cron:dispatch-outbox" });
-  // Placeholder until #30 — nothing to drain yet.
-  const result = { processed: 0 };
-  log.info(result, "cron dispatch-outbox: no-op (outbox drain lands in #30)");
+  const result = await outboxService.drain();
+  log.info(result, "cron dispatch-outbox: drained");
 
   return NextResponse.json(
     { ok: true, task: "dispatch-outbox", ...result },

@@ -129,6 +129,53 @@ describe("orderRepository.markPaidByPaymentIntent (integration)", () => {
     expect(afterStock.stock).toBe(7);
   });
 
+  it("enqueues exactly one PENDING order-confirmation in the flip transaction", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, {
+      stock: 5,
+      priceCents: 1000,
+    });
+    const intent = uniqueId("pi");
+    const order = await seedPendingOrder(tenant.id, intent, [
+      { variantId: variant.id, qty: 1, priceCents: 1000 },
+    ]);
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    // The transactional outbox (#30): the confirmation is queued atomically with
+    // PENDING → PAID, so a paid order always has exactly one message to send.
+    const messages = await prisma.outboxMessage.findMany({
+      where: { tenantId: tenant.id, orderId: order.id },
+    });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: "ORDER_CONFIRMATION",
+      status: "PENDING",
+      attempts: 0,
+      idempotencyKey: `oc_${order.id}`,
+    });
+  });
+
+  it("does not enqueue a second outbox message on a duplicate delivery", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 5 });
+    const intent = uniqueId("pi");
+    const order = await seedPendingOrder(tenant.id, intent, [
+      { variantId: variant.id, qty: 1, priceCents: 1000 },
+    ]);
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    // Only the single PENDING → PAID transition enqueues; the duplicate delivery
+    // finds the order already PAID and touches nothing (and the unique
+    // idempotencyKey would reject a second write even if it tried).
+    const count = await prisma.outboxMessage.count({
+      where: { orderId: order.id },
+    });
+    expect(count).toBe(1);
+  });
+
   it("is a no-op on a duplicate delivery — no second decrement", async () => {
     const tenant = await freshTenant();
     const variant = await seedVariant(tenant.id, { stock: 10 });

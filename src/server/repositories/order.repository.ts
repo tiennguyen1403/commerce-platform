@@ -121,6 +121,18 @@ export const orderRepository = {
   },
 
   /**
+   * Look up an order by id, scoped to the tenant, with its items — the shape the
+   * outbox drain (#30) re-reads to render the confirmation email. Tenant in the
+   * WHERE (golden rule #1) so one store's drain can never render another's order.
+   */
+  findByIdForTenant(tenantId: string, id: string) {
+    return prisma.order.findFirst({
+      where: { tenantId, id },
+      include: { items: true },
+    });
+  },
+
+  /**
    * Confirm payment for an order and allocate its inventory, atomically. In one
    * transaction this (a) flips the tenant's order PENDING → PAID for the given
    * PaymentIntent and (b) decrements each line's variant stock. The
@@ -182,6 +194,24 @@ export const orderRepository = {
         // race). Report that it existed so the service needn't re-read to tell
         // this normal duplicate apart from a genuinely missing order.
         if (count === 0) return { transitioned: false, orderExisted: true };
+
+        // Transactional outbox (#30): queue the confirmation email in the SAME
+        // transaction as the flip, so a paid order can never exist without its
+        // confirmation enqueued — that is what turns delivery from at-most-once
+        // (the old synchronous webhook send, dropped on a Resend blip) into
+        // at-least-once. This write only records the durable *intent*; the actual
+        // send + retry-with-backoff is the cron drain's job (outboxService). Since
+        // this runs only on the single PENDING → PAID transition, the message is
+        // enqueued exactly once; the unique `idempotencyKey` (derived from the
+        // order id) is belt-and-suspenders against ever writing two.
+        await tx.outboxMessage.create({
+          data: {
+            tenantId,
+            orderId: order.id,
+            type: "ORDER_CONFIRMATION",
+            idempotencyKey: `oc_${order.id}`,
+          },
+        });
 
         // We own the transition — allocate inventory in the same transaction. A
         // line whose stock can't cover its quantity is collected as a shortfall

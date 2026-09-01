@@ -137,8 +137,17 @@ export const emailService = {
    * id), falling back to a neutral label if the tenant can't be resolved.
    * Throws on a Resend failure so the caller can log it; never called on a path
    * where that throw would fail the webhook.
+   *
+   * `options.idempotencyKey`, when passed (the outbox drain does, #30), rides
+   * along as Resend's `Idempotency-Key`: if a send succeeds but the caller then
+   * fails to record it (a killed worker) and retries, Resend returns the original
+   * result instead of sending a second email (24h window). Retries of a *failed*
+   * send are unaffected — the key tracks successes, not failures.
    */
-  async sendOrderConfirmation(order: OrderWithItems): Promise<void> {
+  async sendOrderConfirmation(
+    order: OrderWithItems,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
     // Email is optional config (#39), validated here at send time rather than at
     // boot. Unset/blank is a *permanent* failure: throw a typed error the webhook
     // swallows (and a retrying caller marks DEAD, never spins on) — checked before
@@ -154,14 +163,12 @@ export const emailService = {
     const { subject, html, text } = renderOrderConfirmation(order, storeName);
 
     // Resend reports API-level failures via `error` rather than throwing; turn
-    // it into a throw so callers have a single failure channel to handle.
-    const { error } = await getResend(apiKey).emails.send({
-      from,
-      to: order.email,
-      subject,
-      html,
-      text,
-    });
+    // it into a throw so callers have a single failure channel to handle. The
+    // idempotency key (if any) goes in the request options, not the payload.
+    const { error } = await getResend(apiKey).emails.send(
+      { from, to: order.email, subject, html, text },
+      { idempotencyKey: options?.idempotencyKey },
+    );
     if (error) {
       throw new Error(
         `Resend failed to send order confirmation (${error.name}): ${error.message}`,

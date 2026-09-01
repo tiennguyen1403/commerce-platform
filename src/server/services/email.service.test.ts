@@ -140,6 +140,24 @@ describe("emailService.sendOrderConfirmation", () => {
     expect(email.text).toContain("Total: $100.00");
   });
 
+  it("forwards an idempotency key to Resend as request options (outbox drain)", async () => {
+    await emailService.sendOrderConfirmation(orderWithItems(), {
+      idempotencyKey: "oc_order_1",
+    });
+
+    // The key rides in the second arg (request options), not the payload — see
+    // Resend's `CreateEmailRequestOptions`.
+    expect(sendMock.mock.calls[0][1]).toMatchObject({
+      idempotencyKey: "oc_order_1",
+    });
+  });
+
+  it("sends without an idempotency key when none is given", async () => {
+    await emailService.sendOrderConfirmation(orderWithItems());
+
+    expect(sendMock.mock.calls[0][1]).toEqual({ idempotencyKey: undefined });
+  });
+
   it("escapes HTML-significant characters from admin-authored text in the HTML body", async () => {
     findById.mockResolvedValue(tenant({ name: `A&W "Root" <b>'s` }));
 

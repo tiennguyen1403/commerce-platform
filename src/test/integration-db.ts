@@ -56,6 +56,9 @@ export function createTestTenant(
  * table truncation.
  */
 export async function deleteTenantDeep(tenantId: string): Promise<void> {
+  // OutboxMessage cascades from both Tenant and Order; clear it first so neither
+  // cascade path has to (matching the explicit-order rationale above).
+  await prisma.outboxMessage.deleteMany({ where: { tenantId } });
   await prisma.orderItem.deleteMany({ where: { order: { tenantId } } });
   await prisma.order.deleteMany({ where: { tenantId } });
   await prisma.productVariant.deleteMany({ where: { product: { tenantId } } });
