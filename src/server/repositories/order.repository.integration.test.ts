@@ -108,7 +108,9 @@ async function seedPendingOrder(
 }
 
 /** Seed an order in any status (with optional lines and an explicit `createdAt`
- *  for ordering tests). Used by the lifecycle + list suites below. */
+ *  for ordering tests). `email`/`currency`/`totalCents` are overridable so the
+ *  reuse-candidate filter suite can vary them independently of the lines. Used by
+ *  the lifecycle, list, sweep, and reuse suites below. */
 async function seedOrder(
   tenantId: string,
   opts: {
@@ -116,6 +118,9 @@ async function seedOrder(
     lines?: SeedLine[];
     stripePaymentIntentId?: string;
     createdAt?: Date;
+    email?: string;
+    currency?: string;
+    totalCents?: number;
   } = {},
 ) {
   const lines = opts.lines ?? [];
@@ -124,9 +129,11 @@ async function seedOrder(
       tenantId,
       orderNumber: uniqueId("order"),
       status: opts.status ?? "PENDING",
-      email: "shopper@example.com",
-      totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
-      currency: "usd",
+      email: opts.email ?? "shopper@example.com",
+      totalCents:
+        opts.totalCents ??
+        lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
+      currency: opts.currency ?? "usd",
       stripePaymentIntentId: opts.stripePaymentIntentId ?? uniqueId("pi"),
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
       items: {
@@ -1247,5 +1254,246 @@ describe("orderRepository.listByTenant (integration)", () => {
     });
     expect(page.total).toBe(2);
     expect(page.orders.every((o) => o.tenantId === owner.id)).toBe(true);
+  });
+});
+
+/**
+ * `findStalePending` — the abandoned-checkout sweep's work list (#25). This is a
+ * platform-wide query (it deliberately spans tenants, like the outbox drain), so
+ * assertions filter to the ids each test created rather than asserting absolute
+ * counts: the query may legitimately see other tenants' rows.
+ */
+describe("orderRepository.findStalePending (integration)", () => {
+  const minsAgo = (n: number) => new Date(Date.now() - n * 60_000);
+
+  it("returns PENDING orders older than the cutoff, across tenants, oldest first", async () => {
+    const a = await freshTenant();
+    const b = await freshTenant();
+    // Ages: a1 = 3h, b1 = 2h, a2 = 1h → oldest-first is [a1, b1, a2], spanning tenants.
+    const a1 = await seedOrder(a.id, { createdAt: minsAgo(180) });
+    const a2 = await seedOrder(a.id, { createdAt: minsAgo(60) });
+    const b1 = await seedOrder(b.id, { createdAt: minsAgo(120) });
+
+    const stale = await orderRepository.findStalePending(minsAgo(30), 100);
+
+    const mineInOrder = stale
+      .map((o) => o.id)
+      .filter((id) => [a1.id, a2.id, b1.id].includes(id));
+    expect(mineInOrder).toEqual([a1.id, b1.id, a2.id]);
+  });
+
+  it("excludes orders newer than the cutoff", async () => {
+    const t = await freshTenant();
+    const old = await seedOrder(t.id, { createdAt: minsAgo(120) });
+    const fresh = await seedOrder(t.id, { createdAt: minsAgo(5) });
+
+    const ids = (await orderRepository.findStalePending(minsAgo(60), 100)).map(
+      (o) => o.id,
+    );
+    expect(ids).toContain(old.id);
+    expect(ids).not.toContain(fresh.id);
+  });
+
+  it("excludes orders that are not PENDING", async () => {
+    const t = await freshTenant();
+    const pending = await seedOrder(t.id, {
+      status: "PENDING",
+      createdAt: minsAgo(120),
+    });
+    const paid = await seedOrder(t.id, {
+      status: "PAID",
+      createdAt: minsAgo(120),
+    });
+    const cancelled = await seedOrder(t.id, {
+      status: "CANCELLED",
+      createdAt: minsAgo(120),
+    });
+
+    const ids = (await orderRepository.findStalePending(minsAgo(30), 100)).map(
+      (o) => o.id,
+    );
+    expect(ids).toContain(pending.id);
+    expect(ids).not.toContain(paid.id);
+    expect(ids).not.toContain(cancelled.id);
+  });
+
+  it("respects the batch limit", async () => {
+    const t = await freshTenant();
+    await seedOrder(t.id, { createdAt: minsAgo(180) });
+    await seedOrder(t.id, { createdAt: minsAgo(150) });
+    await seedOrder(t.id, { createdAt: minsAgo(120) });
+
+    // take=2 with ≥2 stale rows in existence → exactly 2, whatever else is around.
+    const stale = await orderRepository.findStalePending(minsAgo(30), 2);
+    expect(stale).toHaveLength(2);
+  });
+
+  it("selects only the fields the sweep needs (id, tenantId, PaymentIntent)", async () => {
+    const t = await freshTenant();
+    const o = await seedOrder(t.id, {
+      createdAt: minsAgo(120),
+      stripePaymentIntentId: "pi_shape",
+    });
+
+    const found = (
+      await orderRepository.findStalePending(minsAgo(30), 100)
+    ).find((r) => r.id === o.id);
+    expect(found).toBeDefined();
+    expect(Object.keys(found!).sort()).toEqual([
+      "id",
+      "stripePaymentIntentId",
+      "tenantId",
+    ]);
+    expect(found).toMatchObject({
+      id: o.id,
+      tenantId: t.id,
+      stripePaymentIntentId: "pi_shape",
+    });
+  });
+});
+
+/**
+ * `findReusablePendingCandidates` — the checkout dedupe read (#25). Tenant-scoped,
+ * so exact-count assertions are safe (a fresh tenant sees only its own rows). The
+ * equality filters (email, currency, total, window, status) are what the service
+ * relies on to never reuse a stale-priced or foreign attempt.
+ */
+describe("orderRepository.findReusablePendingCandidates (integration)", () => {
+  const EMAIL = "reuse-shopper@example.com";
+  const recent = () => new Date(Date.now() - 60_000); // 1 min ago (inside window)
+  const query = (tenantId: string) => ({
+    tenantId,
+    email: EMAIL,
+    totalCents: 3000,
+    currency: "usd",
+    createdAfter: new Date(Date.now() - 15 * 60_000),
+    limit: 5,
+  });
+
+  it("returns matching recent PENDING orders with their items, newest first", async () => {
+    const t = await freshTenant();
+    const variant = await seedVariant(t.id, { stock: 10, priceCents: 1500 });
+    const older = await seedOrder(t.id, {
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: new Date(Date.now() - 5 * 60_000),
+      lines: [{ variantId: variant.id, qty: 2, priceCents: 1500 }],
+    });
+    const newer = await seedOrder(t.id, {
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+      lines: [{ variantId: variant.id, qty: 2, priceCents: 1500 }],
+    });
+
+    const found = await orderRepository.findReusablePendingCandidates(
+      query(t.id),
+    );
+
+    expect(found.map((o) => o.id)).toEqual([newer.id, older.id]);
+    expect(found[0].items).toHaveLength(1);
+    expect(found[0].items[0]).toMatchObject({
+      variantId: variant.id,
+      quantity: 2,
+    });
+  });
+
+  it("excludes a different shopper email", async () => {
+    const t = await freshTenant();
+    await seedOrder(t.id, {
+      email: "someone-else@example.com",
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("excludes a different currency", async () => {
+    const t = await freshTenant();
+    await seedOrder(t.id, {
+      email: EMAIL,
+      currency: "eur",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("excludes a drifted total (a stale-priced prior attempt)", async () => {
+    const t = await freshTenant();
+    await seedOrder(t.id, {
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 2500,
+      createdAt: recent(),
+    });
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("excludes a non-PENDING order", async () => {
+    const t = await freshTenant();
+    await seedOrder(t.id, {
+      status: "PAID",
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("excludes an order older than the reuse window", async () => {
+    const t = await freshTenant();
+    await seedOrder(t.id, {
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: new Date(Date.now() - 30 * 60_000), // 30 min > 15 min window
+    });
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("excludes another tenant's order", async () => {
+    const t = await freshTenant();
+    const other = await freshTenant();
+    await seedOrder(other.id, {
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("respects the candidate limit", async () => {
+    const t = await freshTenant();
+    for (let i = 0; i < 4; i++) {
+      await seedOrder(t.id, {
+        email: EMAIL,
+        currency: "usd",
+        totalCents: 3000,
+        createdAt: new Date(Date.now() - (i + 1) * 60_000),
+      });
+    }
+    const found = await orderRepository.findReusablePendingCandidates({
+      ...query(t.id),
+      limit: 2,
+    });
+    expect(found).toHaveLength(2);
   });
 });
