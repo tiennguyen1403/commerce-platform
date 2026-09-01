@@ -34,8 +34,19 @@ export function MemberRoleSelect({
 }) {
   const router = useRouter();
   const [value, setValue] = useState<Role>(role);
+  const [syncedRole, setSyncedRole] = useState<Role>(role);
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
+
+  // Re-sync to the server's role when it changes under us (e.g. another admin
+  // edited it and the page refreshed) — the idiomatic "adjust state on prop
+  // change" pattern, no effect needed. Our own optimistic change leaves `role`
+  // untouched until the post-success refresh, so this never clobbers an
+  // in-flight selection.
+  if (role !== syncedRole) {
+    setSyncedRole(role);
+    setValue(role);
+  }
 
   function applyRole(next: Role) {
     if (next === value) return;
@@ -65,7 +76,11 @@ export function MemberRoleSelect({
           disabled={disabled || pending}
         >
           <SelectTrigger
-            aria-label="Change role"
+            aria-label={
+              disabled && disabledReason
+                ? `Change role — ${disabledReason}`
+                : "Change role"
+            }
             title={disabled ? disabledReason : undefined}
             className="w-28"
           >

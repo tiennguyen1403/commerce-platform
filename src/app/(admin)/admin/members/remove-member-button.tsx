@@ -40,7 +40,17 @@ export function RemoveMemberButton({
 
   if (disabled) {
     return (
-      <Button variant="ghost" size="sm" disabled title={disabledReason}>
+      <Button
+        variant="ghost"
+        size="sm"
+        disabled
+        title={disabledReason}
+        aria-label={
+          disabledReason
+            ? `Remove ${memberName} — ${disabledReason}`
+            : `Remove ${memberName}`
+        }
+      >
         <UserMinus />
         Remove
       </Button>
@@ -62,7 +72,15 @@ export function RemoveMemberButton({
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger render={<Button variant="ghost" size="sm" />}>
+      <DialogTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={`Remove ${memberName}`}
+          />
+        }
+      >
         <UserMinus />
         Remove
       </DialogTrigger>

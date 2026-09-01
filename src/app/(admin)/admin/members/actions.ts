@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { unstable_rethrow } from "next/navigation";
 import type { ZodError } from "zod";
 import { assertRole } from "@/server/auth/admin-context";
 import { InsufficientRoleError } from "@/server/auth/rbac.errors";
@@ -42,6 +43,12 @@ function fieldErrorsFromZod(error: ZodError): MemberFieldErrors {
 /** Map a thrown error to the client result — typed domain errors to their
  *  field/form slot, anything else reported and shown as a generic message. */
 async function mapMemberError(err: unknown): Promise<MemberActionResult> {
+  // `assertRole` → `requireAdminContext` can `redirect()` (session expired, no
+  // membership), which throws a control-flow error Next must handle. Re-throw
+  // those first so this catch never swallows a redirect into a generic message
+  // (and never fires the error webhook for a non-error).
+  unstable_rethrow(err);
+
   if (err instanceof InsufficientRoleError) {
     return { ok: false, formError: err.message };
   }
@@ -89,7 +96,13 @@ export async function changeMemberRoleAction(
   role: string,
 ): Promise<MemberActionResult> {
   try {
-    const { tenantId } = await assertRole(ROLES.OWNER);
+    const { tenantId, userId: actingUserId } = await assertRole(ROLES.OWNER);
+
+    // Managing your own membership from here is forbidden (mirrors the disabled
+    // row control) — enforced server-side too, since actions are public.
+    if (userId === actingUserId) {
+      return { ok: false, formError: "You can't change your own role here." };
+    }
 
     const parsed = changeRoleSchema.safeParse({ userId, role });
     if (!parsed.success) {
@@ -112,8 +125,11 @@ export async function removeMemberAction(
   userId: string,
 ): Promise<MemberActionResult> {
   try {
-    const { tenantId } = await assertRole(ROLES.OWNER);
+    const { tenantId, userId: actingUserId } = await assertRole(ROLES.OWNER);
     if (!userId) return { ok: false, formError: "Missing member." };
+    if (userId === actingUserId) {
+      return { ok: false, formError: "You can't remove yourself." };
+    }
 
     await membershipService.removeMember(tenantId, userId);
     revalidatePath("/admin/members");
