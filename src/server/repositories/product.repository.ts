@@ -134,93 +134,102 @@ export const productRepository = {
     const keptIds = kept.map((v) => v.id);
 
     try {
-      return await prisma.$transaction(async (tx) => {
-        const owned = await tx.product.findFirst({
-          where: { id, tenantId },
-          select: { id: true },
-        });
-        if (!owned) return null;
-
-        await tx.product.update({
-          where: { id },
-          data: {
-            title: input.title,
-            slug: input.slug,
-            description: input.description ?? null,
-            status: input.status,
-          },
-        });
-
-        // Refuse to remove a variant that already appears in an order:
-        // `OrderItem.variant` is onDelete:Restrict, so the delete below would
-        // otherwise fail with P2003 (mapped as a race backstop in mapWriteError).
-        // This pre-check runs in the same transaction and names the offending
-        // SKUs, so the admin gets a clear, field-level error — not a generic 500.
-        const removedInUse = await tx.productVariant.findMany({
-          where: {
-            productId: id,
-            ...(keptIds.length ? { id: { notIn: keptIds } } : {}),
-            orderItems: { some: {} },
-          },
-          select: { sku: true },
-          orderBy: { createdAt: "asc" },
-        });
-        if (removedInUse.length) {
-          throw new VariantInUseError(removedInUse.map((v) => v.sku));
-        }
-
-        // Delete the variants the admin removed. An empty `keptIds` means every
-        // existing variant was replaced, so the filter drops them all; only
-        // order-free variants reach here since the guard above rejected the rest.
-        await tx.productVariant.deleteMany({
-          where: {
-            productId: id,
-            ...(keptIds.length ? { id: { notIn: keptIds } } : {}),
-          },
-        });
-
-        // Two-phase update of kept variants: park every SKU to a transient,
-        // collision-proof value first, so an admin swapping or rotating SKUs
-        // between existing variants can't trip @@unique([productId, sku])
-        // mid-update. zod already proved the final set is unique.
-        for (const v of kept) {
-          await tx.productVariant.updateMany({
-            where: { id: v.id, productId: id },
-            data: { sku: `__tmp_${v.id}` },
+      return await prisma.$transaction(
+        async (tx) => {
+          const owned = await tx.product.findFirst({
+            where: { id, tenantId },
+            select: { id: true },
           });
-        }
-        for (const v of kept) {
-          // updateMany (not update) keeps the write scoped to this product: a
-          // stale or foreign id matches zero rows instead of touching it.
-          await tx.productVariant.updateMany({
-            where: { id: v.id, productId: id },
+          if (!owned) return null;
+
+          await tx.product.update({
+            where: { id },
             data: {
-              sku: v.sku,
-              name: v.name,
-              priceCents: v.priceCents,
-              stock: v.stock,
+              title: input.title,
+              slug: input.slug,
+              description: input.description ?? null,
+              status: input.status,
             },
           });
-        }
 
-        const added = input.variants.filter((v) => !v.id);
-        if (added.length) {
-          await tx.productVariant.createMany({
-            data: added.map((v) => ({
+          // Refuse to remove a variant that already appears in an order:
+          // `OrderItem.variant` is onDelete:Restrict, so the delete below would
+          // otherwise fail with P2003 (mapped as a race backstop in mapWriteError).
+          // This pre-check runs in the same transaction and names the offending
+          // SKUs, so the admin gets a clear, field-level error — not a generic 500.
+          const removedInUse = await tx.productVariant.findMany({
+            where: {
               productId: id,
-              sku: v.sku,
-              name: v.name,
-              priceCents: v.priceCents,
-              stock: v.stock,
-            })),
+              ...(keptIds.length ? { id: { notIn: keptIds } } : {}),
+              orderItems: { some: {} },
+            },
+            select: { sku: true },
+            orderBy: { createdAt: "asc" },
           });
-        }
+          if (removedInUse.length) {
+            throw new VariantInUseError(removedInUse.map((v) => v.sku));
+          }
 
-        return tx.product.findUnique({
-          where: { id },
-          include: { variants: { orderBy: { createdAt: "asc" } } },
-        });
-      });
+          // Delete the variants the admin removed. An empty `keptIds` means every
+          // existing variant was replaced, so the filter drops them all; only
+          // order-free variants reach here since the guard above rejected the rest.
+          await tx.productVariant.deleteMany({
+            where: {
+              productId: id,
+              ...(keptIds.length ? { id: { notIn: keptIds } } : {}),
+            },
+          });
+
+          // Two-phase update of kept variants: park every SKU to a transient,
+          // collision-proof value first, so an admin swapping or rotating SKUs
+          // between existing variants can't trip @@unique([productId, sku])
+          // mid-update. zod already proved the final set is unique.
+          for (const v of kept) {
+            await tx.productVariant.updateMany({
+              where: { id: v.id, productId: id },
+              data: { sku: `__tmp_${v.id}` },
+            });
+          }
+          for (const v of kept) {
+            // updateMany (not update) keeps the write scoped to this product: a
+            // stale or foreign id matches zero rows instead of touching it.
+            await tx.productVariant.updateMany({
+              where: { id: v.id, productId: id },
+              data: {
+                sku: v.sku,
+                name: v.name,
+                priceCents: v.priceCents,
+                stock: v.stock,
+              },
+            });
+          }
+
+          const added = input.variants.filter((v) => !v.id);
+          if (added.length) {
+            await tx.productVariant.createMany({
+              data: added.map((v) => ({
+                productId: id,
+                sku: v.sku,
+                name: v.name,
+                priceCents: v.priceCents,
+                stock: v.stock,
+              })),
+            });
+          }
+
+          return tx.product.findUnique({
+            where: { id },
+            include: { variants: { orderBy: { createdAt: "asc" } } },
+          });
+        },
+        // Ownership check + product update + in-use pre-check + deleteMany + 2×N
+        // guarded SKU updateMany + createMany + findUnique run sequentially in this
+        // interactive transaction; lift Prisma's default 5s cap so a many-variant
+        // edit on a high-latency managed Postgres can't roll back with P2028
+        // part-way through. Kept at 15s for consistency with the order path
+        // (`order.repository.markPaidByPaymentIntent`).
+        { timeout: 15_000 },
+      );
     } catch (err) {
       // Backstop for the pre-check above: if an order lands on a to-be-removed
       // variant in the race between that check and the delete, Postgres refuses
