@@ -13,6 +13,7 @@
     "test": "vitest run --project unit --project dom",
     "test:watch": "vitest --project unit --project dom",
     "test:integration": "vitest run --project integration --no-file-parallelism",
+    "test:e2e": "playwright test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
@@ -45,6 +46,7 @@
     "zod": "^4.5.4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
