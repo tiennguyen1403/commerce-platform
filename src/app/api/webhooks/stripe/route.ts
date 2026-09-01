@@ -3,11 +3,7 @@ import type Stripe from "stripe";
 import { env } from "@/lib/env";
 import { getStripe } from "@/lib/stripe";
 import { orderService } from "@/server/services/order.service";
-import {
-  emailService,
-  EmailNotConfiguredError,
-} from "@/server/services/email.service";
-import type { OrderWithItems } from "@/server/repositories/order.repository";
+import { outboxService } from "@/server/services/outbox.service";
 import { logger, type Logger } from "@/server/observability/logger";
 import { reportError } from "@/server/observability/error-reporter";
 
@@ -37,39 +33,6 @@ import { reportError } from "@/server/observability/error-reporter";
  *   stripe trigger payment_intent.succeeded
  * Copy the `whsec_...` the listener prints into `STRIPE_WEBHOOK_SECRET`.
  */
-
-/** Send the order-confirmation email without ever failing the webhook. By the
- *  time we're here the payment has already succeeded, so a Resend outage or
- *  misconfiguration must not turn this delivery into a retryable 500 — the PAID
- *  order is the durable record and the email is best-effort. Log and move on. */
-async function sendConfirmationEmailSafely(
-  order: OrderWithItems,
-  log: Logger,
-): Promise<void> {
-  try {
-    await emailService.sendOrderConfirmation(order);
-    log.info({ orderNumber: order.orderNumber }, "confirmation email sent");
-  } catch (err) {
-    // Email unconfigured is an expected state (the store hasn't set up Resend),
-    // not something to alarm on — log it as a warning. Any other send failure is
-    // a real problem, so keep that at error level. Either way the webhook 200s.
-    if (err instanceof EmailNotConfiguredError) {
-      log.warn(
-        { orderNumber: order.orderNumber },
-        "email not configured — skipped order confirmation",
-      );
-      return;
-    }
-    // A structured error log, not `reportError`: this is best-effort email whose
-    // failure is already swallowed, and a Resend outage would otherwise fan every
-    // order's failure out to the alert channel. Reliable delivery (outbox +
-    // retry) is issue #30's job, not this seam's.
-    log.error(
-      { err, orderNumber: order.orderNumber },
-      "failed to send order confirmation email",
-    );
-  }
-}
 
 /** Move the matching Order to PAID. Best-effort logging only — the repository's
  *  guard, not this function, decides whether anything actually changed. */
@@ -115,10 +78,13 @@ async function handlePaymentIntentSucceeded(
           "OVERSELL: payment captured but stock was insufficient — manual refund/review needed",
         );
       }
-      // Hang the confirmation off this single PENDING → PAID transition: only
-      // this one delivery sends, so Stripe's retries never duplicate it (at
-      // most once per order — a swallowed send failure is not retried).
-      await sendConfirmationEmailSafely(result.order, log);
+      // The confirmation email was durably queued in the SAME transaction as
+      // this PAID flip (transactional outbox, #30), so delivery no longer hinges
+      // on this request. Try an immediate best-effort send for low latency;
+      // whatever the outcome, the cron drain (/api/cron/dispatch-outbox) is the
+      // durable retry path. This never throws, so the webhook still 200s the
+      // payment regardless of the email/outbox outcome.
+      await outboxService.dispatchForOrder(tenantId, result.order.id);
       break;
     case "already-processed":
       log.info(

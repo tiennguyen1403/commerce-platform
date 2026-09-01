@@ -2,13 +2,17 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 /**
  * Route test for the outbox-drain cron entry point. The Bearer gate is unit-tested
- * in `verify-cron-request.test.ts`; here we mock it to drive the two branches and
- * confirm the route's 401-vs-200 contract and its never-cache header. The logger
- * is stubbed so the test emits no log lines and never loads pino.
+ * in `verify-cron-request.test.ts` and the drain in `outbox.service.test.ts`; here
+ * both are mocked to drive the route's 401-vs-200 contract, confirm it does no
+ * work when unauthorized, and confirm it surfaces the drain's counts and its
+ * never-cache header. The logger is stubbed so the test emits no log lines.
  */
 
 vi.mock("@/server/cron/verify-cron-request", () => ({
   verifyCronRequest: vi.fn(),
+}));
+vi.mock("@/server/services/outbox.service", () => ({
+  outboxService: { drain: vi.fn() },
 }));
 vi.mock("@/server/observability/logger", () => {
   const stub = {
@@ -22,9 +26,11 @@ vi.mock("@/server/observability/logger", () => {
 });
 
 import { verifyCronRequest } from "@/server/cron/verify-cron-request";
+import { outboxService } from "@/server/services/outbox.service";
 import { GET } from "@/app/api/cron/dispatch-outbox/route";
 
 const verify = vi.mocked(verifyCronRequest);
+const drain = vi.mocked(outboxService.drain);
 
 function request(): Request {
   return new Request("https://example.test/api/cron/dispatch-outbox");
@@ -35,7 +41,7 @@ beforeEach(() => {
 });
 
 describe("GET /api/cron/dispatch-outbox", () => {
-  it("401s an unauthorized request without doing any work", async () => {
+  it("401s an unauthorized request without draining", async () => {
     verify.mockReturnValue(false);
 
     const response = await GET(request());
@@ -43,10 +49,18 @@ describe("GET /api/cron/dispatch-outbox", () => {
     expect(response.status).toBe(401);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.json()).toMatchObject({ error: "Unauthorized" });
+    expect(drain).not.toHaveBeenCalled();
   });
 
-  it("200s an authorized request with a bounded no-op result", async () => {
+  it("200s an authorized request and returns the drain counts", async () => {
     verify.mockReturnValue(true);
+    drain.mockResolvedValue({
+      recovered: 1,
+      sent: 3,
+      failed: 1,
+      dead: 0,
+      skipped: 2,
+    });
 
     const response = await GET(request());
 
@@ -55,7 +69,12 @@ describe("GET /api/cron/dispatch-outbox", () => {
     expect(await response.json()).toMatchObject({
       ok: true,
       task: "dispatch-outbox",
-      processed: 0,
+      recovered: 1,
+      sent: 3,
+      failed: 1,
+      dead: 0,
+      skipped: 2,
     });
+    expect(drain).toHaveBeenCalledOnce();
   });
 });
