@@ -408,35 +408,154 @@ describe("orderService.markOrderPaid", () => {
 });
 
 describe("orderService.cancelOrder", () => {
-  it("delegates to the repository and resolves on a successful transition", async () => {
+  it("cancels the PaymentIntent, then flips + releases when the intent is still awaiting payment", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ id: "order_1", stripePaymentIntentId: "pi_1" }),
+    );
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "requires_payment_method",
+    });
+    paymentIntents.cancel.mockResolvedValue({ id: "pi_1", status: "canceled" });
     cancelRepo.mockResolvedValue({ transitioned: true });
 
     await expect(
       orderService.cancelOrder(TENANT, "order_1"),
     ).resolves.toBeUndefined();
+    expect(paymentIntents.cancel).toHaveBeenCalledWith("pi_1");
     expect(cancelRepo).toHaveBeenCalledWith(TENANT, "order_1");
+    // Intent retired BEFORE the DB flip — the money-safe ordering (an order is only
+    // flipped once its intent can no longer be charged).
+    expect(paymentIntents.cancel.mock.invocationCallOrder[0]).toBeLessThan(
+      cancelRepo.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("REFUSES with a non-typed error the boundary reports when the intent can't be verified", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ stripePaymentIntentId: "pi_1" }),
+    );
+    paymentIntents.retrieve.mockRejectedValue(new Error("Stripe unreachable"));
+
+    // Can't confirm the intent is uncharged → refuse rather than cancel blindly.
+    await expect(orderService.cancelOrder(TENANT, "order_1")).rejects.toThrow(
+      /could not verify/i,
+    );
+    // NOT a typed lifecycle error, so the action boundary reports it + shows the
+    // generic retryable message (never a friendly transition/not-found message).
+    await expect(
+      orderService.cancelOrder(TENANT, "order_1"),
+    ).rejects.not.toBeInstanceOf(OrderTransitionError);
+    expect(cancelRepo).not.toHaveBeenCalled();
   });
 
   it("throws OrderNotFoundError when the order doesn't exist", async () => {
-    cancelRepo.mockResolvedValue({ transitioned: false, currentStatus: null });
+    findById.mockResolvedValue(null);
 
     await expect(
       orderService.cancelOrder(TENANT, "order_x"),
     ).rejects.toBeInstanceOf(OrderNotFoundError);
+    expect(paymentIntents.retrieve).not.toHaveBeenCalled();
+    expect(cancelRepo).not.toHaveBeenCalled();
   });
 
   it("throws OrderTransitionError naming the current status when it isn't PENDING", async () => {
-    cancelRepo.mockResolvedValue({
-      transitioned: false,
-      currentStatus: "PAID",
+    findById.mockResolvedValue(orderWithItems({ status: "PAID" }));
+
+    // Fails fast on the pre-read — no Stripe call, no flip attempt.
+    await expect(orderService.cancelOrder(TENANT, "order_1")).rejects.toThrow(
+      /paid/i,
+    );
+    await expect(
+      orderService.cancelOrder(TENANT, "order_1"),
+    ).rejects.toBeInstanceOf(OrderTransitionError);
+    expect(paymentIntents.retrieve).not.toHaveBeenCalled();
+    expect(cancelRepo).not.toHaveBeenCalled();
+  });
+
+  it("REFUSES (never cancels) when the intent shows payment in flight", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ stripePaymentIntentId: "pi_1" }),
+    );
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "succeeded",
     });
 
     await expect(
       orderService.cancelOrder(TENANT, "order_1"),
     ).rejects.toBeInstanceOf(OrderTransitionError);
-    // The refusal message names the blocking status so the admin sees why.
+    // Money-safety: a paying/paid order is never cancelled, and its intent untouched.
+    expect(paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(cancelRepo).not.toHaveBeenCalled();
+  });
+
+  it("REFUSES when the cancel loses the race to a real payment", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ stripePaymentIntentId: "pi_1" }),
+    );
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "requires_payment_method",
+    });
+    paymentIntents.cancel.mockRejectedValue(
+      new Error("payment_intent_unexpected_state"),
+    );
+
+    await expect(
+      orderService.cancelOrder(TENANT, "order_1"),
+    ).rejects.toBeInstanceOf(OrderTransitionError);
+    // The intent wasn't provably canceled, so the order is left for the webhook.
+    expect(cancelRepo).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an already-canceled intent by flipping, without re-cancelling", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ id: "order_1", stripePaymentIntentId: "pi_1" }),
+    );
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "canceled",
+    });
+    cancelRepo.mockResolvedValue({ transitioned: true });
+
+    await expect(
+      orderService.cancelOrder(TENANT, "order_1"),
+    ).resolves.toBeUndefined();
+    expect(paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(cancelRepo).toHaveBeenCalledWith(TENANT, "order_1");
+  });
+
+  it("flips an order with no linked intent (anomaly) without touching Stripe", async () => {
+    findById.mockResolvedValue(
+      orderWithItems({ id: "order_1", stripePaymentIntentId: null }),
+    );
+    cancelRepo.mockResolvedValue({ transitioned: true });
+
+    await expect(
+      orderService.cancelOrder(TENANT, "order_1"),
+    ).resolves.toBeUndefined();
+    expect(paymentIntents.retrieve).not.toHaveBeenCalled();
+    expect(cancelRepo).toHaveBeenCalledWith(TENANT, "order_1");
+  });
+
+  it("surfaces a wrong-state race the repository guard catches after the intent is retired", async () => {
+    // Pre-read sees PENDING and the intent retires cleanly, but a concurrent actor
+    // flips the order first — the guarded transition is the authoritative arbiter.
+    findById.mockResolvedValue(
+      orderWithItems({ stripePaymentIntentId: "pi_1" }),
+    );
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "canceled",
+    });
+    cancelRepo.mockResolvedValue({
+      transitioned: false,
+      currentStatus: "CANCELLED",
+    });
+
     await expect(orderService.cancelOrder(TENANT, "order_1")).rejects.toThrow(
-      /paid/i,
+      /cancelled/i,
     );
   });
 });
