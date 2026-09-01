@@ -3,6 +3,7 @@ import { Resend } from "resend";
 import { env } from "@/lib/env";
 import { formatMoney } from "@/lib/utils";
 import { tenantRepository } from "@/server/repositories/tenant.repository";
+import { EmailNotConfiguredError } from "@/server/email.errors";
 import type { OrderWithItems } from "@/server/repositories/order.repository";
 
 /**
@@ -16,14 +17,23 @@ import type { OrderWithItems } from "@/server/repositories/order.repository";
  * outage must never turn a real payment into a retryable webhook failure.
  *
  * Server-only: it holds the Resend secret and is never imported by client code.
- * The client is constructed lazily so a build — or a webhook for an event we
- * don't email on — never needs `RESEND_API_KEY` to be a real key.
+ * Email is *optional* config (#39): the client is built lazily so a build — or a
+ * webhook for an event we don't email on — never needs a key, and a send with the
+ * config unset throws `EmailNotConfiguredError` (a permanent failure) rather than
+ * crashing the whole app at boot.
  */
+
+// Re-exported so a caller importing the service also gets the error to catch from
+// one module (mirrors `order.service.ts` re-exporting `EmptyCartError`). The class
+// itself lives in the dependency-free `email.errors.ts`.
+export { EmailNotConfiguredError } from "@/server/email.errors";
 
 let resendSingleton: Resend | null = null;
 
-function getResend(): Resend {
-  resendSingleton ??= new Resend(env.RESEND_API_KEY);
+/** Build the Resend client lazily. The caller has already asserted the key is
+ *  present (email config is validated at send time, not at boot — #39). */
+function getResend(apiKey: string): Resend {
+  resendSingleton ??= new Resend(apiKey);
   return resendSingleton;
 }
 
@@ -129,14 +139,24 @@ export const emailService = {
    * where that throw would fail the webhook.
    */
   async sendOrderConfirmation(order: OrderWithItems): Promise<void> {
+    // Email is optional config (#39), validated here at send time rather than at
+    // boot. Unset/blank is a *permanent* failure: throw a typed error the webhook
+    // swallows (and a retrying caller marks DEAD, never spins on) — checked before
+    // any DB or network work so an unconfigured store pays nothing for it.
+    const apiKey = env.RESEND_API_KEY;
+    const from = env.EMAIL_FROM;
+    if (!apiKey || !from) {
+      throw new EmailNotConfiguredError();
+    }
+
     const tenant = await tenantRepository.findById(order.tenantId);
     const storeName = tenant?.name ?? "our store";
     const { subject, html, text } = renderOrderConfirmation(order, storeName);
 
     // Resend reports API-level failures via `error` rather than throwing; turn
     // it into a throw so callers have a single failure channel to handle.
-    const { error } = await getResend().emails.send({
-      from: env.EMAIL_FROM,
+    const { error } = await getResend(apiKey).emails.send({
+      from,
       to: order.email,
       subject,
       html,

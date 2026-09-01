@@ -3,7 +3,10 @@ import type Stripe from "stripe";
 import { env } from "@/lib/env";
 import { getStripe } from "@/lib/stripe";
 import { orderService } from "@/server/services/order.service";
-import { emailService } from "@/server/services/email.service";
+import {
+  emailService,
+  EmailNotConfiguredError,
+} from "@/server/services/email.service";
 import type { OrderWithItems } from "@/server/repositories/order.repository";
 
 /**
@@ -46,6 +49,15 @@ async function sendConfirmationEmailSafely(
       `Stripe webhook: confirmation email sent for order ${order.orderNumber}`,
     );
   } catch (err) {
+    // Email unconfigured is an expected state (the store hasn't set up Resend),
+    // not something to alarm on — log it as a warning. Any other send failure is
+    // a real problem, so keep that at error level. Either way the webhook 200s.
+    if (err instanceof EmailNotConfiguredError) {
+      console.warn(
+        `Stripe webhook: email not configured — skipped confirmation for order ${order.orderNumber}`,
+      );
+      return;
+    }
     console.error(
       `Stripe webhook: failed to send confirmation email for order ${order.orderNumber}`,
       err,

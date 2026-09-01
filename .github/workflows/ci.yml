@@ -18,8 +18,8 @@ jobs:
       STRIPE_SECRET_KEY: sk_test_ci_dummy
       STRIPE_WEBHOOK_SECRET: whsec_ci_dummy
       NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: pk_test_ci_dummy
-      # Dummy Resend values: env.ts requires these, but the build never sends
-      # email (the Resend client is lazy), so a non-empty placeholder satisfies it.
+      # Resend email is optional since #39, but keep dummy values so CI's build
+      # exercises the configured path; the build never sends (the client is lazy).
       RESEND_API_KEY: re_ci_dummy
       EMAIL_FROM: "CI <onboarding@resend.dev>"
     steps:
