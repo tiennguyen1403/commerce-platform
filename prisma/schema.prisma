@@ -218,6 +218,12 @@ model Order {
   // status-filtered. Composite so the tenant scope + `createdAt` ordering is
   // index-served, not a sort over the tenant's whole order history.
   @@index([tenantId, createdAt])
+  // Abandoned-PENDING sweep (`findStalePending`, #25): the platform-wide cron
+  // selects PENDING orders older than a grace window, oldest first, ACROSS all
+  // tenants — so it can't use the tenant-scoped index above. Composite [status,
+  // createdAt] serves the `status = 'PENDING'` filter + `createdAt` ordering
+  // directly (mirrors the outbox's [status, nextAttemptAt] drain index).
+  @@index([status, createdAt])
 }
 
 model OrderItem {

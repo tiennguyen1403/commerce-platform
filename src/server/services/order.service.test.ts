@@ -35,11 +35,24 @@ vi.mock("@/server/repositories/order.repository", () => ({
     markPaidByPaymentIntent: vi.fn(),
     findByPaymentIntentForTenant: vi.fn(),
     findByIdForTenant: vi.fn(),
+    findStalePending: vi.fn(),
+    findReusablePendingCandidates: vi.fn(),
     cancelPendingAndRelease: vi.fn(),
     markFulfilled: vi.fn(),
     markRefundedByPaymentIntent: vi.fn(),
   },
 }));
+// The sweep logs through pino; stub it so tests emit no lines and never load pino.
+vi.mock("@/server/observability/logger", () => {
+  const stub = {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+    debug: () => {},
+    child: () => stub,
+  };
+  return { logger: stub };
+});
 
 // A minimal Stripe stand-in — only the PaymentIntent + Refund calls the service
 // makes.
@@ -55,6 +68,8 @@ const getCartView = vi.mocked(cartService.getCartView);
 const createWithItems = vi.mocked(orderRepository.createWithItems);
 const markPaid = vi.mocked(orderRepository.markPaidByPaymentIntent);
 const findById = vi.mocked(orderRepository.findByIdForTenant);
+const findStale = vi.mocked(orderRepository.findStalePending);
+const findReusable = vi.mocked(orderRepository.findReusablePendingCandidates);
 const cancelRepo = vi.mocked(orderRepository.cancelPendingAndRelease);
 const fulfillRepo = vi.mocked(orderRepository.markFulfilled);
 const markRefunded = vi.mocked(orderRepository.markRefundedByPaymentIntent);
@@ -125,9 +140,28 @@ function orderWithItems(o: Partial<OrderWithItems> = {}): OrderWithItems {
   return { ...order(), items: [orderItem()], ...o };
 }
 
+/** The slim row `findStalePending` returns for the sweep. */
+function stalePending(
+  o: Partial<{
+    id: string;
+    tenantId: string;
+    stripePaymentIntentId: string | null;
+  }> = {},
+) {
+  return {
+    id: "order_1",
+    tenantId: TENANT,
+    stripePaymentIntentId: "pi_1",
+    ...o,
+  };
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(getStripe).mockReturnValue(fakeStripe);
+  // Default: no in-flight order to reuse, so startCheckout mints fresh unless a
+  // test opts into a reuse candidate. (resetAllMocks clears this each test.)
+  findReusable.mockResolvedValue([]);
 });
 
 describe("orderService.startCheckout", () => {
@@ -555,5 +589,442 @@ describe("orderService.markOrderRefunded", () => {
     await expect(
       orderService.markOrderRefunded(TENANT, "pi_1"),
     ).resolves.toEqual({ outcome: "no-order" });
+  });
+});
+
+/**
+ * Reuse an in-flight PaymentIntent on a re-submit (#25 dedupe). The behaviour the
+ * service owns: match a recent PENDING order to the freshly re-priced cart, verify
+ * the linked intent is still reusable, and hand back its existing client secret —
+ * minting nothing new — or fall through to a fresh create on any miss.
+ */
+describe("orderService.startCheckout — reuse in-flight intent", () => {
+  /** A reusable candidate: a PENDING order for this cart with a still-awaiting PI. */
+  function reusableCandidate(): OrderWithItems {
+    return orderWithItems({
+      id: "order_existing",
+      orderNumber: "20250101-OLD999",
+      stripePaymentIntentId: "pi_existing",
+      totalCents: 3000,
+      currency: "usd",
+      items: [orderItem({ variantId: "v1", quantity: 2 })],
+    });
+  }
+
+  it("reuses a matching in-flight intent instead of minting a new one", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([reusableCandidate()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_existing",
+      status: "requires_payment_method",
+      amount: 3000,
+      currency: "usd",
+      client_secret: "cs_existing",
+    });
+
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+    );
+
+    expect(result).toEqual({
+      clientSecret: "cs_existing",
+      orderId: "order_existing",
+      orderNumber: "20250101-OLD999",
+      totalCents: 3000,
+      currency: "usd",
+    });
+    // The whole point: no second PaymentIntent, no second order (nor its hold).
+    expect(paymentIntents.create).not.toHaveBeenCalled();
+    expect(createWithItems).not.toHaveBeenCalled();
+  });
+
+  it("keys the dedupe read on the RE-PRICED cart total + currency, not a stored one", async () => {
+    getCartView.mockResolvedValue(
+      cartView({ totalCents: 4200, currency: "eur" }),
+    );
+    findReusable.mockResolvedValue([]);
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "eur",
+    );
+
+    expect(findReusable).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: TENANT,
+        email: EMAIL,
+        totalCents: 4200,
+        currency: "eur",
+        createdAfter: expect.any(Date),
+        limit: expect.any(Number),
+      }),
+    );
+    // The reuse window is a lower bound in the past.
+    const { createdAfter } = findReusable.mock.calls[0][0];
+    expect(createdAfter.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
+  it("creates fresh when there is no candidate to reuse", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([]);
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+    );
+
+    expect(paymentIntents.create).toHaveBeenCalledTimes(1);
+    expect(createWithItems).toHaveBeenCalledTimes(1);
+    expect(result.clientSecret).toBe("cs_1");
+  });
+
+  it("does not reuse a candidate whose line-set differs from the cart", async () => {
+    getCartView.mockResolvedValue(cartView()); // cart is v1 × 2
+    findReusable.mockResolvedValue([
+      orderWithItems({
+        stripePaymentIntentId: "pi_existing",
+        items: [orderItem({ variantId: "v1", quantity: 3 })], // qty differs
+      }),
+    ]);
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+    );
+
+    // A mismatch is rejected before any Stripe retrieve; checkout mints fresh.
+    expect(paymentIntents.retrieve).not.toHaveBeenCalled();
+    expect(paymentIntents.create).toHaveBeenCalledTimes(1);
+    expect(result.clientSecret).toBe("cs_1");
+  });
+
+  it("does not reuse a candidate whose intent is no longer awaiting payment", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([reusableCandidate()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_existing",
+      status: "succeeded", // already paid — never re-hand this out
+      amount: 3000,
+      currency: "usd",
+      client_secret: "cs_existing",
+    });
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+    );
+
+    expect(paymentIntents.create).toHaveBeenCalledTimes(1);
+    expect(result.clientSecret).toBe("cs_1");
+  });
+
+  it("does not reuse a candidate whose intent amount has drifted", async () => {
+    getCartView.mockResolvedValue(cartView({ totalCents: 3000 }));
+    findReusable.mockResolvedValue([reusableCandidate()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_existing",
+      status: "requires_payment_method",
+      amount: 9999, // no longer equals the re-priced cart
+      currency: "usd",
+      client_secret: "cs_existing",
+    });
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+    );
+
+    expect(paymentIntents.create).toHaveBeenCalledTimes(1);
+    expect(result.clientSecret).toBe("cs_1");
+  });
+
+  it("falls through to a fresh create when the intent can't be retrieved", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([reusableCandidate()]);
+    paymentIntents.retrieve.mockRejectedValue(
+      new Error("No such payment_intent"),
+    );
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+    );
+
+    expect(paymentIntents.create).toHaveBeenCalledTimes(1);
+    expect(result.clientSecret).toBe("cs_1");
+  });
+
+  it("skips a non-matching candidate and reuses the matching one", async () => {
+    getCartView.mockResolvedValue(cartView()); // v1 × 2
+    findReusable.mockResolvedValue([
+      // Newest first: this one doesn't match the cart, so it's skipped…
+      orderWithItems({
+        id: "order_other",
+        stripePaymentIntentId: "pi_other",
+        items: [orderItem({ variantId: "v2", quantity: 1 })],
+      }),
+      // …and this matching one is reused.
+      reusableCandidate(),
+    ]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_existing",
+      status: "requires_confirmation",
+      amount: 3000,
+      currency: "usd",
+      client_secret: "cs_existing",
+    });
+
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+    );
+
+    expect(result.orderId).toBe("order_existing");
+    // Only the matching candidate's intent is retrieved; the mismatch is filtered first.
+    expect(paymentIntents.retrieve).toHaveBeenCalledTimes(1);
+    expect(paymentIntents.retrieve).toHaveBeenCalledWith("pi_existing");
+    expect(paymentIntents.create).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Sweep abandoned PENDING checkouts (#25). The invariants under test: an order is
+ * cancelled only once its intent is provably `canceled` (money-safety), a payment
+ * in flight or captured is never touched, the DB flip's guard turns a lost race
+ * into a skip, and one order's error can't abort the batch.
+ */
+describe("orderService.sweepAbandonedPending", () => {
+  it("cancels the intent and releases an abandoned, still-chargeable order", async () => {
+    findStale.mockResolvedValue([
+      stalePending({ id: "o1", stripePaymentIntentId: "pi_1" }),
+    ]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "requires_payment_method",
+    });
+    paymentIntents.cancel.mockResolvedValue({ id: "pi_1", status: "canceled" });
+    cancelRepo.mockResolvedValue({ transitioned: true });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(paymentIntents.cancel).toHaveBeenCalledWith("pi_1");
+    expect(cancelRepo).toHaveBeenCalledWith(TENANT, "o1");
+    expect(result).toEqual({ swept: 1, skipped: 0, errored: 0 });
+  });
+
+  it("queries stale orders with a past grace cutoff and a batch limit", async () => {
+    findStale.mockResolvedValue([]);
+
+    await orderService.sweepAbandonedPending();
+
+    expect(findStale).toHaveBeenCalledTimes(1);
+    const [olderThan, limit] = findStale.mock.calls[0];
+    expect(olderThan).toBeInstanceOf(Date);
+    expect(olderThan.getTime()).toBeLessThan(Date.now()); // grace window in the past
+    expect(limit).toBeGreaterThan(0);
+  });
+
+  it("leaves a SUCCEEDED intent's order for the webhook (never cancels a paid order)", async () => {
+    findStale.mockResolvedValue([
+      stalePending({ id: "o1", stripePaymentIntentId: "pi_1" }),
+    ]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "succeeded",
+    });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(cancelRepo).not.toHaveBeenCalled();
+    expect(result).toEqual({ swept: 0, skipped: 1, errored: 0 });
+  });
+
+  it("leaves an in-progress (processing) payment alone", async () => {
+    findStale.mockResolvedValue([stalePending()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "processing",
+    });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(cancelRepo).not.toHaveBeenCalled();
+    expect(result.skipped).toBe(1);
+  });
+
+  it("leaves a payment awaiting customer action (3DS) alone", async () => {
+    findStale.mockResolvedValue([stalePending()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "requires_action",
+    });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(cancelRepo).not.toHaveBeenCalled();
+    expect(result.skipped).toBe(1);
+  });
+
+  it("reconciles an already-canceled intent by flipping the order, without re-cancelling", async () => {
+    findStale.mockResolvedValue([stalePending({ id: "o1" })]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "canceled",
+    });
+    cancelRepo.mockResolvedValue({ transitioned: true });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(cancelRepo).toHaveBeenCalledWith(TENANT, "o1");
+    expect(result).toEqual({ swept: 1, skipped: 0, errored: 0 });
+  });
+
+  it("does NOT flip the order when the cancel loses the race to a real payment", async () => {
+    findStale.mockResolvedValue([stalePending()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "requires_payment_method",
+    });
+    // Shopper paid in the retrieve→cancel window: cancel now throws.
+    paymentIntents.cancel.mockRejectedValue(
+      new Error("payment_intent_unexpected_state"),
+    );
+
+    const result = await orderService.sweepAbandonedPending();
+
+    // The order stays PENDING for the webhook — money-safety over cleanup.
+    expect(cancelRepo).not.toHaveBeenCalled();
+    expect(result).toEqual({ swept: 0, skipped: 1, errored: 0 });
+  });
+
+  it("does NOT flip the order when the cancel returns a non-canceled status", async () => {
+    findStale.mockResolvedValue([stalePending()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "requires_confirmation",
+    });
+    paymentIntents.cancel.mockResolvedValue({
+      id: "pi_1",
+      status: "processing",
+    });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(cancelRepo).not.toHaveBeenCalled();
+    expect(result.swept).toBe(0);
+    expect(result.skipped).toBe(1);
+  });
+
+  it("cancels-and-releases an order with no linked intent (anomaly) via the DB guard", async () => {
+    findStale.mockResolvedValue([
+      stalePending({ id: "o1", stripePaymentIntentId: null }),
+    ]);
+    cancelRepo.mockResolvedValue({ transitioned: true });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(paymentIntents.retrieve).not.toHaveBeenCalled();
+    expect(cancelRepo).toHaveBeenCalledWith(TENANT, "o1");
+    expect(result.swept).toBe(1);
+  });
+
+  it("counts a lost race to PAID (guard no-op) as skipped, not swept", async () => {
+    findStale.mockResolvedValue([stalePending()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_1",
+      status: "requires_payment_method",
+    });
+    paymentIntents.cancel.mockResolvedValue({ id: "pi_1", status: "canceled" });
+    // The webhook flipped it PENDING → PAID between retrieve and flip.
+    cancelRepo.mockResolvedValue({
+      transitioned: false,
+      currentStatus: "PAID",
+    });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(result).toEqual({ swept: 0, skipped: 1, errored: 0 });
+  });
+
+  it("isolates one order's error and keeps sweeping the rest", async () => {
+    findStale.mockResolvedValue([
+      stalePending({ id: "o1", stripePaymentIntentId: "pi_1" }),
+      stalePending({ id: "o2", stripePaymentIntentId: "pi_2" }),
+    ]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi",
+      status: "requires_payment_method",
+    });
+    paymentIntents.cancel.mockResolvedValue({ status: "canceled" });
+    // First order's DB flip blows up; the second sweeps fine.
+    cancelRepo
+      .mockRejectedValueOnce(new Error("db down"))
+      .mockResolvedValueOnce({ transitioned: true });
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(result).toEqual({ swept: 1, skipped: 0, errored: 1 });
+  });
+
+  it("is a clean no-op when nothing is stale", async () => {
+    findStale.mockResolvedValue([]);
+
+    const result = await orderService.sweepAbandonedPending();
+
+    expect(result).toEqual({ swept: 0, skipped: 0, errored: 0 });
+    expect(paymentIntents.retrieve).not.toHaveBeenCalled();
+    expect(paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(cancelRepo).not.toHaveBeenCalled();
   });
 });

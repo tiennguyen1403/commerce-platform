@@ -21,6 +21,31 @@ export type CreateOrderItemInput = {
   quantity: number;
 };
 
+/** The fields the abandoned-PENDING sweep (#25) needs for one order: its id and
+ *  tenant (to run the tenant-scoped cancel-and-release) plus the PaymentIntent to
+ *  cancel at Stripe. `stripePaymentIntentId` is nullable to mirror the column,
+ *  though every checkout order links one. */
+export type StalePendingOrder = {
+  id: string;
+  tenantId: string;
+  stripePaymentIntentId: string | null;
+};
+
+/** Query for reusable in-flight checkout candidates (the #25 dedupe read). The
+ *  equality filters — tenant, shopper email, currency, and re-priced total — are
+ *  pushed to the DB; the remaining line-set match and the live PaymentIntent-status
+ *  check stay in the service, which owns that business logic. */
+export type ReusablePendingQuery = {
+  tenantId: string;
+  email: string;
+  totalCents: number;
+  currency: string;
+  /** Lower bound on `createdAt` — the reuse window (a soon-to-be-swept order isn't
+   *  worth reusing). */
+  createdAfter: Date;
+  limit: number;
+};
+
 /** A full order to persist. The `id`, `orderNumber`, total, and per-item prices
  *  are all computed by the service (from a fresh variant read) — never the
  *  client. `id` is pre-generated so the linked PaymentIntent can carry it in
@@ -242,6 +267,60 @@ export const orderRepository = {
   findByIdForTenant(tenantId: string, id: string) {
     return prisma.order.findFirst({
       where: { tenantId, id },
+      include: { items: true },
+    });
+  },
+
+  /**
+   * PENDING orders created before `olderThan`, oldest first, up to `limit` — the
+   * abandoned-checkout sweep's work list (#25). Like the outbox drain's `findDue`,
+   * this is a **platform-wide** cron query and deliberately spans all tenants — the
+   * one intentional exception to golden rule #1's tenant scoping (see the outbox
+   * repository's tenancy note). There is no leakage: each row carries its own
+   * `tenantId`, and every write the sweep makes off these rows runs through the
+   * tenant-scoped `cancelPendingAndRelease(order.tenantId, …)`. Selects only the
+   * fields the sweep needs — never the whole row. Served by the `[status,
+   * createdAt]` index (mirroring the outbox's `[status, nextAttemptAt]`).
+   */
+  findStalePending(
+    olderThan: Date,
+    limit: number,
+  ): Promise<StalePendingOrder[]> {
+    return prisma.order.findMany({
+      where: { status: "PENDING", createdAt: { lt: olderThan } },
+      orderBy: { createdAt: "asc" },
+      take: limit,
+      select: { id: true, tenantId: true, stripePaymentIntentId: true },
+    });
+  },
+
+  /**
+   * Recent PENDING orders (newest first) that could be the *same* in-flight
+   * checkout a shopper is re-submitting — the dedupe read behind
+   * `orderService.startCheckout` (#25). Scoped to the tenant (golden rule #1) and
+   * the shopper's `email`, and pre-filtered to the re-priced cart's exact
+   * `currency` + `totalCents`, so a stale-priced prior attempt can never be a
+   * candidate; `createdAfter` bounds it to the reuse window. Returns the orders
+   * *with items* so the service can confirm the line-set matches before reusing the
+   * linked PaymentIntent's client secret. Newest first so the freshest attempt wins.
+   *
+   * Return type is left to inference (like the other `include: { items: true }`
+   * reads here): annotating it `OrderWithItems[]` would make `orderRepository`'s
+   * type reference `OrderWithItems`, which is itself derived from `orderRepository`
+   * — a circular reference. The inferred shape is structurally `OrderWithItems`.
+   */
+  findReusablePendingCandidates(q: ReusablePendingQuery) {
+    return prisma.order.findMany({
+      where: {
+        tenantId: q.tenantId,
+        email: q.email,
+        status: "PENDING",
+        currency: q.currency,
+        totalCents: q.totalCents,
+        createdAt: { gte: q.createdAfter },
+      },
+      orderBy: { createdAt: "desc" },
+      take: q.limit,
       include: { items: true },
     });
   },
