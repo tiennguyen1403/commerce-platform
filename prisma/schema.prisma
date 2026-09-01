@@ -198,6 +198,13 @@ model Order {
   totalCents            Int
   currency              String      @default("usd")
   stripePaymentIntentId String?     @unique
+  // Set true — in the SAME transaction as the PENDING → PAID flip — when the
+  // atomic stock decrement couldn't fully allocate one or more lines (an oversell
+  // captured at payment: the units were sold but weren't on hand). A durable cue
+  // for the admin order view (manual refund/review) and the confirmation email's
+  // copy (#40). The payment still stands PAID; only inventory fell short. One-way:
+  // nothing clears it. Set by `markPaidByPaymentIntent`.
+  oversold              Boolean     @default(false)
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
@@ -207,6 +214,10 @@ model Order {
 
   @@unique([tenantId, orderNumber])
   @@index([tenantId])
+  // Admin orders list (`listByTenant`): newest-first within a tenant, optionally
+  // status-filtered. Composite so the tenant scope + `createdAt` ordering is
+  // index-served, not a sort over the tenant's whole order history.
+  @@index([tenantId, createdAt])
 }
 
 model OrderItem {

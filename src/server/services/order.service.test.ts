@@ -12,6 +12,8 @@ import {
   EmptyCartError,
   OrderNumberTakenError,
   InsufficientStockError,
+  OrderNotFoundError,
+  OrderTransitionError,
 } from "@/server/order.errors";
 import type { CartItem } from "@/lib/cart";
 
@@ -32,6 +34,8 @@ vi.mock("@/server/repositories/order.repository", () => ({
     createWithItems: vi.fn(),
     markPaidByPaymentIntent: vi.fn(),
     findByPaymentIntentForTenant: vi.fn(),
+    cancelPendingAndRelease: vi.fn(),
+    markFulfilled: vi.fn(),
   },
 }));
 
@@ -46,6 +50,8 @@ const fakeStripe = { paymentIntents } as unknown as Stripe;
 const getCartView = vi.mocked(cartService.getCartView);
 const createWithItems = vi.mocked(orderRepository.createWithItems);
 const markPaid = vi.mocked(orderRepository.markPaidByPaymentIntent);
+const cancelRepo = vi.mocked(orderRepository.cancelPendingAndRelease);
+const fulfillRepo = vi.mocked(orderRepository.markFulfilled);
 
 const TENANT = "tenant_1";
 const EMAIL = "shopper@example.com";
@@ -90,6 +96,7 @@ function order(o: Partial<Order> = {}): Order {
     totalCents: 3000,
     currency: "usd",
     stripePaymentIntentId: "pi_1",
+    oversold: false,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     ...o,
@@ -357,5 +364,72 @@ describe("orderService.markOrderPaid", () => {
     await expect(orderService.markOrderPaid(TENANT, "pi_1")).resolves.toEqual({
       outcome: "no-order",
     });
+  });
+});
+
+describe("orderService.cancelOrder", () => {
+  it("delegates to the repository and resolves on a successful transition", async () => {
+    cancelRepo.mockResolvedValue({ transitioned: true });
+
+    await expect(
+      orderService.cancelOrder(TENANT, "order_1"),
+    ).resolves.toBeUndefined();
+    expect(cancelRepo).toHaveBeenCalledWith(TENANT, "order_1");
+  });
+
+  it("throws OrderNotFoundError when the order doesn't exist", async () => {
+    cancelRepo.mockResolvedValue({ transitioned: false, currentStatus: null });
+
+    await expect(
+      orderService.cancelOrder(TENANT, "order_x"),
+    ).rejects.toBeInstanceOf(OrderNotFoundError);
+  });
+
+  it("throws OrderTransitionError naming the current status when it isn't PENDING", async () => {
+    cancelRepo.mockResolvedValue({
+      transitioned: false,
+      currentStatus: "PAID",
+    });
+
+    await expect(
+      orderService.cancelOrder(TENANT, "order_1"),
+    ).rejects.toBeInstanceOf(OrderTransitionError);
+    // The refusal message names the blocking status so the admin sees why.
+    await expect(orderService.cancelOrder(TENANT, "order_1")).rejects.toThrow(
+      /paid/i,
+    );
+  });
+});
+
+describe("orderService.fulfillOrder", () => {
+  it("delegates to the repository and resolves on a successful transition", async () => {
+    fulfillRepo.mockResolvedValue({ transitioned: true });
+
+    await expect(
+      orderService.fulfillOrder(TENANT, "order_1"),
+    ).resolves.toBeUndefined();
+    expect(fulfillRepo).toHaveBeenCalledWith(TENANT, "order_1");
+  });
+
+  it("throws OrderNotFoundError when the order doesn't exist", async () => {
+    fulfillRepo.mockResolvedValue({ transitioned: false, currentStatus: null });
+
+    await expect(
+      orderService.fulfillOrder(TENANT, "order_x"),
+    ).rejects.toBeInstanceOf(OrderNotFoundError);
+  });
+
+  it("throws OrderTransitionError naming the current status when it isn't PAID", async () => {
+    fulfillRepo.mockResolvedValue({
+      transitioned: false,
+      currentStatus: "PENDING",
+    });
+
+    await expect(
+      orderService.fulfillOrder(TENANT, "order_1"),
+    ).rejects.toBeInstanceOf(OrderTransitionError);
+    await expect(orderService.fulfillOrder(TENANT, "order_1")).rejects.toThrow(
+      /pending/i,
+    );
   });
 });

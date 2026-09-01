@@ -1,4 +1,5 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+import type { OrderStatus } from "@prisma/client";
 import {
   orderRepository,
   type CreateOrderInput,
@@ -103,6 +104,41 @@ async function seedPendingOrder(
         })),
       },
     },
+  });
+}
+
+/** Seed an order in any status (with optional lines and an explicit `createdAt`
+ *  for ordering tests). Used by the lifecycle + list suites below. */
+async function seedOrder(
+  tenantId: string,
+  opts: {
+    status?: OrderStatus;
+    lines?: SeedLine[];
+    stripePaymentIntentId?: string;
+    createdAt?: Date;
+  } = {},
+) {
+  const lines = opts.lines ?? [];
+  return prisma.order.create({
+    data: {
+      tenantId,
+      orderNumber: uniqueId("order"),
+      status: opts.status ?? "PENDING",
+      email: "shopper@example.com",
+      totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
+      currency: "usd",
+      stripePaymentIntentId: opts.stripePaymentIntentId ?? uniqueId("pi"),
+      ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
+      items: {
+        create: lines.map((l) => ({
+          variantId: l.variantId,
+          titleSnapshot: l.titleSnapshot ?? "Tee / Blue",
+          priceCents: l.priceCents,
+          quantity: l.qty,
+        })),
+      },
+    },
+    include: { items: true },
   });
 }
 
@@ -333,6 +369,51 @@ describe("orderRepository.markPaidByPaymentIntent (integration)", () => {
     });
     expect(ampleAfter.stock).toBe(8);
     expect(scarceAfter.stock).toBe(2);
+  });
+
+  it("flags the order oversold when a line couldn't be fully allocated", async () => {
+    const tenant = await freshTenant();
+    const scarce = await seedVariant(tenant.id, { stock: 2, name: "Scarce" });
+    const intent = uniqueId("pi");
+    await seedPendingOrder(tenant.id, intent, [
+      { variantId: scarce.id, qty: 5, priceCents: 2000 },
+    ]);
+
+    const result = await orderRepository.markPaidByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+    expect(result.transitioned).toBe(true);
+    if (!result.transitioned) return;
+
+    // The durable oversell flag is written in the same transaction as the flip —
+    // what the admin order view and the confirmation email (#40) read long after
+    // the capture, unlike the transient `shortfalls` return.
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: result.order.id },
+    });
+    expect(persisted.oversold).toBe(true);
+  });
+
+  it("leaves oversold false when every line is fully allocated", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 10 });
+    const intent = uniqueId("pi");
+    await seedPendingOrder(tenant.id, intent, [
+      { variantId: variant.id, qty: 3, priceCents: 1000 },
+    ]);
+
+    const result = await orderRepository.markPaidByPaymentIntent(
+      tenant.id,
+      intent,
+    );
+    expect(result.transitioned).toBe(true);
+    if (!result.transitioned) return;
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: result.order.id },
+    });
+    expect(persisted.oversold).toBe(false);
   });
 
   it("transitions exactly once under a concurrent double-delivery (Promise.all)", async () => {
@@ -617,5 +698,375 @@ describe("orderRepository.createWithItems (reservation, integration)", () => {
       where: { id: variant.id },
     });
     expect(afterRetry.reserved).toBe(2);
+  });
+});
+
+describe("orderRepository.cancelPendingAndRelease (integration)", () => {
+  it("cancels a PENDING order and releases its reservation", async () => {
+    const tenant = await freshTenant();
+    // 10 on hand, 3 held by this order's PENDING reservation.
+    const variant = await seedVariant(tenant.id, { stock: 10, reserved: 3 });
+    const order = await seedOrder(tenant.id, {
+      status: "PENDING",
+      lines: [{ variantId: variant.id, qty: 3, priceCents: 1000 }],
+    });
+
+    const result = await orderRepository.cancelPendingAndRelease(
+      tenant.id,
+      order.id,
+    );
+    expect(result).toEqual({ transitioned: true });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("CANCELLED");
+
+    // The hold is freed and physical stock is untouched (a PENDING order never
+    // decremented it), so those units are sellable again.
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.stock).toBe(10);
+    expect(after.reserved).toBe(0);
+  });
+
+  it("floors the reservation release at 0 (drift-safe)", async () => {
+    const tenant = await freshTenant();
+    // Only 1 unit held though the line is for 3 (a drift edge): the release must
+    // not drive `reserved` negative.
+    const variant = await seedVariant(tenant.id, { stock: 10, reserved: 1 });
+    const order = await seedOrder(tenant.id, {
+      status: "PENDING",
+      lines: [{ variantId: variant.id, qty: 3, priceCents: 1000 }],
+    });
+
+    await orderRepository.cancelPendingAndRelease(tenant.id, order.id);
+
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.reserved).toBe(0); // GREATEST(1 - 3, 0)
+  });
+
+  it("is a no-op on an order that isn't PENDING, reporting its status", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 10, reserved: 0 });
+    // A PAID order is past PENDING — this leg can't cancel it.
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      lines: [{ variantId: variant.id, qty: 2, priceCents: 1000 }],
+    });
+
+    const result = await orderRepository.cancelPendingAndRelease(
+      tenant.id,
+      order.id,
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: "PAID" });
+
+    // Untouched: still PAID, and no phantom release drove `reserved` negative.
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PAID");
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.reserved).toBe(0);
+  });
+
+  it("reports currentStatus:null for an unknown order id", async () => {
+    const tenant = await freshTenant();
+    const result = await orderRepository.cancelPendingAndRelease(
+      tenant.id,
+      uniqueId("order-missing"),
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: null });
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const variant = await seedVariant(owner.id, { stock: 5, reserved: 2 });
+    const order = await seedOrder(owner.id, {
+      status: "PENDING",
+      lines: [{ variantId: variant.id, qty: 2, priceCents: 1000 }],
+    });
+
+    // Same order id, wrong tenant: unknown, and it must touch nothing.
+    const result = await orderRepository.cancelPendingAndRelease(
+      other.id,
+      order.id,
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: null });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PENDING");
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.reserved).toBe(2); // hold intact
+  });
+
+  it("cancels exactly once under a concurrent double-cancel (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    // 5 reserved though this order holds 3 (2 belong to other in-flight orders):
+    // a single release leaves 2, so `reserved === 2` proves the loser did NOT
+    // release a second time (a double release would floor it to 0).
+    const variant = await seedVariant(tenant.id, { stock: 10, reserved: 5 });
+    const order = await seedOrder(tenant.id, {
+      status: "PENDING",
+      lines: [{ variantId: variant.id, qty: 3, priceCents: 1000 }],
+    });
+
+    // Two admins (or an admin + the sweep) cancel at once. Row locking on the
+    // guarded updateMany must let exactly one win; the other sees CANCELLED.
+    const [a, b] = await Promise.all([
+      orderRepository.cancelPendingAndRelease(tenant.id, order.id),
+      orderRepository.cancelPendingAndRelease(tenant.id, order.id),
+    ]);
+
+    const transitioned = [a, b].filter((r) => r.transitioned);
+    expect(transitioned).toHaveLength(1);
+    const loser = [a, b].find((r) => !r.transitioned);
+    expect(loser).toEqual({ transitioned: false, currentStatus: "CANCELLED" });
+
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.reserved).toBe(2); // released once (5 - 3), never twice
+    expect(after.stock).toBe(10);
+  });
+
+  it("cancel racing markPaid on one PENDING order: exactly one wins, no corruption", async () => {
+    const tenant = await freshTenant();
+    // 10 on hand, 3 held by this order's reservation.
+    const variant = await seedVariant(tenant.id, { stock: 10, reserved: 3 });
+    const intent = uniqueId("pi");
+    const order = await seedOrder(tenant.id, {
+      status: "PENDING",
+      stripePaymentIntentId: intent,
+      lines: [{ variantId: variant.id, qty: 3, priceCents: 1000 }],
+    });
+
+    // An admin cancels at the same instant the payment webhook confirms. Both
+    // legs guard on `status: PENDING` and take the order row lock first, so they
+    // serialize there: exactly one transitions, and the order can never end up
+    // both cancelled and paid (or paid without its stock decremented).
+    const [cancel, pay] = await Promise.all([
+      orderRepository.cancelPendingAndRelease(tenant.id, order.id),
+      orderRepository.markPaidByPaymentIntent(tenant.id, intent),
+    ]);
+
+    expect(
+      [cancel.transitioned, pay.transitioned].filter(Boolean),
+    ).toHaveLength(1);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    // Either outcome frees the hold; only the winning sale touches physical stock.
+    expect(after.reserved).toBe(0);
+    if (cancel.transitioned) {
+      expect(pay.transitioned).toBe(false);
+      expect(persisted.status).toBe("CANCELLED");
+      expect(after.stock).toBe(10); // cancel never decrements
+    } else {
+      expect(pay.transitioned).toBe(true);
+      expect(persisted.status).toBe("PAID");
+      expect(after.stock).toBe(7); // the sale decremented its 3 units
+    }
+  });
+});
+
+describe("orderRepository.markFulfilled (integration)", () => {
+  it("marks a PAID order FULFILLED", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" });
+
+    const result = await orderRepository.markFulfilled(tenant.id, order.id);
+    expect(result).toEqual({ transitioned: true });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("FULFILLED");
+  });
+
+  it("is a no-op on an order that isn't PAID, reporting its status", async () => {
+    const tenant = await freshTenant();
+    const pending = await seedOrder(tenant.id, { status: "PENDING" });
+
+    const result = await orderRepository.markFulfilled(tenant.id, pending.id);
+    expect(result).toEqual({ transitioned: false, currentStatus: "PENDING" });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: pending.id },
+    });
+    expect(persisted.status).toBe("PENDING");
+  });
+
+  it("reports currentStatus:null for an unknown order id", async () => {
+    const tenant = await freshTenant();
+    const result = await orderRepository.markFulfilled(
+      tenant.id,
+      uniqueId("order-missing"),
+    );
+    expect(result).toEqual({ transitioned: false, currentStatus: null });
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedOrder(owner.id, { status: "PAID" });
+
+    const result = await orderRepository.markFulfilled(other.id, order.id);
+    expect(result).toEqual({ transitioned: false, currentStatus: null });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("does not touch stock or reservations (status-only attestation)", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 7, reserved: 2 });
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      lines: [{ variantId: variant.id, qty: 3, priceCents: 1000 }],
+    });
+
+    await orderRepository.markFulfilled(tenant.id, order.id);
+
+    const after = await prisma.productVariant.findUniqueOrThrow({
+      where: { id: variant.id },
+    });
+    expect(after.stock).toBe(7);
+    expect(after.reserved).toBe(2);
+  });
+
+  it("transitions exactly once under a concurrent double-fulfil (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" });
+
+    const [a, b] = await Promise.all([
+      orderRepository.markFulfilled(tenant.id, order.id),
+      orderRepository.markFulfilled(tenant.id, order.id),
+    ]);
+
+    const transitioned = [a, b].filter((r) => r.transitioned);
+    expect(transitioned).toHaveLength(1);
+    const loser = [a, b].find((r) => !r.transitioned);
+    expect(loser).toEqual({ transitioned: false, currentStatus: "FULFILLED" });
+  });
+});
+
+describe("orderRepository.listByTenant (integration)", () => {
+  it("returns a tenant's orders newest-first with a total", async () => {
+    const tenant = await freshTenant();
+    const oldest = await seedOrder(tenant.id, {
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    const newest = await seedOrder(tenant.id, {
+      createdAt: new Date("2026-03-01T00:00:00.000Z"),
+    });
+    const middle = await seedOrder(tenant.id, {
+      createdAt: new Date("2026-02-01T00:00:00.000Z"),
+    });
+
+    const page = await orderRepository.listByTenant(tenant.id, {
+      page: 1,
+      pageSize: 10,
+    });
+
+    expect(page.total).toBe(3);
+    expect(page.orders.map((o) => o.id)).toEqual([
+      newest.id,
+      middle.id,
+      oldest.id,
+    ]);
+  });
+
+  it("filters by status and totals only the filtered rows", async () => {
+    const tenant = await freshTenant();
+    await seedOrder(tenant.id, { status: "PENDING" });
+    const paidOld = await seedOrder(tenant.id, {
+      status: "PAID",
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    const paidNew = await seedOrder(tenant.id, {
+      status: "PAID",
+      createdAt: new Date("2026-02-01T00:00:00.000Z"),
+    });
+
+    const page = await orderRepository.listByTenant(tenant.id, {
+      status: "PAID",
+      page: 1,
+      pageSize: 10,
+    });
+
+    expect(page.total).toBe(2);
+    expect(page.orders.map((o) => o.id)).toEqual([paidNew.id, paidOld.id]);
+    expect(page.orders.every((o) => o.status === "PAID")).toBe(true);
+  });
+
+  it("paginates — each page continues where the last left off", async () => {
+    const tenant = await freshTenant();
+    // Five orders with strictly increasing createdAt (so newest is last created).
+    const dates = [
+      "2026-01-01",
+      "2026-01-02",
+      "2026-01-03",
+      "2026-01-04",
+      "2026-01-05",
+    ];
+    const created: { id: string }[] = [];
+    for (const d of dates) {
+      created.push(
+        await seedOrder(tenant.id, {
+          createdAt: new Date(`${d}T00:00:00.000Z`),
+        }),
+      );
+    }
+    const newestFirst = [...created].reverse().map((o) => o.id);
+
+    const p1 = await orderRepository.listByTenant(tenant.id, {
+      page: 1,
+      pageSize: 2,
+    });
+    const p2 = await orderRepository.listByTenant(tenant.id, {
+      page: 2,
+      pageSize: 2,
+    });
+    const p3 = await orderRepository.listByTenant(tenant.id, {
+      page: 3,
+      pageSize: 2,
+    });
+
+    expect(p1.total).toBe(5);
+    expect(p1.orders.map((o) => o.id)).toEqual(newestFirst.slice(0, 2));
+    expect(p2.orders.map((o) => o.id)).toEqual(newestFirst.slice(2, 4));
+    expect(p3.orders.map((o) => o.id)).toEqual(newestFirst.slice(4, 5));
+  });
+
+  it("does not cross the tenant boundary — only the tenant's orders", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    await seedOrder(owner.id, {});
+    await seedOrder(owner.id, {});
+    await seedOrder(other.id, {});
+
+    const page = await orderRepository.listByTenant(owner.id, {
+      page: 1,
+      pageSize: 10,
+    });
+    expect(page.total).toBe(2);
+    expect(page.orders.every((o) => o.tenantId === owner.id)).toBe(true);
   });
 });
