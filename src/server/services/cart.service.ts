@@ -1,3 +1,4 @@
+import "server-only";
 import { productRepository } from "@/server/repositories/product.repository";
 import { availableUnits } from "@/lib/inventory";
 import { MAX_CART_QTY, type CartItem, type CartLine } from "@/lib/cart";

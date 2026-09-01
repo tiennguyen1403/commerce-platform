@@ -1,3 +1,4 @@
+import "server-only";
 import { randomInt, randomUUID } from "node:crypto";
 import type Stripe from "stripe";
 import { getStripe } from "@/lib/stripe";

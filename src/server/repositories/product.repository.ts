@@ -1,3 +1,4 @@
+import "server-only";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/server/db";
 import type { ProductInput } from "@/lib/validators/catalog";

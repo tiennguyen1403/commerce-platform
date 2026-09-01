@@ -1,3 +1,4 @@
+import "server-only";
 import type { Role } from "@/config/roles";
 import { userRepository } from "@/server/repositories/user.repository";
 import { membershipRepository } from "@/server/repositories/membership.repository";
