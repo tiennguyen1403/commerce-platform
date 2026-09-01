@@ -22,9 +22,18 @@ export function formatDate(value: Date | string, withTime = false) {
   return new Intl.DateTimeFormat(
     "en-US",
     withTime
-      ? // `timeZoneName` labels the zone (the runtime's — UTC in prod, local in
-        // dev) so an operator never misreads a bare wall-clock time.
-        { dateStyle: "medium", timeStyle: "short", timeZoneName: "short" }
+      ? // Spell out the components: `timeZoneName` can't be combined with
+        // `dateStyle`/`timeStyle` (ECMA-402 throws "Invalid option"). Labelling
+        // the zone (the runtime's — UTC in prod, local in dev) keeps an operator
+        // from misreading a bare wall-clock time.
+        {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          timeZoneName: "short",
+        }
       : { dateStyle: "medium" },
   ).format(date);
 }

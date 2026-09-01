@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatMoney, slugify, cn } from "@/lib/utils";
+import { formatMoney, slugify, cn, formatDate } from "@/lib/utils";
 
 describe("formatMoney", () => {
   it("formats integer cents as USD by default", () => {
@@ -64,5 +64,29 @@ describe("cn", () => {
     expect(cn("text-sm", false && "hidden", "font-bold")).toBe(
       "text-sm font-bold",
     );
+  });
+});
+
+describe("formatDate", () => {
+  const d = new Date("2026-09-01T12:00:00.000Z");
+
+  it("formats a medium date (no time) by default", () => {
+    const s = formatDate(d);
+    expect(s).toMatch(/2026/);
+    expect(s).not.toMatch(/:/); // no clock time when withTime is false
+  });
+
+  it("adds a time + timezone label when withTime is true", () => {
+    // Regression guard for the ECMA-402 rule that `timeZoneName` may NOT be
+    // combined with dateStyle/timeStyle (it throws "Invalid option" at runtime,
+    // which TS does not catch). Must not throw, and must include a HH:MM time.
+    expect(() => formatDate(d, true)).not.toThrow();
+    const s = formatDate(d, true);
+    expect(s).toMatch(/2026/);
+    expect(s).toMatch(/:\d{2}/);
+  });
+
+  it("accepts an ISO string", () => {
+    expect(formatDate("2026-09-01T12:00:00.000Z")).toMatch(/2026/);
   });
 });
