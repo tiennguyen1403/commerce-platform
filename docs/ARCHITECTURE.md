@@ -74,6 +74,8 @@ AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
 - Local Postgres via `docker-compose.yml` on host port **55432**.
 - Production target: Vercel (app) + Neon/Supabase (Postgres). Prisma client is generated
   in `postinstall` and in CI.
+- Migration safety (the `NOT NULL`/`DEFAULT` convention, the CI guard, and how to deploy
+  onto a pre-seeded database) lives in [`docs/DATABASE.md`](DATABASE.md).
 
 ## 8. Decision log
 
@@ -94,5 +96,10 @@ AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
   no-ops; the browser redirect never writes order state.
 - **Single currency per tenant** (M1) — currency lives on `Tenant`, not `ProductVariant`;
   a store can't accidentally mix currencies in a cart or order total.
+- **Static migration-safety guard** (M2) — a `NOT NULL` column added with no `DEFAULT`
+  breaks `migrate deploy` on a non-empty table, and applied migrations are forward-only, so
+  the fix is prevention: `pnpm db:check-migrations` scans migration SQL in CI and blocks the
+  pattern. The pre-existing `account_issuer` case is grandfathered with a documented
+  corrective path (`docs/DATABASE.md`, issue #38).
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).
