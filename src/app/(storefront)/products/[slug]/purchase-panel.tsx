@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import Link from "next/link";
 import { Check, Info, Loader2, ShoppingCart } from "lucide-react";
 import { formatMoney } from "@/lib/utils";
+import { LOW_STOCK_THRESHOLD } from "@/config/constants";
 import { addToCartAction } from "@/app/(storefront)/cart/actions";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -22,9 +23,6 @@ export type PurchaseVariant = {
   /** Sellable units (`stock - reserved`) — drives the sold-out/low-stock UI. */
   available: number;
 };
-
-/** Below this many units we nudge the shopper with an exact count. */
-const LOW_STOCK_THRESHOLD = 5;
 
 /**
  * PDP purchase controls: pick a variant, see its live price and stock, add it to
