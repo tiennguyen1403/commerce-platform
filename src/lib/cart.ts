@@ -56,7 +56,8 @@ export type CartActionResult =
 /**
  * A single priced, reconciled cart line for display — the output of the cart
  * service, consumed by both the server cart page and the client line-item UI.
- * Every field except `qty` comes straight from a live `ProductVariant` read.
+ * Price/title come straight from a live `ProductVariant` read; `available` is the
+ * sellable ceiling (`stock - reserved`) the line's qty is clamped to.
  */
 export type CartItem = {
   variantId: string;
@@ -67,7 +68,8 @@ export type CartItem = {
   currency: string;
   qty: number;
   lineTotalCents: number;
-  stock: number;
+  /** Sellable units (`stock - reserved`) — the qty ceiling shown on the cart. */
+  available: number;
 };
 
 // --- Pure reducers ---------------------------------------------------------

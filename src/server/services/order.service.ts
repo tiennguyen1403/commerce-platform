@@ -24,7 +24,7 @@ import type { CartLine } from "@/lib/cart";
  */
 
 // Re-export so the Server Action boundary imports checkout errors from one place.
-export { EmptyCartError } from "@/server/order.errors";
+export { EmptyCartError, InsufficientStockError } from "@/server/order.errors";
 
 export type StartCheckoutResult = {
   clientSecret: string;

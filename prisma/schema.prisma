@@ -157,9 +157,18 @@ model ProductVariant {
   // currency is the store's (`Tenant.currency`), never per-variant — that's what
   // keeps a cart/order total single-currency and soundly summable.
   priceCents Int
-  stock      Int      @default(0)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  // Physical units on hand — what the admin types. Sellable stock is
+  // `available = stock - reserved`, never `stock` alone.
+  stock Int @default(0)
+  // Units held by in-flight (PENDING) orders: bumped when an order is created,
+  // released on CANCELLED/sweep, and released again when the sale reconciles at
+  // PAID (as `stock` drops by the same amount). A running counter — kept as an
+  // atomically-maintained cache of the Order/OrderItem ledger — so the sellable
+  // check is a single-row read, not an aggregate over every open order. Floored
+  // at 0 on release; the storefront shows/clamps to `stock - reserved`.
+  reserved  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
   orderItems OrderItem[]
