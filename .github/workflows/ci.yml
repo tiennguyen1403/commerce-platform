@@ -31,6 +31,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm prisma generate
+      # Static migration-safety guard (issue #38): no NOT NULL column added
+      # without a DEFAULT. Reads the SQL only — no database needed.
+      - run: pnpm db:check-migrations
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm build

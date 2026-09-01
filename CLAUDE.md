@@ -4,7 +4,8 @@ Multi-tenant e-commerce platform (storefront + admin + pluggable fulfillment), b
 end-to-end as a **production-grade portfolio project**. Read this fully before working.
 
 Deep references: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
-[`docs/DESIGN.md`](docs/DESIGN.md) · process: [`docs/milestones/README.md`](docs/milestones/README.md)
+[`docs/DESIGN.md`](docs/DESIGN.md) · [`docs/DATABASE.md`](docs/DATABASE.md) ·
+process: [`docs/milestones/README.md`](docs/milestones/README.md)
 
 @AGENTS.md
 
@@ -33,6 +34,9 @@ know, go read or search — don't invent. This binds every agent.
    `NEXT_PUBLIC_*` var.
 6. **Migrations are forward-only** on shared branches — create with
    `pnpm db:migrate --name <change>`, review the generated SQL, never edit an applied one.
+   A new `NOT NULL` column on a table that may hold rows must ship with a `DEFAULT` (drop
+   it in a follow-up if unwanted), or `migrate deploy` breaks on non-empty DBs;
+   `pnpm db:check-migrations` enforces this in CI. See [`docs/DATABASE.md`](docs/DATABASE.md).
 
 ## Next.js 16 caveat
 
