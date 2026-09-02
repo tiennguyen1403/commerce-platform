@@ -1,18 +1,20 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
-import { ShoppingCart, Store } from "lucide-react";
+import { LogIn, ShoppingCart, Store } from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
+import { getShopperSession } from "@/server/auth/shopper-context";
 import { readCart } from "@/server/cart-cookie";
 import { cartItemCount } from "@/lib/cart";
 import { tenantThemeCss } from "@/lib/theme";
 import { Badge } from "@/components/ui/badge";
+import { AccountMenu } from "./account/account-menu";
 
 /**
  * Public storefront shell. Resolves the tenant once (cached) and shares its
  * name with the header; child pages read the same cached context for their data.
  * Every storefront route already renders on-demand (the list is `force-dynamic`,
- * the PDP is a dynamic segment, the cart reads cookies), so neither this DB read
- * nor the cart-cookie read below ever runs at build time.
+ * the PDP is a dynamic segment, the cart reads cookies), so none of these reads
+ * (tenant, shopper session, cart cookie) ever runs at build time.
  *
  * Per-tenant accent (#98): the wrapper carries `data-tenant-theme` and an inline
  * `<style>` re-parametrizing the accent tokens by `themeHue`. Scoping to this
@@ -25,7 +27,14 @@ export default async function StorefrontLayout({
 }: {
   children: ReactNode;
 }) {
-  const { tenantName, themeHue } = await getStoreTenant();
+  // Two per-request DB reads in parallel: the tenant, and the shopper session.
+  // The session read is optimistic and non-gating — it never redirects a guest
+  // (the store is public) and degrades to `null` on failure — so it only decides
+  // which nav chrome to show; the gated pages (`/account`) re-check for real.
+  const [{ tenantName, themeHue }, session] = await Promise.all([
+    getStoreTenant(),
+    getShopperSession(),
+  ]);
   // Header badge is a cheap hint from the raw cookie; the cart page does the
   // authoritative re-pricing/reconciliation against live stock.
   const itemCount = cartItemCount(await readCart());
@@ -61,6 +70,20 @@ export default async function StorefrontLayout({
                 </Badge>
               ) : null}
             </Link>
+            {session ? (
+              <AccountMenu
+                name={session.user.name}
+                email={session.user.email}
+              />
+            ) : (
+              <Link
+                href="/account/sign-in"
+                className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1.5 transition-colors"
+              >
+                <LogIn className="size-4" aria-hidden />
+                Sign in
+              </Link>
+            )}
           </nav>
         </div>
       </header>
