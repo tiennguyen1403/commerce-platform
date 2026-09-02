@@ -62,4 +62,21 @@ export const tenantRepository = {
   updateCurrency(id: string, currency: string) {
     return prisma.tenant.update({ where: { id }, data: { currency } });
   },
+
+  /** Set the store's display name (`Tenant.name`). Scoped by the tenant's own id
+   *  (the isolation root). Touches only the name column — the immutable `slug`
+   *  (the store's subdomain/address) is deliberately never changed here, so a
+   *  rename can't move where the store lives or collide with another slug. */
+  updateName(id: string, name: string) {
+    return prisma.tenant.update({ where: { id }, data: { name } });
+  },
+
+  /** Set the store's storefront accent (`Tenant.themeHue`, an OKLCH hue angle).
+   *  Scoped by the tenant's own id. Touches only the hue column; the caller
+   *  validates it against `themeHueSchema` (0–359) and the CSS-injection
+   *  boundary (`tenantThemeCss`) re-validates on read, so a bad value can never
+   *  reach the storefront's inline `<style>`. */
+  updateThemeHue(id: string, themeHue: number) {
+    return prisma.tenant.update({ where: { id }, data: { themeHue } });
+  },
 };

@@ -104,3 +104,42 @@ export function tenantThemeCss(hue: number): string {
     `${TENANT_THEME_SELECTOR}{${declarations(TOKEN_RECIPE.dark, safe)}}}`
   );
 }
+
+/** The concrete accent colors for a hue, as ready-to-use `oklch()` strings. */
+export interface AccentPreview {
+  /** Storefront primary — buttons, links, the active accent. */
+  primary: string;
+  /** Readable text/icon color on top of {@link primary}. */
+  primaryForeground: string;
+  /** Focus-ring / slider accent. */
+  ring: string;
+}
+
+/**
+ * Resolve a hue to its concrete accent swatches, for UI that must show the
+ * accent *outside* the themed storefront subtree — the admin settings picker
+ * lives under the platform theme, so it can't read the per-tenant tokens off the
+ * cascade and instead renders these values inline. Uses the light-scheme L/C
+ * from {@link TOKEN_RECIPE} (a mid-tone primary reads fine on either admin
+ * scheme), and validates the hue via {@link resolveThemeHue} so an out-of-range
+ * value previews the default rather than emitting a broken `oklch()`. Derived
+ * from the recipe by token name, so the preview can never drift from the CSS the
+ * storefront actually ships.
+ */
+export function accentPreview(hue: number): AccentPreview {
+  const safe = resolveThemeHue(hue);
+  const byToken = new Map(
+    TOKEN_RECIPE.light.map(([name, l, c]) => [
+      name,
+      `oklch(${l} ${c} ${safe})`,
+    ]),
+  );
+  // The recipe always carries these tokens; the fallback only satisfies the
+  // types and is never reached.
+  const fallback = `oklch(0.5 0.12 ${safe})`;
+  return {
+    primary: byToken.get("--primary") ?? fallback,
+    primaryForeground: byToken.get("--primary-foreground") ?? fallback,
+    ring: byToken.get("--ring") ?? fallback,
+  };
+}

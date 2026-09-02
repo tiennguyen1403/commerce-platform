@@ -19,12 +19,20 @@ export const SLUG_MAX_LENGTH = 63;
 // the DB without getting in a real owner's way — mirrors the catalog title cap.
 const STORE_NAME_MAX = 160;
 
+/**
+ * A store's display name: trimmed, non-empty, capped. Shared by onboarding
+ * (`createStoreSchema`) and the settings branding editor (`updateNameSchema`),
+ * so the rule a name is created under is the exact rule it's later renamed
+ * under — one source of truth, never duplicated.
+ */
+export const storeNameSchema = z
+  .string()
+  .trim()
+  .min(1, { error: "Store name is required." })
+  .max(STORE_NAME_MAX, { error: "Store name is too long." });
+
 export const createStoreSchema = z.object({
-  name: z
-    .string()
-    .trim()
-    .min(1, { error: "Store name is required." })
-    .max(STORE_NAME_MAX, { error: "Store name is too long." }),
+  name: storeNameSchema,
   // Normalized (trim + lowercase) before every check, so the length, shape, and
   // reserved rules all see the same value the store is created with.
   slug: z
