@@ -209,8 +209,9 @@ async function main() {
 
   // A second store on a distinct hue so per-tenant theming is visible at a glance:
   // `demo.localhost:3000` renders emerald, `aurora.localhost:3000` violet, from
-  // the one shared token recipe. `update` re-applies the hue on re-seed. The demo
-  // owner owns it too, so both stores appear in the admin store switcher.
+  // the one shared token recipe. `update` re-applies the hue on re-seed.
+  // Deliberately storefront-only (no members): the admin-auth e2e assumes the
+  // seeded admin owns exactly one store, so `admin@demo.test` must NOT own aurora.
   const aurora = await prisma.tenant.upsert({
     where: { slug: "aurora" },
     update: { themeHue: AURORA_HUE },
@@ -222,17 +223,13 @@ async function main() {
     },
   });
   await seedProducts(aurora.id, AURORA_PRODUCTS);
-  await prisma.membership.upsert({
-    where: { userId_tenantId: { userId: owner.id, tenantId: aurora.id } },
-    update: { role: "OWNER" },
-    create: { userId: owner.id, tenantId: aurora.id, role: "OWNER" },
-  });
 
   console.log(
     `Seeded "${demo.slug}" (emerald, ${PRODUCTS.length} products) and ` +
-      `"${aurora.slug}" (violet hue ${AURORA_HUE}, ${AURORA_PRODUCTS.length} products); ` +
-      `owner "${owner.email}" (OWNER of both), a STAFF member (staff@demo.test), and ` +
-      `an unassigned account (teammate@demo.test) to add via the members page.`,
+      `"${aurora.slug}" (violet hue ${AURORA_HUE}, ${AURORA_PRODUCTS.length} products, ` +
+      `storefront-only); owner "${owner.email}" (OWNER of ${demo.slug}), a STAFF member ` +
+      `(staff@demo.test), and an unassigned account (teammate@demo.test) to add via the ` +
+      `members page.`,
   );
 }
 
