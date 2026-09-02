@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Activity, ArrowRight } from "lucide-react";
+import { Activity, ArrowRight, Store } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 const STACK = [
@@ -43,8 +43,13 @@ export default function Home() {
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
+        <Button size="lg" nativeButton={false} render={<Link href="/new" />}>
+          <Store />
+          Create your store
+        </Button>
         <Button
           size="lg"
+          variant="outline"
           nativeButton={false}
           render={<Link href="/products" />}
         >
