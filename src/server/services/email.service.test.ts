@@ -41,6 +41,7 @@ function tenant(o: Partial<Tenant> = {}): Tenant {
     slug: "acme",
     name: "Acme Store",
     currency: "usd",
+    themeHue: 162,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     ...o,

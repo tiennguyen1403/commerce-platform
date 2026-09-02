@@ -4,6 +4,7 @@ import { ShoppingCart, Store } from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
 import { readCart } from "@/server/cart-cookie";
 import { cartItemCount } from "@/lib/cart";
+import { tenantThemeCss } from "@/lib/theme";
 import { Badge } from "@/components/ui/badge";
 
 /**
@@ -12,19 +13,26 @@ import { Badge } from "@/components/ui/badge";
  * Every storefront route already renders on-demand (the list is `force-dynamic`,
  * the PDP is a dynamic segment, the cart reads cookies), so neither this DB read
  * nor the cart-cookie read below ever runs at build time.
+ *
+ * Per-tenant accent (#98): the wrapper carries `data-tenant-theme` and an inline
+ * `<style>` re-parametrizing the accent tokens by `themeHue`. Scoping to this
+ * wrapper (not `:root`) keeps the override inside the storefront — the
+ * `(admin)`/`(auth)` trees render as siblings under the root layout and are never
+ * touched. SSR'd here, so the accent is correct on first paint with no flash.
  */
 export default async function StorefrontLayout({
   children,
 }: {
   children: ReactNode;
 }) {
-  const { tenantName } = await getStoreTenant();
+  const { tenantName, themeHue } = await getStoreTenant();
   // Header badge is a cheap hint from the raw cookie; the cart page does the
   // authoritative re-pricing/reconciliation against live stock.
   const itemCount = cartItemCount(await readCart());
 
   return (
-    <div className="flex min-h-dvh flex-col">
+    <div data-tenant-theme="" className="flex min-h-dvh flex-col">
+      <style dangerouslySetInnerHTML={{ __html: tenantThemeCss(themeHue) }} />
       <header className="border-b">
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 px-6 py-4">
           <Link

@@ -40,6 +40,7 @@ function tenantRow(
     slug: o.slug ?? "ada-shop",
     name: o.name ?? "Ada's Shop",
     currency: "usd",
+    themeHue: 162,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
   };

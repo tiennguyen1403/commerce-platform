@@ -11,6 +11,10 @@ export interface StoreContext {
   /** The store's single currency (lowercase ISO 4217). Every price shown and
    *  every total charged is in this currency; the catalog has no other. */
   currency: string;
+  /** OKLCH hue angle for this store's accent (see `src/lib/theme.ts`). Raw from
+   *  the DB; validated at the CSS-injection boundary (`tenantThemeCss`), which
+   *  falls back to the default for an out-of-range value. */
+  themeHue: number;
 }
 
 /**
@@ -37,5 +41,6 @@ export const getStoreTenant = cache(async (): Promise<StoreContext> => {
     tenantId: tenant.id,
     tenantName: tenant.name,
     currency: tenant.currency,
+    themeHue: tenant.themeHue,
   };
 });

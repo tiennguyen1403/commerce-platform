@@ -26,6 +26,7 @@ function tenantRow(currency: string): TenantRow {
     slug: "demo",
     name: "Demo",
     currency,
+    themeHue: 162,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
   };

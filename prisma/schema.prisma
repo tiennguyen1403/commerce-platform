@@ -25,6 +25,12 @@ model Tenant {
   // per-variant currency, so a cart/order can never mix currencies. One store =
   // one currency (M1 is single-tenant; a store-settings editor is a follow-up).
   currency  String   @default("usd")
+  // Per-tenant storefront accent: an OKLCH hue angle (0–359°) fed to the scoped
+  // theme in `(storefront)/layout.tsx` (see src/lib/theme.ts). Defaults to the
+  // platform emerald (162°, see globals.css / docs/DESIGN.md), so an existing
+  // store is a visual no-op. NOT NULL + DEFAULT keeps the migration safe on
+  // non-empty tables (docs/DATABASE.md migration guard).
+  themeHue  Int      @default(162)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
