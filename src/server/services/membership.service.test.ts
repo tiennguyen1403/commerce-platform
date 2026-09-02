@@ -23,6 +23,7 @@ vi.mock("@/server/repositories/user.repository", () => ({
 vi.mock("@/server/repositories/membership.repository", () => ({
   membershipRepository: {
     findForUser: vi.fn(),
+    listForUser: vi.fn(),
     listByTenant: vi.fn(),
     countOwners: vi.fn(),
     create: vi.fn(),
@@ -33,6 +34,7 @@ vi.mock("@/server/repositories/membership.repository", () => ({
 
 const findByEmail = vi.mocked(userRepository.findByEmail);
 const findForUser = vi.mocked(membershipRepository.findForUser);
+const listForUser = vi.mocked(membershipRepository.listForUser);
 const create = vi.mocked(membershipRepository.create);
 const changeRole = vi.mocked(membershipRepository.changeRole);
 const remove = vi.mocked(membershipRepository.remove);
@@ -118,6 +120,21 @@ describe("membershipService.addMemberByEmail", () => {
       membershipService.addMemberByEmail(TENANT, "dana@example.com", "ADMIN"),
     ).resolves.toBe(created);
     expect(create).toHaveBeenCalledWith(TENANT, "user_9", "ADMIN");
+  });
+});
+
+describe("membershipService.listStoresForUser", () => {
+  it("delegates to the repository, scoped by the caller's user id", async () => {
+    const rows: Awaited<ReturnType<typeof membershipRepository.listForUser>> = [
+      { role: "OWNER", tenant: { slug: "demo", name: "Demo Store" } },
+      { role: "STAFF", tenant: { slug: "aurora", name: "Aurora" } },
+    ];
+    listForUser.mockResolvedValue(rows);
+
+    await expect(membershipService.listStoresForUser("user_1")).resolves.toBe(
+      rows,
+    );
+    expect(listForUser).toHaveBeenCalledWith("user_1");
   });
 });
 
