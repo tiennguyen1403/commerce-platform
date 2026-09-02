@@ -5,7 +5,10 @@ import { outboxRepository } from "@/server/repositories/outbox.repository";
 import type { OutboxMessageSummary } from "@/server/repositories/outbox.repository";
 import { orderRepository } from "@/server/repositories/order.repository";
 import { emailService } from "@/server/services/email.service";
-import { EmailNotConfiguredError } from "@/server/email.errors";
+import {
+  EmailNotConfiguredError,
+  EmailSendTimeoutError,
+} from "@/server/email.errors";
 import { reportError } from "@/server/observability/error-reporter";
 import type { OrderWithItems } from "@/server/repositories/order.repository";
 
@@ -176,6 +179,26 @@ describe("outboxService.drain", () => {
       "msg_1",
       new Date(NOW.getTime() + BACKOFF_FIRST_MS),
       "Error: Resend 503",
+    );
+    expect(markDead).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ failed: 1, dead: 0 });
+  });
+
+  it("treats a timed-out send (#31) as transient — reschedules, never DEAD", async () => {
+    // The webhook bounds each Resend send (#31) and throws EmailSendTimeoutError
+    // on a hung one. It must classify like any transient fault — backoff-and-retry,
+    // not DEAD — so a slow Resend can't strand a paid order's confirmation, and the
+    // webhook's 2xx is never at stake.
+    findDue.mockResolvedValue([summary({ attempts: 0 })]);
+    sendOrderConfirmation.mockRejectedValue(new EmailSendTimeoutError(5000));
+
+    const result = await outboxService.drain();
+
+    expect(reschedule).toHaveBeenCalledWith(
+      "msg_1",
+      new Date(NOW.getTime() + BACKOFF_FIRST_MS),
+      expect.stringContaining("EmailSendTimeoutError"),
     );
     expect(markDead).not.toHaveBeenCalled();
     expect(report).not.toHaveBeenCalled();

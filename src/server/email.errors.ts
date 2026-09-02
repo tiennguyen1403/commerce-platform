@@ -23,3 +23,18 @@ export class EmailNotConfiguredError extends Error {
     this.name = "EmailNotConfiguredError";
   }
 }
+
+/**
+ * A single Resend API call exceeded its timeout and was abandoned (#31). Unlike
+ * `EmailNotConfiguredError` this is a *transient* failure — a retry may well
+ * succeed — so a retrying caller (the outbox drain) backs off and tries again
+ * rather than marking it DEAD. It exists chiefly so a hung Resend call can't hold
+ * the Stripe webhook's 200 open toward Stripe's own delivery timeout: the send is
+ * bounded, and this is what that bound throws.
+ */
+export class EmailSendTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Resend send timed out after ${timeoutMs}ms`);
+    this.name = "EmailSendTimeoutError";
+  }
+}

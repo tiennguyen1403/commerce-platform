@@ -3,6 +3,7 @@ import type { Order, OrderItem, Tenant } from "@prisma/client";
 import {
   emailService,
   EmailNotConfiguredError,
+  EmailSendTimeoutError,
 } from "@/server/services/email.service";
 import { tenantRepository } from "@/server/repositories/tenant.repository";
 import { env } from "@/lib/env";
@@ -87,6 +88,11 @@ type SentEmail = {
   text: string;
 };
 const lastEmail = (): SentEmail => sendMock.mock.calls[0][0] as SentEmail;
+
+// Mirrors the service's private send-timeout ceiling (#31): the test only needs
+// to advance past it, so exact drift is tolerated (a raised ceiling would make
+// this test time out loudly rather than pass silently).
+const SEND_TIMEOUT_MS = 5_000;
 
 beforeEach(() => {
   sendMock.mockReset();
@@ -203,6 +209,47 @@ describe("emailService.sendOrderConfirmation", () => {
     ).rejects.toThrow(
       "Resend failed to send order confirmation (rate_limit_exceeded): Too many requests",
     );
+  });
+
+  it("throws EmailSendTimeoutError when a hung Resend send exceeds the timeout (#31)", async () => {
+    // A send that never settles stands in for a hung Resend call; fake timers let
+    // us trip the bound without waiting real seconds.
+    vi.useFakeTimers();
+    try {
+      sendMock.mockReturnValue(new Promise(() => {}));
+
+      const promise = emailService.sendOrderConfirmation(orderWithItems());
+      // Attach the rejection expectation before advancing time so the eventual
+      // rejection is never flagged as unhandled.
+      const assertion = expect(promise).rejects.toBeInstanceOf(
+        EmailSendTimeoutError,
+      );
+
+      // Flush the awaited config gate + tenant lookup so the timeout timer is
+      // scheduled, then advance past it to trip the bound.
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(SEND_TIMEOUT_MS);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not time out a healthy send that resolves within the bound", async () => {
+    // Guards against the timeout firing (or leaking a timer) on the happy path:
+    // a normal resolved send settles the race first and clears the timer.
+    vi.useFakeTimers();
+    try {
+      sendMock.mockResolvedValue({ data: { id: "email_1" }, error: null });
+
+      await expect(
+        emailService.sendOrderConfirmation(orderWithItems()),
+      ).resolves.toBeUndefined();
+      // No timer should be left pending once the send has resolved.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("throws EmailNotConfiguredError before any work when the API key is unset", async () => {
