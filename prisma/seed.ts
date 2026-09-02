@@ -143,19 +143,42 @@ const PRODUCTS: SeedProduct[] = [
   },
 ];
 
-async function main() {
-  const tenant = await prisma.tenant.upsert({
-    where: { slug: DEMO_TENANT_SLUG },
-    update: {},
-    create: { slug: DEMO_TENANT_SLUG, name: "Demo Store", currency: "usd" },
-  });
+// A distinct accent hue for the second store so per-tenant theming (#98) is
+// visible side by side: violet, well clear of the platform emerald (162°).
+const AURORA_HUE = 285;
 
-  for (const product of PRODUCTS) {
+// The second store's small catalog — enough to show the themed accent across the
+// grid, a purchase panel, and a low-stock badge (the 14 oz mug sits below the
+// threshold). Slugs are unique per tenant, so they may overlap with `demo`'s.
+const AURORA_PRODUCTS: SeedProduct[] = [
+  {
+    slug: "aurora-candle",
+    title: "Aurora Candle",
+    description: "Hand-poured soy candle with a midnight-plum scent.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "AUR-CNDL", name: "One size", priceCents: 2400, stock: 60 },
+    ],
+  },
+  {
+    slug: "midnight-mug",
+    title: "Midnight Mug",
+    description: "Matte-violet stoneware mug that keeps coffee hot longer.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "AUR-MUG-14", name: "14 oz", priceCents: 1800, stock: 4 },
+    ],
+  },
+];
+
+/** Upsert a tenant's catalog (idempotent by `[tenantId, slug]`). */
+async function seedProducts(tenantId: string, products: SeedProduct[]) {
+  for (const product of products) {
     await prisma.product.upsert({
-      where: { tenantId_slug: { tenantId: tenant.id, slug: product.slug } },
+      where: { tenantId_slug: { tenantId, slug: product.slug } },
       update: {},
       create: {
-        tenantId: tenant.id,
+        tenantId,
         title: product.title,
         slug: product.slug,
         description: product.description,
@@ -171,12 +194,44 @@ async function main() {
       },
     });
   }
+}
 
-  const owner = await seedMembers(tenant.id);
+async function main() {
+  // Primary store, on the platform default hue (162° emerald) — themeHue is left
+  // to the column default, so it stays a visual no-op (#98).
+  const demo = await prisma.tenant.upsert({
+    where: { slug: DEMO_TENANT_SLUG },
+    update: {},
+    create: { slug: DEMO_TENANT_SLUG, name: "Demo Store", currency: "usd" },
+  });
+  await seedProducts(demo.id, PRODUCTS);
+  const owner = await seedMembers(demo.id);
+
+  // A second store on a distinct hue so per-tenant theming is visible at a glance:
+  // `demo.localhost:3000` renders emerald, `aurora.localhost:3000` violet, from
+  // the one shared token recipe. `update` re-applies the hue on re-seed. The demo
+  // owner owns it too, so both stores appear in the admin store switcher.
+  const aurora = await prisma.tenant.upsert({
+    where: { slug: "aurora" },
+    update: { themeHue: AURORA_HUE },
+    create: {
+      slug: "aurora",
+      name: "Aurora",
+      currency: "usd",
+      themeHue: AURORA_HUE,
+    },
+  });
+  await seedProducts(aurora.id, AURORA_PRODUCTS);
+  await prisma.membership.upsert({
+    where: { userId_tenantId: { userId: owner.id, tenantId: aurora.id } },
+    update: { role: "OWNER" },
+    create: { userId: owner.id, tenantId: aurora.id, role: "OWNER" },
+  });
 
   console.log(
-    `Seeded tenant "${tenant.slug}" with ${PRODUCTS.length} products, ` +
-      `owner "${owner.email}" (OWNER), a STAFF member (staff@demo.test), and ` +
+    `Seeded "${demo.slug}" (emerald, ${PRODUCTS.length} products) and ` +
+      `"${aurora.slug}" (violet hue ${AURORA_HUE}, ${AURORA_PRODUCTS.length} products); ` +
+      `owner "${owner.email}" (OWNER of both), a STAFF member (staff@demo.test), and ` +
       `an unassigned account (teammate@demo.test) to add via the members page.`,
   );
 }
