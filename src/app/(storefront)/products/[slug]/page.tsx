@@ -5,6 +5,7 @@ import { cache } from "react";
 import { ArrowLeft, ImageIcon } from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
 import { catalogService } from "@/server/services/catalog.service";
+import { availableUnits } from "@/lib/inventory";
 import { PurchasePanel } from "./purchase-panel";
 
 /**
@@ -81,7 +82,7 @@ export default async function ProductDetailPage({
               id: v.id,
               name: v.name,
               priceCents: v.priceCents,
-              stock: v.stock,
+              available: availableUnits(v),
             }))}
           />
         </div>

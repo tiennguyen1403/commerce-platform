@@ -1,14 +1,17 @@
+import "server-only";
 import { productRepository } from "@/server/repositories/product.repository";
+import { availableUnits } from "@/lib/inventory";
 import { MAX_CART_QTY, type CartItem, type CartLine } from "@/lib/cart";
 
 /**
  * Cart business logic. Turns the cookie's `{ variantId, qty }[]` into a priced,
- * reconciled view by reading live `ProductVariant` rows: price, title, and stock
- * always come from the DB, never the cookie. Lines are dropped when the variant
- * no longer resolves for the tenant, its product isn't ACTIVE, or it's out of
- * stock; quantities are clamped down to available stock. This reconciliation is
- * the security boundary the cart — and, later, checkout — both rely on. Stays
- * free of Prisma (repositories own that).
+ * reconciled view by reading live `ProductVariant` rows: price, title, and
+ * sellable stock (`available = stock - reserved`) always come from the DB, never
+ * the cookie. Lines are dropped when the variant no longer resolves for the
+ * tenant, its product isn't ACTIVE, or it has no sellable units; quantities are
+ * clamped down to `available`. This reconciliation is the security boundary the
+ * cart — and, later, checkout — both rely on. Stays free of Prisma (repositories
+ * own that).
  */
 
 export type CartView = {
@@ -33,9 +36,10 @@ const EMPTY_CART: CartView = {
 
 function isPurchasable(variant: {
   stock: number;
+  reserved: number;
   product: { status: string };
 }): boolean {
-  return variant.product.status === "ACTIVE" && variant.stock > 0;
+  return variant.product.status === "ACTIVE" && availableUnits(variant) > 0;
 }
 
 export const cartService = {
@@ -69,7 +73,8 @@ export const cartService = {
         continue;
       }
 
-      const qty = Math.min(line.qty, variant.stock, MAX_CART_QTY);
+      const available = availableUnits(variant);
+      const qty = Math.min(line.qty, available, MAX_CART_QTY);
       if (qty < line.qty) adjusted = true;
 
       items.push({
@@ -81,7 +86,7 @@ export const cartService = {
         currency,
         qty,
         lineTotalCents: variant.priceCents * qty,
-        stock: variant.stock,
+        available,
       });
     }
 
@@ -118,7 +123,7 @@ export const cartService = {
     if (!variant || !isPurchasable(variant)) return { ok: false };
     return {
       ok: true,
-      qty: Math.min(requestedQty, variant.stock, MAX_CART_QTY),
+      qty: Math.min(requestedQty, availableUnits(variant), MAX_CART_QTY),
     };
   },
 };

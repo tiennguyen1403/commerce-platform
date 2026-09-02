@@ -52,6 +52,6 @@ docs/milestones/
 | --------- | ---------------- | ------- |
 | M0        | foundations      | ✅ done |
 | M1        | commerce-slice   | ✅ done |
-| M2        | production-grade | planned |
+| M2        | production-grade | ✅ done |
 | M3        | platform         | planned |
 | M4        | fulfillment      | planned |

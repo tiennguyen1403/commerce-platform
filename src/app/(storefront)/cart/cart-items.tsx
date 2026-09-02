@@ -47,7 +47,7 @@ function CartRow({ item }: { item: CartItem }) {
     });
   }
 
-  const atMax = item.qty >= Math.min(item.stock, MAX_CART_QTY);
+  const atMax = item.qty >= Math.min(item.available, MAX_CART_QTY);
 
   return (
     <div

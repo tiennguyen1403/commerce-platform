@@ -28,9 +28,10 @@ model Tenant {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships Membership[]
-  products    Product[]
-  orders      Order[]
+  memberships    Membership[]
+  products       Product[]
+  orders         Order[]
+  outboxMessages OutboxMessage[]
 }
 
 enum Role {
@@ -156,9 +157,18 @@ model ProductVariant {
   // currency is the store's (`Tenant.currency`), never per-variant — that's what
   // keeps a cart/order total single-currency and soundly summable.
   priceCents Int
-  stock      Int      @default(0)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  // Physical units on hand — what the admin types. Sellable stock is
+  // `available = stock - reserved`, never `stock` alone.
+  stock Int @default(0)
+  // Units held by in-flight (PENDING) orders: bumped when an order is created,
+  // released on CANCELLED/sweep, and released again when the sale reconciles at
+  // PAID (as `stock` drops by the same amount). A running counter — kept as an
+  // atomically-maintained cache of the Order/OrderItem ledger — so the sellable
+  // check is a single-row read, not an aggregate over every open order. Floored
+  // at 0 on release; the storefront shows/clamps to `stock - reserved`.
+  reserved  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
   orderItems OrderItem[]
@@ -188,14 +198,32 @@ model Order {
   totalCents            Int
   currency              String      @default("usd")
   stripePaymentIntentId String?     @unique
+  // Set true — in the SAME transaction as the PENDING → PAID flip — when the
+  // atomic stock decrement couldn't fully allocate one or more lines (an oversell
+  // captured at payment: the units were sold but weren't on hand). A durable cue
+  // for the admin order view (manual refund/review) and the confirmation email's
+  // copy (#40). The payment still stands PAID; only inventory fell short. One-way:
+  // nothing clears it. Set by `markPaidByPaymentIntent`.
+  oversold              Boolean     @default(false)
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
-  tenant Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  items  OrderItem[]
+  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  items          OrderItem[]
+  outboxMessages OutboxMessage[]
 
   @@unique([tenantId, orderNumber])
   @@index([tenantId])
+  // Admin orders list (`listByTenant`): newest-first within a tenant, optionally
+  // status-filtered. Composite so the tenant scope + `createdAt` ordering is
+  // index-served, not a sort over the tenant's whole order history.
+  @@index([tenantId, createdAt])
+  // Abandoned-PENDING sweep (`findStalePending`, #25): the platform-wide cron
+  // selects PENDING orders older than a grace window, oldest first, ACROSS all
+  // tenants — so it can't use the tenant-scoped index above. Composite [status,
+  // createdAt] serves the `status = 'PENDING'` filter + `createdAt` ordering
+  // directly (mirrors the outbox's [status, nextAttemptAt] drain index).
+  @@index([status, createdAt])
 }
 
 model OrderItem {
@@ -210,5 +238,68 @@ model OrderItem {
   order   Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
   variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
 
+  @@index([orderId])
+}
+
+// ---------------------------------------------------------------------------
+// Transactional outbox (reliable email delivery — #30)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of an outbox message. Retry state is a PENDING row with a future
+/// `nextAttemptAt` (no separate FAILED status) so "due to send" is a single,
+/// uniform query. PENDING and SENDING are the only live states; SENT and DEAD
+/// are terminal.
+enum OutboxStatus {
+  PENDING // awaiting send, or backing off until `nextAttemptAt`
+  SENDING // claimed by a drain run, in flight (reclaimed if the claim goes stale)
+  SENT // delivered — terminal
+  DEAD // permanently failed: retries exhausted or a permanent error — terminal
+}
+
+/// What kind of message this row renders to. One kind today (the order
+/// confirmation); the discriminator lets the drain dispatch by type and keeps
+/// the table a genuine outbox rather than a single-purpose queue.
+enum OutboxMessageType {
+  ORDER_CONFIRMATION
+}
+
+/// A durable "please send this" record, written **in the same transaction** as
+/// the business event it follows (the order's PENDING → PAID flip), so a paid
+/// order can never exist without its confirmation being queued. The cron drain
+/// (`/api/cron/dispatch-outbox`) sends pending rows with backoff, turning
+/// delivery from at-most-once (the old synchronous webhook send) into
+/// at-least-once. Tenant-scoped like every business table.
+model OutboxMessage {
+  id       String            @id @default(cuid())
+  tenantId String
+  type     OutboxMessageType
+  // The order this message renders from. The email content is already
+  // snapshotted on the order (titleSnapshot/priceCents), so the drain re-reads
+  // the order at send time instead of duplicating a rendered payload here.
+  orderId  String
+  // Stable, unique key — also passed to Resend as its `Idempotency-Key` so a
+  // send that succeeds but whose row update is then lost (a killed worker) is
+  // de-duplicated by Resend on the next attempt (24h window). Derived from the
+  // order id, so the single in-transaction enqueue can never write two.
+  idempotencyKey String       @unique
+  status         OutboxStatus @default(PENDING)
+  attempts       Int          @default(0)
+  // When the row next becomes eligible to send. Defaults to now (send asap);
+  // a failed attempt pushes it into the future (exponential backoff).
+  nextAttemptAt DateTime  @default(now())
+  // When the current SENDING claim was taken — lets a later run reclaim a claim
+  // abandoned by a crashed/killed worker. Null whenever the row is not SENDING.
+  claimedAt DateTime?
+  // Last failure text, for observability only — never drives control flow.
+  lastError String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  order  Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  // The drain's hot path: "PENDING rows whose nextAttemptAt has arrived".
+  @@index([status, nextAttemptAt])
+  @@index([tenantId])
   @@index([orderId])
 }

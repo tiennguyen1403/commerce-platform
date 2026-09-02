@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Prisma } from "@prisma/client";
 import { ImageIcon } from "lucide-react";
 import { formatMoney } from "@/lib/utils";
+import { availableUnits } from "@/lib/inventory";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
@@ -30,7 +31,7 @@ export function ProductCard({
   product: StorefrontProduct;
   currency: string;
 }) {
-  const inStock = product.variants.some((v) => v.stock > 0);
+  const inStock = product.variants.some((v) => availableUnits(v) > 0);
 
   return (
     <Link

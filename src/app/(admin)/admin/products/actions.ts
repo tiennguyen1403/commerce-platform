@@ -15,6 +15,7 @@ import {
   type ActionResult,
   type FieldErrors,
 } from "@/lib/validators/catalog";
+import { reportError } from "@/server/observability/error-reporter";
 
 /**
  * Catalog mutations. Every action re-resolves the tenant from the signed-in
@@ -41,7 +42,7 @@ function fieldErrorsFromZod(error: ZodError): FieldErrors {
   return out;
 }
 
-function mapWriteError(err: unknown): ActionResult {
+async function mapWriteError(err: unknown): Promise<ActionResult> {
   if (err instanceof SlugTakenError) {
     return { ok: false, fieldErrors: { slug: err.message } };
   }
@@ -56,7 +57,10 @@ function mapWriteError(err: unknown): ActionResult {
   if (err instanceof ProductNotFoundError) {
     return { ok: false, formError: err.message };
   }
-  console.error("Catalog action failed:", err);
+  // An unexpected write failure — none of the known domain errors above. These
+  // actions swallow it and return a friendly message, so Next's onRequestError
+  // hook never sees it: report it here at the catch site.
+  await reportError(err, { action: "catalog-write" });
   return { ok: false, formError: "Something went wrong. Please try again." };
 }
 
