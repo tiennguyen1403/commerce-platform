@@ -35,31 +35,37 @@ export const metadata: Metadata = { title: "Orders" };
 // params (status + page) are the only thing the URL controls.
 const PAGE_SIZE = 20;
 
-/** Build a `/admin/orders` URL preserving the status filter and page (page 1 and
- *  an absent filter stay implicit, for clean shareable URLs). */
-function ordersHref({
-  status,
-  page,
-}: {
-  status?: OrderStatusValue;
-  page?: number;
-}) {
-  const sp = new URLSearchParams();
-  if (status) sp.set("status", status);
-  if (page && page > 1) sp.set("page", String(page));
-  const qs = sp.toString();
-  return qs ? `/admin/orders?${qs}` : "/admin/orders";
-}
-
 export default async function OrdersPage({
+  params,
   searchParams,
 }: {
+  params: Promise<{ storeSlug: string }>;
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
-  const { tenantId } = await requireAdminContext();
+  const { storeSlug } = await params;
+  const { tenantId } = await requireAdminContext(storeSlug);
   // Forgiving parse: a mistyped ?status / ?page renders the default view, never
   // errors (see `listOrdersParamsSchema`).
   const { status, page } = listOrdersParamsSchema.parse(await searchParams);
+
+  // Build a store-scoped orders URL preserving the status filter and page (page 1
+  // and an absent filter stay implicit, for clean shareable URLs). Closes over
+  // `storeSlug` so every filter/pagination link stays on this store.
+  const ordersHref = ({
+    status,
+    page,
+  }: {
+    status?: OrderStatusValue;
+    page?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (status) sp.set("status", status);
+    if (page && page > 1) sp.set("page", String(page));
+    const qs = sp.toString();
+    return qs
+      ? `/admin/${storeSlug}/orders?${qs}`
+      : `/admin/${storeSlug}/orders`;
+  };
 
   const { orders, total } = await orderService.listOrders(tenantId, {
     status,
@@ -196,7 +202,7 @@ export default async function OrdersPage({
                     </TableCell>
                     <TableCell className="text-right">
                       <Link
-                        href={`/admin/orders/${order.id}`}
+                        href={`/admin/${storeSlug}/orders/${order.id}`}
                         className={buttonVariants({
                           variant: "outline",
                           size: "sm",

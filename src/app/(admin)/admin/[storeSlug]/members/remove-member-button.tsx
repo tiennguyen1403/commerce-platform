@@ -23,11 +23,13 @@ import { removeMemberAction } from "./actions";
  * your own row, or the tenant's last owner — with the reason as a tooltip.
  */
 export function RemoveMemberButton({
+  storeSlug,
   userId,
   memberName,
   disabled = false,
   disabledReason,
 }: {
+  storeSlug: string;
   userId: string;
   memberName: string;
   disabled?: boolean;
@@ -60,7 +62,7 @@ export function RemoveMemberButton({
   function onRemove() {
     setError(null);
     startTransition(async () => {
-      const result = await removeMemberAction(userId);
+      const result = await removeMemberAction(storeSlug, userId);
       if (result.ok) {
         setOpen(false);
         router.refresh();

@@ -16,9 +16,12 @@ import { resolveTenantSlug } from "@/lib/tenant-host";
  *     `x-tenant-slug`. Any inbound `x-tenant-slug` is deleted first, so a client
  *     can never forge the active tenant; the authoritative slug → tenant lookup
  *     is `getStoreTenant`, this header's only reader.
- *  2. Admin auth gate — an optimistic cookie-only redirect for `/admin`. The
- *     authoritative session + membership check lives in the admin layout
- *     (`src/app/(admin)/admin/layout.tsx`).
+ *  2. Admin auth gate — an optimistic cookie-only redirect for any `/admin`
+ *     path (the bare `/admin` store index and every `/admin/[storeSlug]/…`
+ *     below it). The authoritative session + per-store membership check lives in
+ *     the store-scoped admin layout
+ *     (`src/app/(admin)/admin/[storeSlug]/layout.tsx`), which resolves the tenant
+ *     from the URL slug — the prefix gate here needs no slug awareness.
  */
 
 // Bare domain the platform is served from, no port — `example.com` in production,

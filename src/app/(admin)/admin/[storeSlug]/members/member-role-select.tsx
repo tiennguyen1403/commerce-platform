@@ -22,11 +22,13 @@ import { changeMemberRoleAction } from "./actions";
  * stays the real boundary.
  */
 export function MemberRoleSelect({
+  storeSlug,
   userId,
   role,
   disabled = false,
   disabledReason,
 }: {
+  storeSlug: string;
   userId: string;
   role: Role;
   disabled?: boolean;
@@ -54,7 +56,7 @@ export function MemberRoleSelect({
     setValue(next);
     setError(null);
     startTransition(async () => {
-      const result = await changeMemberRoleAction(userId, next);
+      const result = await changeMemberRoleAction(storeSlug, userId, next);
       if (result.ok) {
         router.refresh();
         return;

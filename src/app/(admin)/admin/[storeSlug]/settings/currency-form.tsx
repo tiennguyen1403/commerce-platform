@@ -55,7 +55,13 @@ const EXAMPLE_CENTS = 1999;
  * concrete example, and a standing caution explains it up front. The server
  * (`updateStoreCurrencyAction`) stays the real validation + OWNER boundary.
  */
-export function CurrencyForm({ currentCurrency }: { currentCurrency: string }) {
+export function CurrencyForm({
+  storeSlug,
+  currentCurrency,
+}: {
+  storeSlug: string;
+  currentCurrency: string;
+}) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   // Seed with the stored code even if it isn't in the supported set, so the
@@ -78,7 +84,7 @@ export function CurrencyForm({ currentCurrency }: { currentCurrency: string }) {
 
     setError(null);
     startTransition(async () => {
-      const result = await updateStoreCurrencyAction(parsed.data);
+      const result = await updateStoreCurrencyAction(storeSlug, parsed.data);
       if (result.ok) {
         setOpen(false);
         setDone(

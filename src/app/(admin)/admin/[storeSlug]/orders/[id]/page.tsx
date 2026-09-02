@@ -27,10 +27,10 @@ export const metadata: Metadata = { title: "Order" };
 export default async function OrderDetailPage({
   params,
 }: {
-  params: Promise<{ id: string }>;
+  params: Promise<{ storeSlug: string; id: string }>;
 }) {
-  const { tenantId, role } = await requireAdminContext();
-  const { id } = await params;
+  const { storeSlug, id } = await params;
+  const { tenantId, role } = await requireAdminContext(storeSlug);
 
   // Awaited directly (not wrapped in Suspense) and this segment has no
   // `loading.tsx`, so `notFound()` yields a real 404 — a streamed boundary would
@@ -46,7 +46,7 @@ export default async function OrderDetailPage({
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-10">
       <div className="flex flex-col gap-2">
         <Link
-          href="/admin/orders"
+          href={`/admin/${storeSlug}/orders`}
           className="text-muted-foreground hover:text-foreground inline-flex w-fit items-center gap-1 text-sm font-medium"
         >
           <ArrowLeft className="size-4" />
@@ -67,6 +67,7 @@ export default async function OrderDetailPage({
             </p>
           </div>
           <OrderActions
+            storeSlug={storeSlug}
             orderId={order.id}
             status={status}
             oversold={order.oversold}

@@ -14,15 +14,20 @@ const EMPTY_PRODUCT: ProductFormValues = {
   variants: [{ sku: "", name: "", price: "", stock: "0" }],
 };
 
-export default async function NewProductPage() {
-  // The /admin layout already gates access; re-resolve the tenant (cached) for
+export default async function NewProductPage({
+  params,
+}: {
+  params: Promise<{ storeSlug: string }>;
+}) {
+  const { storeSlug } = await params;
+  // The admin layout already gates access; re-resolve the tenant (cached) for
   // its currency, which the form shows read-only.
-  const { currency } = await requireAdminContext();
+  const { currency } = await requireAdminContext(storeSlug);
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 px-6 py-10">
       <div className="flex flex-col gap-2">
         <Link
-          href="/admin/products"
+          href={`/admin/${storeSlug}/products`}
           className="text-muted-foreground hover:text-foreground inline-flex w-fit items-center gap-1 text-sm font-medium"
         >
           <ArrowLeft className="size-4" />
@@ -32,6 +37,7 @@ export default async function NewProductPage() {
       </div>
       <ProductForm
         mode="create"
+        storeSlug={storeSlug}
         initialValues={EMPTY_PRODUCT}
         storeCurrency={currency}
       />

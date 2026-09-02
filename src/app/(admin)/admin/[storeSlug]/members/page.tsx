@@ -20,10 +20,15 @@ export const metadata: Metadata = { title: "Members" };
 // Rendered server-side only, so a fixed locale keeps the "Added" column stable.
 const dateFormatter = new Intl.DateTimeFormat("en-US", { dateStyle: "medium" });
 
-export default async function MembersPage() {
-  // OWNER-only: a member below OWNER is redirected to /admin. This is the
-  // security boundary — the hidden nav link is just UX.
-  const { tenantId, userId } = await requireRole(ROLES.OWNER);
+export default async function MembersPage({
+  params,
+}: {
+  params: Promise<{ storeSlug: string }>;
+}) {
+  const { storeSlug } = await params;
+  // OWNER-only: a member below OWNER is redirected to this store's dashboard.
+  // This is the security boundary — the hidden nav link is just UX.
+  const { tenantId, userId } = await requireRole(storeSlug, ROLES.OWNER);
   const members = await membershipService.listMembers(tenantId);
   const ownerCount = members.filter((m) => m.role === "OWNER").length;
 
@@ -36,7 +41,7 @@ export default async function MembersPage() {
         </p>
       </div>
 
-      <AddMemberForm />
+      <AddMemberForm storeSlug={storeSlug} />
 
       <Card className="py-0">
         <Table>
@@ -85,6 +90,7 @@ export default async function MembersPage() {
                   </TableCell>
                   <TableCell>
                     <MemberRoleSelect
+                      storeSlug={storeSlug}
                       userId={m.userId}
                       role={m.role}
                       disabled={Boolean(roleDisabledReason)}
@@ -96,6 +102,7 @@ export default async function MembersPage() {
                   </TableCell>
                   <TableCell className="text-right">
                     <RemoveMemberButton
+                      storeSlug={storeSlug}
                       userId={m.userId}
                       memberName={m.user.name}
                       disabled={Boolean(removeDisabledReason)}

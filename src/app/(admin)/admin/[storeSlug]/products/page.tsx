@@ -45,9 +45,15 @@ function priceRange(
     : `${formatMoney(min, currency)} – ${formatMoney(max, currency)}`;
 }
 
-export default async function ProductsPage() {
-  const { tenantId, currency } = await requireAdminContext();
+export default async function ProductsPage({
+  params,
+}: {
+  params: Promise<{ storeSlug: string }>;
+}) {
+  const { storeSlug } = await params;
+  const { tenantId, currency } = await requireAdminContext(storeSlug);
   const products = await catalogService.getAdminProducts(tenantId);
+  const base = `/admin/${storeSlug}`;
 
   return (
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-6 py-10">
@@ -58,7 +64,7 @@ export default async function ProductsPage() {
             Manage your catalog and variants.
           </p>
         </div>
-        <Link href="/admin/products/new" className={buttonVariants()}>
+        <Link href={`${base}/products/new`} className={buttonVariants()}>
           <Plus />
           New product
         </Link>
@@ -75,7 +81,7 @@ export default async function ProductsPage() {
               </p>
             </div>
             <Link
-              href="/admin/products/new"
+              href={`${base}/products/new`}
               className={buttonVariants({ variant: "outline", size: "sm" })}
             >
               <Plus />
@@ -119,7 +125,7 @@ export default async function ProductsPage() {
                   </TableCell>
                   <TableCell className="text-right">
                     <Link
-                      href={`/admin/products/${product.id}`}
+                      href={`${base}/products/${product.id}`}
                       className={buttonVariants({
                         variant: "outline",
                         size: "sm",

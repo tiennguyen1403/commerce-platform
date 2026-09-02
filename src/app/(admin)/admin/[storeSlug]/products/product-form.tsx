@@ -67,6 +67,8 @@ export type ProductFormValues = {
 
 type ProductFormProps = {
   mode: "create" | "edit";
+  /** The active store's slug — scopes the action calls and post-save redirect. */
+  storeSlug: string;
   productId?: string;
   initialValues: ProductFormValues;
   /** The store's currency (`Tenant.currency`); every variant price is in it. */
@@ -100,6 +102,7 @@ function emptyVariant(key: string): VariantRow {
 
 export function ProductForm({
   mode,
+  storeSlug,
   productId,
   initialValues,
   storeCurrency,
@@ -224,11 +227,11 @@ export function ProductForm({
     startTransition(async () => {
       const result: ActionResult =
         mode === "edit" && productId
-          ? await updateProductAction(productId, parsed.data)
-          : await createProductAction(parsed.data);
+          ? await updateProductAction(storeSlug, productId, parsed.data)
+          : await createProductAction(storeSlug, parsed.data);
 
       if (result.ok) {
-        router.push("/admin/products");
+        router.push(`/admin/${storeSlug}/products`);
         router.refresh();
         return;
       }
@@ -503,7 +506,7 @@ export function ProductForm({
         <Button
           variant="ghost"
           nativeButton={false}
-          render={<Link href="/admin/products" />}
+          render={<Link href={`/admin/${storeSlug}/products`} />}
         >
           Cancel
         </Button>

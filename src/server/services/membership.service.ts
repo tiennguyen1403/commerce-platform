@@ -30,6 +30,13 @@ export const membershipService = {
     return membershipRepository.listByTenant(tenantId);
   },
 
+  /** The stores a user belongs to (role + tenant slug/name), for the `/admin`
+   *  store index/switcher. Scoped by the user's own memberships — the one
+   *  deliberately cross-tenant read (see the repository). */
+  listStoresForUser(userId: string) {
+    return membershipRepository.listForUser(userId);
+  },
+
   /**
    * Add an *existing* account to the tenant by email. Never creates the login:
    * an admin request calling `auth.api.signUpEmail` would overwrite the owner's

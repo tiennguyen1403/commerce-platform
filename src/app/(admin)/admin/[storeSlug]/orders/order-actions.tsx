@@ -43,11 +43,13 @@ import {
  * available actions appear.
  */
 export function OrderActions({
+  storeSlug,
   orderId,
   status,
   oversold,
   canRefund,
 }: {
+  storeSlug: string;
   orderId: string;
   status: OrderStatusValue;
   oversold: boolean;
@@ -77,7 +79,7 @@ export function OrderActions({
           dismissLabel="Keep order"
           confirmLabel="Cancel order"
           confirmVariant="destructive"
-          action={() => cancelOrderAction(orderId)}
+          action={() => cancelOrderAction(storeSlug, orderId)}
         />
       ) : null}
 
@@ -107,7 +109,7 @@ export function OrderActions({
           }
           confirmLabel="Mark fulfilled"
           confirmVariant="default"
-          action={() => fulfillOrderAction(orderId)}
+          action={() => fulfillOrderAction(storeSlug, orderId)}
         />
       ) : null}
 
@@ -120,7 +122,7 @@ export function OrderActions({
           description="Starts a full refund through Stripe. Once Stripe confirms the money was returned, the order moves to Refunded. Refunds can't be undone."
           confirmLabel="Refund order"
           confirmVariant="destructive"
-          action={() => refundOrderAction(orderId)}
+          action={() => refundOrderAction(storeSlug, orderId)}
         />
       ) : null}
     </div>

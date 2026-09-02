@@ -37,7 +37,7 @@ type FormErrors = MemberFieldErrors & { form?: string };
  * the owner's session), so an unknown email comes back as a field error asking
  * the owner to have them sign up first.
  */
-export function AddMemberForm() {
+export function AddMemberForm({ storeSlug }: { storeSlug: string }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [email, setEmail] = useState("");
@@ -63,7 +63,7 @@ export function AddMemberForm() {
 
     setErrors({});
     startTransition(async () => {
-      const result = await addMemberAction(parsed.data);
+      const result = await addMemberAction(storeSlug, parsed.data);
       if (result.ok) {
         setDone(`Added ${parsed.data.email}.`);
         setEmail("");

@@ -7,8 +7,9 @@
  * reserved word — so it doubles as the local-dev/test host fallback: when the
  * platform is served from `localhost`, a bare loopback host (no subdomain)
  * resolves here (`src/proxy.ts`), keeping `pnpm dev` and the Playwright suite
- * working without real subdomains. The admin still hard-codes it too, until
- * `/admin/[storeSlug]` path-scopes that lookup (a later M3 issue).
+ * working without real subdomains. The admin no longer references it — it
+ * resolves the store from the `/admin/[storeSlug]` URL — so this is now only the
+ * storefront localhost fallback plus the seed's slug.
  */
 export const DEMO_TENANT_SLUG = "demo";
 
