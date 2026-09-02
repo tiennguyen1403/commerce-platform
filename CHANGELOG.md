@@ -2,11 +2,60 @@
 
 Notable changes to this project, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 style. Versions tag milestone releases (`vM<n>`), not semver — see
-[`docs/milestones/README.md`](docs/milestones/README.md) for the process and
+[`docs/milestones/README.md`](docs/milestones/README.md) for the process,
 [`docs/milestones/M1-commerce-slice/handoff.md`](docs/milestones/M1-commerce-slice/handoff.md)
-for the full M1 writeup.
+for the full M1 writeup, and
+[`docs/milestones/M2-production-grade/handoff.md`](docs/milestones/M2-production-grade/handoff.md)
+for the full M2 writeup.
 
 ## [Unreleased]
+
+## [vM2] — production-grade — 2026-09-02
+
+Hardens the store for real operation: automated tests running in CI on every change,
+real observability, reliable order-confirmation email, inventory held at checkout, and
+a complete order lifecycle — an admin can now fulfil, cancel, and refund an order, not
+just watch it become paid.
+
+### Added
+
+- Admin order management: view all orders (filterable by status), mark an order
+  fulfilled, cancel a pending order, and issue a refund.
+- Store members page (owner-only): add an existing user to help run the store, change
+  their role, or remove them — the store's last owner can't be demoted or removed.
+- Store settings page (owner-only): change the store's currency.
+- A lean overview on the admin home page: revenue, order counts by status, low-stock
+  items, and recent orders.
+- A background job (via GitHub Actions and Vercel Cron) that automatically retries a
+  failed order-confirmation email and cleans up checkouts a shopper abandoned partway
+  through.
+- Structured application logging, an error-alerting hook, and a real health-check
+  endpoint suitable for uptime monitoring.
+- An automated test suite (unit, service, database, and full end-to-end browser tests)
+  that runs in CI on every change.
+- The Stripe payment form now follows the site's light/dark theme instead of Stripe's
+  default styling.
+
+### Changed
+
+- Inventory is now reserved the moment a shopper starts checkout, not just decremented
+  after payment — two shoppers can no longer both "buy" the last unit of something.
+- A shopper who resubmits the same cart (after an error, or navigating back) reuses
+  their in-flight payment instead of starting a duplicate one; checkouts abandoned for
+  more than 30 minutes are automatically released.
+- Order-confirmation email now retries automatically instead of being sent once and
+  forgotten; leaving the email service unconfigured no longer prevents the app from
+  starting — checkout still works, only the email is skipped.
+- Every privileged admin action is now checked against the signed-in user's role on
+  the server, not just hidden from the menu.
+
+### Fixed
+
+- Cancelling a pending order now also cancels its payment at Stripe, so a shopper can
+  no longer complete a payment against an order that was just cancelled.
+- A pre-existing migration that could break deployment onto a non-empty database is
+  now caught automatically, and every new migration is checked the same way going
+  forward.
 
 ## [vM1] — commerce-slice — 2026-09-01
 
@@ -44,5 +93,6 @@ Stripe test-mode purchase; an admin manages the catalog behind auth.
   details — it verifies against the live Stripe payment first, closing an
   information-disclosure gap.
 
-[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM1...HEAD
+[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM2...HEAD
+[vm2]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM2
 [vm1]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM1

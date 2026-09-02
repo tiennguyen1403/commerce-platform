@@ -101,5 +101,43 @@ AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
   the fix is prevention: `pnpm db:check-migrations` scans migration SQL in CI and blocks the
   pattern. The pre-existing `account_issuer` case is grandfathered with a documented
   corrective path (`docs/DATABASE.md`, issue #38).
+- **Transactional outbox for order-confirmation email, not a direct send from the
+  webhook** (M2) — the PENDING → PAID transaction only enqueues an `OutboxMessage`; a
+  scheduled drain (with retry/backoff) does the actual send. Delivery is now
+  at-least-once instead of at-most-once, and the webhook keeps no blocking network
+  call on its response path.
+- **Inventory reservation supersedes M1's decrement-at-capture** (M2) — stock is held
+  (`ProductVariant.reserved`) at PENDING via an atomic `$executeRaw` guard, released on
+  cancel/sweep, and reconciled at PAID; `available = stock - reserved` is now the one
+  sellable-units figure every read uses. Oversell at PAID is still possible (rare, not
+  eliminated) and stays surfaced, not blocked.
+- **Order state machine completed: fulfil, cancel, refund** (M2) — PAID → FULFILLED is
+  a manual status attestation only (no fulfilment provider or shipping address until
+  M4); PENDING → CANCELLED retires the Stripe PaymentIntent first and flips the DB
+  only once it's provably `canceled` (a primitive shared by the abandoned-order sweep
+  and the admin cancel action); PAID|FULFILLED → REFUNDED is driven exclusively by the
+  Stripe refund webhook — admin-initiated refunds never write the DB directly.
+- **RBAC surfaced via `requireRole` (pages, redirects) / `assertRole` (Server Actions,
+  throws)** (M2) — server-side defense-in-depth on top of role-aware nav, which is UX
+  only. `OWNER > ADMIN > STAFF`; last-owner demotion/removal is guarded by a
+  `SELECT … FOR UPDATE` on the tenant's OWNER rows inside one transaction.
+- **No Sentry; a thin, swappable `reportError` seam instead** (M2) — `@sentry/nextjs`
+  10.38+ crashes in production under Next 16 + Turbopack
+  (`getsentry/sentry-javascript#19367`, closed "not planned"). Structured logging is a
+  bare `pino()` with no transport, since `pino.transport()`'s worker thread crashes
+  under Turbopack too (`vercel/next.js#84766`).
+- **Background/periodic work: GitHub Actions `schedule:` (primary) + Vercel Cron
+  (backstop)** (M2) — both hit secret-protected `GET /api/cron/*` routes. Vercel
+  Hobby cron is capped at once/day (too coarse for the outbox drain/order sweep); GH
+  Actions runs every 10 minutes but auto-disables after 60 days of repo inactivity,
+  which Vercel Cron covers. `CRON_SECRET` is deliberately outside `env.ts`'s strict
+  schema so a missing secret only 401s the cron routes, never blocks boot.
+- **`server-only` applied blanket-wide across the db → repository → service layer and
+  `auth/index`** (M2) — defense-in-depth so a refactor can never accidentally pull
+  server internals into a client bundle.
+- **Three-tier Vitest split by filename, not by folder** (M2) — `*.test.ts` (unit,
+  mocked repos, zero infra), `*.test.tsx` (dom), `*.integration.test.ts` (real
+  Postgres, run serial, throwaway-tenant isolation). `server-only` is aliased to a
+  no-op only inside the test runner, never in the real build.
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).
