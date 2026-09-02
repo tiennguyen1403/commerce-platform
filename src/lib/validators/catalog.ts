@@ -30,8 +30,10 @@ export const CURRENCY_LABELS: Record<CurrencyValue, string> = {
   gbp: "GBP",
 };
 
-// Lowercase words joined by single hyphens, e.g. "classic-tee".
-const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+// Lowercase words joined by single hyphens, e.g. "classic-tee". Exported and
+// reused by store-slug (subdomain) onboarding validation — one shape rule for
+// every user-facing slug in the app, never redefined.
+export const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 // Ceilings that keep an obviously-bad value (a typo, a tampered payload) out of
 // the database without getting in a real admin's way. $1,000,000 max price.

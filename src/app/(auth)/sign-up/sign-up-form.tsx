@@ -17,7 +17,7 @@ const schema = z.object({
     .min(8, { error: "Password must be at least 8 characters." }),
 });
 
-export function SignUpForm() {
+export function SignUpForm({ redirectTo }: { redirectTo: string }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -49,8 +49,10 @@ export function SignUpForm() {
       return;
     }
 
-    // A fresh account has no admin membership yet, so land on the storefront.
-    router.push("/");
+    // A fresh account has no store yet, so this is the storefront by default —
+    // unless the visitor came to create one (e.g. from `/new`), in which case
+    // `redirectTo` sends them there to finish onboarding.
+    router.push(redirectTo);
     router.refresh();
   }
 
