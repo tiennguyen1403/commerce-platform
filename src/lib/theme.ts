@@ -33,6 +33,27 @@ export const DEFAULT_THEME_HUE = 162;
 export const TENANT_THEME_SELECTOR = "[data-tenant-theme]";
 
 /**
+ * Marker attribute a storefront overlay stamps on its *portaled* surface so the
+ * injected theme CSS still reaches it (#113). CSS custom properties inherit down
+ * the DOM tree, so an overlay rendered through a portal to `document.body` — e.g.
+ * `SelectContent` (`src/components/ui/select.tsx`) — escapes
+ * {@link TENANT_THEME_SELECTOR} and would fall back to the `:root` platform
+ * accent. {@link tenantThemeCss} re-emits the accent recipe for
+ * {@link TENANT_THEME_PORTAL_SELECTOR} alongside the wrapper; the rule is
+ * document-wide, but it exists *only while the storefront `<style>` is mounted* —
+ * never in the `(admin)`/`(auth)` trees — so the #98 isolation holds. `select.tsx`
+ * stamps this exact constant, so the marker and the CSS can never drift; any
+ * future storefront overlay portaled to `<body>` (dialog, popover, toast) should
+ * stamp it too. Deliberately distinct from the wrapper attribute: checkout locates
+ * the wrapper via `querySelector(TENANT_THEME_SELECTOR)`, which must never match an
+ * overlay.
+ */
+export const TENANT_THEME_PORTAL_ATTR = "data-tenant-theme-portal";
+
+/** CSS-selector form of {@link TENANT_THEME_PORTAL_ATTR}, targeted by {@link tenantThemeCss}. */
+export const TENANT_THEME_PORTAL_SELECTOR = `[${TENANT_THEME_PORTAL_ATTR}]`;
+
+/**
  * A valid OKLCH hue: an integer degree in [0, 359]. This is the CSS-injection
  * boundary — only a bare integer can reach the interpolated `oklch()` string —
  * and it rejects out-of-range/non-integer values (NaN included, via `.int()`) so
@@ -91,17 +112,23 @@ function declarations(
 
 /**
  * Build the scoped `<style>` body that re-themes the storefront to `hue`. Emits
- * the light recipe on the wrapper and the dark recipe inside the same
- * `prefers-color-scheme: dark` media query `globals.css` uses, so the wrapper's
- * accent follows the OS scheme exactly like the base tokens do. `hue` is
- * validated here (the interpolation boundary), so any caller value is safe.
+ * the light recipe and, inside the same `prefers-color-scheme: dark` media query
+ * `globals.css` uses, the dark recipe — so the accent follows the OS scheme
+ * exactly like the base tokens do — for two selectors: the in-flow wrapper
+ * ({@link TENANT_THEME_SELECTOR}) and any overlay portaled out of it
+ * ({@link TENANT_THEME_PORTAL_SELECTOR}, #113). `hue` is validated here (the
+ * interpolation boundary), so any caller value is safe.
  */
 export function tenantThemeCss(hue: number): string {
   const safe = resolveThemeHue(hue);
+  // Theme the in-flow wrapper and any overlay portaled out of it (#113) from the
+  // one recipe. The portal selector is document-wide, but this rule lives only in
+  // the storefront subtree's <style>, so it never reaches (admin)/(auth).
+  const scope = `${TENANT_THEME_SELECTOR},${TENANT_THEME_PORTAL_SELECTOR}`;
   return (
-    `${TENANT_THEME_SELECTOR}{${declarations(TOKEN_RECIPE.light, safe)}}\n` +
+    `${scope}{${declarations(TOKEN_RECIPE.light, safe)}}\n` +
     `@media (prefers-color-scheme:dark){` +
-    `${TENANT_THEME_SELECTOR}{${declarations(TOKEN_RECIPE.dark, safe)}}}`
+    `${scope}{${declarations(TOKEN_RECIPE.dark, safe)}}}`
   );
 }
 
