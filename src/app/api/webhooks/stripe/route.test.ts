@@ -286,6 +286,9 @@ describe("payment_intent.succeeded → handlePaymentIntentSucceeded", () => {
     const response = await POST(webhookRequest());
 
     expect(response.status).toBe(200);
+    // The PAID info line still fires — the OVERSELL alert is *in addition to*
+    // it (route.ts logs both), not instead of it.
+    expect(logInfo).toHaveBeenCalledTimes(1);
     expect(logError).toHaveBeenCalledTimes(1); // OVERSELL alert
     expect(dispatch).toHaveBeenCalledWith(TENANT, "order_1");
   });
@@ -329,7 +332,10 @@ describe("payment_intent.succeeded → handlePaymentIntentSucceeded", () => {
 describe("refund.* → handleRefundEvent", () => {
   it("ignores a dashboard-initiated refund with no tenantId metadata", async () => {
     constructEvent.mockReturnValue(
-      stripeEvent("refund.updated", refund({ status: "succeeded", tenantId: null })),
+      stripeEvent(
+        "refund.updated",
+        refund({ status: "succeeded", tenantId: null }),
+      ),
     );
 
     const response = await POST(webhookRequest());
@@ -343,6 +349,33 @@ describe("refund.* → handleRefundEvent", () => {
     constructEvent.mockReturnValue(
       stripeEvent(
         "refund.failed",
+        refund({
+          status: "failed",
+          tenantId: TENANT,
+          orderId: "order_1",
+          failureReason: "declined",
+        }),
+      ),
+    );
+
+    const response = await POST(webhookRequest());
+
+    expect(response.status).toBe(200);
+    expect(markRefunded).not.toHaveBeenCalled();
+    expect(logError).toHaveBeenCalledTimes(1);
+    // Error-only: a failed refund is an alert, not an info/warn no-op.
+    expect(logInfo).not.toHaveBeenCalled();
+    expect(logWarn).not.toHaveBeenCalled();
+  });
+
+  it("branches on refund.status, not the event name (refund.created + status=failed still alerts)", async () => {
+    // The route deliberately switches on `refund.status`, not the event name —
+    // all three refund.* types funnel through one handler (route.ts:261-265).
+    // Pin it: a `refund.created` whose status is `failed` must take the failed
+    // (alert-only) branch, which a refactor keying off the event name would miss.
+    constructEvent.mockReturnValue(
+      stripeEvent(
+        "refund.created",
         refund({
           status: "failed",
           tenantId: TENANT,
@@ -434,7 +467,11 @@ describe("refund.* → handleRefundEvent", () => {
     constructEvent.mockReturnValue(
       stripeEvent(
         "refund.updated",
-        refund({ status: "succeeded", tenantId: TENANT, paymentIntent: "pi_1" }),
+        refund({
+          status: "succeeded",
+          tenantId: TENANT,
+          paymentIntent: "pi_1",
+        }),
       ),
     );
     markRefunded.mockResolvedValue({
@@ -453,7 +490,11 @@ describe("refund.* → handleRefundEvent", () => {
     constructEvent.mockReturnValue(
       stripeEvent(
         "refund.updated",
-        refund({ status: "succeeded", tenantId: TENANT, paymentIntent: "pi_1" }),
+        refund({
+          status: "succeeded",
+          tenantId: TENANT,
+          paymentIntent: "pi_1",
+        }),
       ),
     );
     markRefunded.mockResolvedValue({
@@ -472,7 +513,11 @@ describe("refund.* → handleRefundEvent", () => {
     constructEvent.mockReturnValue(
       stripeEvent(
         "refund.updated",
-        refund({ status: "succeeded", tenantId: TENANT, paymentIntent: "pi_1" }),
+        refund({
+          status: "succeeded",
+          tenantId: TENANT,
+          paymentIntent: "pi_1",
+        }),
       ),
     );
     markRefunded.mockResolvedValue({ outcome: "no-order" });
