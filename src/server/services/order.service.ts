@@ -527,6 +527,7 @@ export const orderService = {
     lines: CartLine[],
     email: string,
     currency: string,
+    userId: string | null,
   ): Promise<StartCheckoutResult> {
     const cart = await cartService.getCartView(tenantId, lines, currency);
     if (cart.items.length === 0) throw new EmptyCartError();
@@ -535,6 +536,9 @@ export const orderService = {
     // existing intent rather than minting a second PENDING order + chargeable
     // PaymentIntent (and a second inventory hold). A miss just falls through to a
     // fresh create; the sweep below is the safety net for anything left abandoned.
+    // Reuse still matches on email alone here; binding it to the session `userId`
+    // (so a guest email can't reuse a signed-in shopper's order) is #92's seam —
+    // the fresh create below already records `userId` on new orders.
     const reused = await tryReuseInFlightIntent(tenantId, email, cart);
     if (reused) return reused;
 
@@ -573,6 +577,10 @@ export const orderService = {
         id: orderId,
         tenantId,
         email,
+        // Server-resolved from the session at the action boundary, threaded down
+        // — never client-supplied. Links a signed-in shopper's order to their
+        // global `User`; a guest's stays null (#102).
+        userId,
         totalCents: cart.totalCents,
         currency: cart.currency,
         stripePaymentIntentId: paymentIntent.id,

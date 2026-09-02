@@ -34,8 +34,29 @@ async function freshTenant() {
   return tenant;
 }
 
+// `User` is platform-wide (not tenant-scoped), so `deleteTenantDeep` never
+// touches it — track and clean up any test-seeded shopper separately.
+const userIds: string[] = [];
+/** Seed a minimal global shopper `User` row (id/name/email are its only
+ *  required fields) for a `userId`-linkage test. */
+async function freshUser() {
+  const user = await prisma.user.create({
+    data: {
+      id: uniqueId("user"),
+      name: "Test Shopper",
+      email: `${uniqueId("shopper")}@example.com`,
+    },
+  });
+  userIds.push(user.id);
+  return user;
+}
+
 afterEach(async () => {
   await Promise.all(tenantIds.splice(0).map(deleteTenantDeep));
+  // Orders referencing these users are already gone via deleteTenantDeep above
+  // (Order.user is onDelete: SetNull, but the row itself is deleted, not
+  // de-linked), so this is a plain, unconstrained delete.
+  await prisma.user.deleteMany({ where: { id: { in: userIds.splice(0) } } });
 });
 
 afterAll(async () => {
@@ -157,6 +178,7 @@ function orderInput(
     id?: string;
     orderNumber?: string;
     stripePaymentIntentId?: string;
+    userId?: string | null;
   } = {},
 ): CreateOrderInput {
   return {
@@ -164,6 +186,7 @@ function orderInput(
     tenantId,
     orderNumber: overrides.orderNumber ?? uniqueId("order"),
     email: "shopper@example.com",
+    userId: overrides.userId ?? null,
     totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
     currency: "usd",
     stripePaymentIntentId: overrides.stripePaymentIntentId ?? uniqueId("pi"),
@@ -705,6 +728,36 @@ describe("orderRepository.createWithItems (reservation, integration)", () => {
       where: { id: variant.id },
     });
     expect(afterRetry.reserved).toBe(2);
+  });
+
+  it("persists the signed-in shopper's userId, and defaults to null for a guest (#102)", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 10 });
+    const shopper = await freshUser();
+
+    const linked = await orderRepository.createWithItems(
+      orderInput(
+        tenant.id,
+        [{ variantId: variant.id, qty: 1, priceCents: 1000 }],
+        { userId: shopper.id },
+      ),
+    );
+    const persistedLinked = await prisma.order.findUniqueOrThrow({
+      where: { id: linked.id },
+    });
+    expect(persistedLinked.userId).toBe(shopper.id);
+
+    // Guest checkout: the default `orderInput` (no override) must persist a real
+    // null, not leave the column undefined/omitted.
+    const guestOrder = await orderRepository.createWithItems(
+      orderInput(tenant.id, [
+        { variantId: variant.id, qty: 1, priceCents: 1000 },
+      ]),
+    );
+    const persistedGuest = await prisma.order.findUniqueOrThrow({
+      where: { id: guestOrder.id },
+    });
+    expect(persistedGuest.userId).toBeNull();
   });
 });
 

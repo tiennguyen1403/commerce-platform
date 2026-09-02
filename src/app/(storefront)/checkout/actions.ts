@@ -1,6 +1,7 @@
 "use server";
 
 import { getStoreTenant } from "@/server/store-context";
+import { getShopperSession } from "@/server/auth/shopper-context";
 import { readCart } from "@/server/cart-cookie";
 import {
   orderService,
@@ -33,6 +34,11 @@ export async function startCheckoutAction(input: {
 
   const { tenantId, currency: storeCurrency } = await getStoreTenant();
   const lines = await readCart();
+  // Link the order to the signed-in shopper, resolved server-side from the
+  // session — a guest's `userId` stays null. Never taken from the client: this
+  // action's only input is the email (`checkoutInputSchema`).
+  const session = await getShopperSession();
+  const userId = session?.user.id ?? null;
 
   try {
     const { clientSecret, totalCents, currency } =
@@ -41,6 +47,7 @@ export async function startCheckoutAction(input: {
         lines,
         parsed.data.email,
         storeCurrency,
+        userId,
       );
     return { ok: true, clientSecret, totalCents, currency };
   } catch (err) {
