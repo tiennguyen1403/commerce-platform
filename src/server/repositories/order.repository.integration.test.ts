@@ -129,9 +129,10 @@ async function seedPendingOrder(
 }
 
 /** Seed an order in any status (with optional lines and an explicit `createdAt`
- *  for ordering tests). `email`/`currency`/`totalCents` are overridable so the
- *  reuse-candidate filter suite can vary them independently of the lines. Used by
- *  the lifecycle, list, sweep, and reuse suites below. */
+ *  for ordering tests). `email`/`currency`/`totalCents`/`userId` are overridable so
+ *  the reuse-candidate filter suite can vary them independently of the lines
+ *  (`userId` defaults to null — a guest order). Used by the lifecycle, list, sweep,
+ *  and reuse suites below. */
 async function seedOrder(
   tenantId: string,
   opts: {
@@ -142,6 +143,7 @@ async function seedOrder(
     email?: string;
     currency?: string;
     totalCents?: number;
+    userId?: string | null;
   } = {},
 ) {
   const lines = opts.lines ?? [];
@@ -151,6 +153,7 @@ async function seedOrder(
       orderNumber: uniqueId("order"),
       status: opts.status ?? "PENDING",
       email: opts.email ?? "shopper@example.com",
+      userId: opts.userId ?? null,
       totalCents:
         opts.totalCents ??
         lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
@@ -1414,9 +1417,21 @@ describe("orderRepository.findStalePending (integration)", () => {
 describe("orderRepository.findReusablePendingCandidates (integration)", () => {
   const EMAIL = "reuse-shopper@example.com";
   const recent = () => new Date(Date.now() - 60_000); // 1 min ago (inside window)
+  // The default query is a *guest* read (`userId: null` + email) — the identity
+  // arm the pre-#92 tests exercised. Authenticated reads pass `{ userId }` instead.
   const query = (tenantId: string) => ({
     tenantId,
+    userId: null,
     email: EMAIL,
+    totalCents: 3000,
+    currency: "usd",
+    createdAfter: new Date(Date.now() - 15 * 60_000),
+    limit: 5,
+  });
+  // An *authenticated* read: keyed on the session-proven userId, carrying no email.
+  const authQuery = (tenantId: string, userId: string) => ({
+    tenantId,
+    userId,
     totalCents: 3000,
     currency: "usd",
     createdAfter: new Date(Date.now() - 15 * 60_000),
@@ -1548,5 +1563,92 @@ describe("orderRepository.findReusablePendingCandidates (integration)", () => {
       limit: 2,
     });
     expect(found).toHaveLength(2);
+  });
+
+  // --- Identity binding (#92) -------------------------------------------------
+  // The reuse read closes a guest-checkout hole: a client-supplied email must not
+  // hand back a signed-in shopper's in-flight PaymentIntent. Authenticated reuse
+  // binds to the session-proven userId; guest reuse is pinned to userId:null.
+
+  it("matches an authenticated shopper on userId, ignoring the order's email (#92)", async () => {
+    const t = await freshTenant();
+    const shopper = await freshUser();
+    const variant = await seedVariant(t.id, { stock: 10, priceCents: 1500 });
+    const o = await seedOrder(t.id, {
+      userId: shopper.id,
+      // Whatever email happened to be on the order — an authenticated read never
+      // filters on it, so it must not affect the match.
+      email: "typed-something-else@example.com",
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+      lines: [{ variantId: variant.id, qty: 2, priceCents: 1500 }],
+    });
+
+    const found = await orderRepository.findReusablePendingCandidates(
+      authQuery(t.id, shopper.id),
+    );
+
+    expect(found.map((x) => x.id)).toEqual([o.id]);
+    expect(found[0].items).toHaveLength(1);
+  });
+
+  it("never lets a guest email match a signed-in shopper's in-flight order (#92)", async () => {
+    const t = await freshTenant();
+    const victim = await freshUser();
+    // Alice (signed in) has a PENDING order; an attacker knows her email + cart.
+    await seedOrder(t.id, {
+      userId: victim.id,
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+
+    // A GUEST checkout with Alice's email + identical cart total. The guest read is
+    // pinned to userId:null, so Alice's userId-bound order is invisible — the exact
+    // hole #92 closes (pre-fix, this returned her order + its client secret).
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("does not match a different signed-in shopper's order (#92)", async () => {
+    const t = await freshTenant();
+    const alice = await freshUser();
+    const bob = await freshUser();
+    await seedOrder(t.id, {
+      userId: alice.id,
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+
+    // Bob's authenticated read must not pick up Alice's order.
+    expect(
+      await orderRepository.findReusablePendingCandidates(
+        authQuery(t.id, bob.id),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("an authenticated read does not pick up a guest (userId-null) order (#92)", async () => {
+    const t = await freshTenant();
+    const shopper = await freshUser();
+    // A guest order (userId null) with an otherwise-matching email/total/currency.
+    await seedOrder(t.id, {
+      userId: null,
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+
+    expect(
+      await orderRepository.findReusablePendingCandidates(
+        authQuery(t.id, shopper.id),
+      ),
+    ).toHaveLength(0);
   });
 });

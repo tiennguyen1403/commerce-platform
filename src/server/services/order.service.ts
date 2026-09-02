@@ -254,27 +254,43 @@ function orderMatchesCart(order: OrderWithItems, cart: CartView): boolean {
  * shopper who submits, hits an error or *Back to cart*, then submits the same cart
  * again used to create a *second* PENDING order + chargeable-shaped PaymentIntent
  * (and a second inventory hold); this collapses that. Looks for a recent PENDING
- * order for this tenant+email whose currency, total, and line-set match the
- * freshly-repriced cart, then confirms the linked PaymentIntent is still awaiting
- * payment (and its amount/currency still match) before handing back its existing
- * client secret. Returns null — meaning "create a fresh intent" — on any miss: no
- * candidate, a line-set mismatch, an unreadable or non-reusable intent, or a
- * drifted amount. Price stays the security boundary: the match is against the
- * re-priced cart (`cart.totalCents`), never a stored total.
+ * order for this tenant + caller identity whose currency, total, and line-set match
+ * the freshly-repriced cart, then confirms the linked PaymentIntent is still
+ * awaiting payment (and its amount/currency still match) before handing back its
+ * existing client secret. Returns null — meaning "create a fresh intent" — on any
+ * miss: no candidate, a line-set mismatch, an unreadable or non-reusable intent, or
+ * a drifted amount.
+ *
+ * Identity is the security boundary for *who* may reuse an intent (#92): a signed-in
+ * shopper (`userId !== null`) is matched on the session-proven `userId` — never the
+ * client-supplied `email`, which anyone could type; a guest (`userId === null`) stays
+ * email-keyed but is pinned to `userId: null`, so a guest can't reuse a signed-in
+ * shopper's in-flight intent by supplying their email. Price stays the security
+ * boundary for *how much*: the match is against the re-priced cart
+ * (`cart.totalCents`), never a stored total.
  */
 async function tryReuseInFlightIntent(
   tenantId: string,
+  userId: string | null,
   email: string,
   cart: CartView,
 ): Promise<StartCheckoutResult | null> {
-  const candidates = await orderRepository.findReusablePendingCandidates({
+  const filters = {
     tenantId,
-    email,
     totalCents: cart.totalCents,
     currency: cart.currency,
     createdAfter: new Date(Date.now() - PENDING_REUSE_WINDOW_MS),
     limit: REUSE_CANDIDATE_LIMIT,
-  });
+  };
+  const candidates = await orderRepository.findReusablePendingCandidates(
+    // Bind reuse to identity (#92): an authenticated shopper matches on the
+    // session-proven `userId` (never the client-supplied email); a guest stays
+    // email-keyed but pinned to `userId: null`. Two complete literals, one per arm
+    // of the identity union, so the trust boundary holds at the type level too.
+    userId !== null
+      ? { ...filters, userId }
+      : { ...filters, userId: null, email },
+  );
 
   const stripe = getStripe();
   for (const candidate of candidates) {
@@ -536,10 +552,10 @@ export const orderService = {
     // existing intent rather than minting a second PENDING order + chargeable
     // PaymentIntent (and a second inventory hold). A miss just falls through to a
     // fresh create; the sweep below is the safety net for anything left abandoned.
-    // Reuse still matches on email alone here; binding it to the session `userId`
-    // (so a guest email can't reuse a signed-in shopper's order) is #92's seam —
-    // the fresh create below already records `userId` on new orders.
-    const reused = await tryReuseInFlightIntent(tenantId, email, cart);
+    // Reuse is bound to identity (#92): a signed-in shopper matches on the
+    // session-proven `userId`, a guest on `userId: null` + email — so a guest can't
+    // hand back a signed-in shopper's in-flight intent by typing their email.
+    const reused = await tryReuseInFlightIntent(tenantId, userId, email, cart);
     if (reused) return reused;
 
     const orderId = randomUUID();

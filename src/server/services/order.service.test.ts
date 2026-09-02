@@ -823,6 +823,55 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
     expect(createdAfter.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
+  it("binds an authenticated reuse to the session userId, never the typed email (#92)", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([]);
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+      "user_alice",
+    );
+
+    // The dedupe read is keyed on the session-proven userId; the client-supplied
+    // email is NOT part of an authenticated match, so it can't widen who an
+    // in-flight intent may be handed back to (the crux of #92).
+    const arg = findReusable.mock.calls[0][0];
+    expect(arg).toMatchObject({ tenantId: TENANT, userId: "user_alice" });
+    expect("email" in arg).toBe(false);
+  });
+
+  it("keeps a guest reuse email-keyed but pinned to userId:null (#92)", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([]);
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+      null,
+    );
+
+    // A guest carries userId:null in the WHERE — the pin that stops a guest email
+    // from matching a signed-in shopper's PENDING order — alongside the email.
+    expect(findReusable).toHaveBeenCalledWith(
+      expect.objectContaining({ tenantId: TENANT, userId: null, email: EMAIL }),
+    );
+  });
+
   it("creates fresh when there is no candidate to reuse", async () => {
     getCartView.mockResolvedValue(cartView());
     findReusable.mockResolvedValue([]);
