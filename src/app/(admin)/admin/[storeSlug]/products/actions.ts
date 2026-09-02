@@ -24,12 +24,12 @@ import { reportError } from "@/server/observability/error-reporter";
  * Server Actions are public endpoints, so the client-side checks are UX only.
  */
 
-function revalidateCatalog(slug?: string) {
+function revalidateCatalog(storeSlug: string, productSlug?: string) {
   // Admin pages are dynamic (they read the session), so this mostly matters for
   // the storefront routes that cache; harmless where a route doesn't exist yet.
-  revalidatePath("/admin/products");
+  revalidatePath(`/admin/${storeSlug}/products`);
   revalidatePath("/products");
-  if (slug) revalidatePath(`/products/${slug}`);
+  if (productSlug) revalidatePath(`/products/${productSlug}`);
 }
 
 /** Collapse zod issues to first-message-per-top-level-field for the form. */
@@ -65,9 +65,10 @@ async function mapWriteError(err: unknown): Promise<ActionResult> {
 }
 
 export async function createProductAction(
+  storeSlug: string,
   input: unknown,
 ): Promise<ActionResult> {
-  const { tenantId } = await requireAdminContext();
+  const { tenantId } = await requireAdminContext(storeSlug);
 
   const parsed = productInputSchema.safeParse(input);
   if (!parsed.success) {
@@ -76,7 +77,7 @@ export async function createProductAction(
 
   try {
     const product = await catalogService.createProduct(tenantId, parsed.data);
-    revalidateCatalog(product.slug);
+    revalidateCatalog(storeSlug, product.slug);
     return { ok: true, id: product.id };
   } catch (err) {
     return mapWriteError(err);
@@ -84,10 +85,11 @@ export async function createProductAction(
 }
 
 export async function updateProductAction(
+  storeSlug: string,
   id: string,
   input: unknown,
 ): Promise<ActionResult> {
-  const { tenantId } = await requireAdminContext();
+  const { tenantId } = await requireAdminContext(storeSlug);
   if (!id) return { ok: false, formError: "Missing product id." };
 
   const parsed = productInputSchema.safeParse(input);
@@ -101,15 +103,18 @@ export async function updateProductAction(
       id,
       parsed.data,
     );
-    revalidateCatalog(product.slug);
+    revalidateCatalog(storeSlug, product.slug);
     return { ok: true, id: product.id };
   } catch (err) {
     return mapWriteError(err);
   }
 }
 
-export async function archiveProductAction(id: string): Promise<ActionResult> {
-  const { tenantId } = await requireAdminContext();
+export async function archiveProductAction(
+  storeSlug: string,
+  id: string,
+): Promise<ActionResult> {
+  const { tenantId } = await requireAdminContext(storeSlug);
   if (!id) return { ok: false, formError: "Missing product id." };
 
   try {
@@ -117,6 +122,6 @@ export async function archiveProductAction(id: string): Promise<ActionResult> {
   } catch (err) {
     return mapWriteError(err);
   }
-  revalidateCatalog();
+  revalidateCatalog(storeSlug);
   return { ok: true, id };
 }

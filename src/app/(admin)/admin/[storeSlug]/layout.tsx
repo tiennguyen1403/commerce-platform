@@ -7,15 +7,20 @@ import { SignOutButton } from "./sign-out-button";
 
 export default async function AdminLayout({
   children,
+  params,
 }: {
   children: ReactNode;
+  params: Promise<{ storeSlug: string }>;
 }) {
-  // Gates the entire /admin subtree; also resolves the tenant context that
-  // child pages read via the same cached call.
-  const { tenantName, userEmail, role } = await requireAdminContext();
+  const { storeSlug } = await params;
+  // Gates the entire /admin/[storeSlug] subtree for THIS store; also resolves
+  // the tenant context that child pages read via the same cached call.
+  const { tenantName, userEmail, role } = await requireAdminContext(storeSlug);
   // Member management and store settings are OWNER-only. Hiding the links is
   // UX, not a security boundary — each page re-checks with `requireRole(OWNER)`.
   const isOwner = hasAtLeast(role, ROLES.OWNER);
+  // Every nav target is scoped to the active store.
+  const base = `/admin/${storeSlug}`;
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -23,7 +28,7 @@ export default async function AdminLayout({
         <div className="mx-auto flex w-full max-w-4xl items-center justify-between gap-4 px-6 py-4">
           <div className="flex items-center gap-6">
             <Link
-              href="/admin"
+              href={base}
               className="inline-flex items-center gap-2 font-semibold tracking-tight"
             >
               <Store className="text-primary size-5" />
@@ -34,13 +39,13 @@ export default async function AdminLayout({
             </Link>
             <nav className="flex items-center gap-4 text-sm">
               <Link
-                href="/admin/products"
+                href={`${base}/products`}
                 className="text-muted-foreground hover:text-foreground transition-colors"
               >
                 Products
               </Link>
               <Link
-                href="/admin/orders"
+                href={`${base}/orders`}
                 className="text-muted-foreground hover:text-foreground transition-colors"
               >
                 Orders
@@ -48,13 +53,13 @@ export default async function AdminLayout({
               {isOwner ? (
                 <>
                   <Link
-                    href="/admin/members"
+                    href={`${base}/members`}
                     className="text-muted-foreground hover:text-foreground transition-colors"
                   >
                     Members
                   </Link>
                   <Link
-                    href="/admin/settings"
+                    href={`${base}/settings`}
                     className="text-muted-foreground hover:text-foreground transition-colors"
                   >
                     Settings

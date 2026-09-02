@@ -29,10 +29,10 @@ async function mapOrderActionError(
   err: unknown,
   action: string,
 ): Promise<OrderActionResult> {
-  // `assertRole` → `requireAdminContext` can `redirect()` (session expired, no
-  // membership), a control-flow throw Next must handle. Re-throw those first so
-  // this catch never swallows a redirect into a generic message (or fires the
-  // error webhook for a non-error).
+  // `assertRole` → `requireAdminContext` can `redirect()` (no session) or
+  // `notFound()` (unknown store / non-member) — a control-flow throw Next must
+  // handle. Re-throw those first so this catch never swallows one into a generic
+  // message (or fires the error webhook for a non-error).
   unstable_rethrow(err);
 
   if (
@@ -51,20 +51,21 @@ async function mapOrderActionError(
 }
 
 /** Revalidate the order's detail page and the list after a transition. */
-function revalidateOrder(orderId: string) {
-  revalidatePath("/admin/orders");
-  revalidatePath(`/admin/orders/${orderId}`);
+function revalidateOrder(storeSlug: string, orderId: string) {
+  revalidatePath(`/admin/${storeSlug}/orders`);
+  revalidatePath(`/admin/${storeSlug}/orders/${orderId}`);
 }
 
 export async function cancelOrderAction(
+  storeSlug: string,
   orderId: string,
 ): Promise<OrderActionResult> {
   try {
-    const { tenantId } = await assertRole(ROLES.STAFF);
+    const { tenantId } = await assertRole(storeSlug, ROLES.STAFF);
     if (!orderId) return { ok: false, error: "Missing order." };
 
     await orderService.cancelOrder(tenantId, orderId);
-    revalidateOrder(orderId);
+    revalidateOrder(storeSlug, orderId);
     return { ok: true };
   } catch (err) {
     return mapOrderActionError(err, "order-cancel");
@@ -72,14 +73,15 @@ export async function cancelOrderAction(
 }
 
 export async function fulfillOrderAction(
+  storeSlug: string,
   orderId: string,
 ): Promise<OrderActionResult> {
   try {
-    const { tenantId } = await assertRole(ROLES.STAFF);
+    const { tenantId } = await assertRole(storeSlug, ROLES.STAFF);
     if (!orderId) return { ok: false, error: "Missing order." };
 
     await orderService.fulfillOrder(tenantId, orderId);
-    revalidateOrder(orderId);
+    revalidateOrder(storeSlug, orderId);
     return { ok: true };
   } catch (err) {
     return mapOrderActionError(err, "order-fulfill");
@@ -87,14 +89,15 @@ export async function fulfillOrderAction(
 }
 
 export async function refundOrderAction(
+  storeSlug: string,
   orderId: string,
 ): Promise<OrderActionResult> {
   try {
-    const { tenantId } = await assertRole(ROLES.ADMIN);
+    const { tenantId } = await assertRole(storeSlug, ROLES.ADMIN);
     if (!orderId) return { ok: false, error: "Missing order." };
 
     await orderService.refundOrder(tenantId, orderId);
-    revalidateOrder(orderId);
+    revalidateOrder(storeSlug, orderId);
     return { ok: true };
   } catch (err) {
     return mapOrderActionError(err, "order-refund");

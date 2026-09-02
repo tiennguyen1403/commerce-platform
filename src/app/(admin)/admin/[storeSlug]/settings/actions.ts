@@ -21,10 +21,10 @@ import { reportError } from "@/server/observability/error-reporter";
  */
 
 async function mapSettingsError(err: unknown): Promise<SettingsActionResult> {
-  // `assertRole` → `requireAdminContext` can `redirect()` (session expired, no
-  // membership), a control-flow throw Next must handle. Re-throw those first so
-  // this catch never swallows a redirect into a generic message (and never
-  // fires the error webhook for a non-error).
+  // `assertRole` → `requireAdminContext` can `redirect()` (no session) or
+  // `notFound()` (unknown store / non-member), a control-flow throw Next must
+  // handle. Re-throw those first so this catch never swallows one into a generic
+  // message (and never fires the error webhook for a non-error).
   unstable_rethrow(err);
 
   if (err instanceof InsufficientRoleError) {
@@ -38,10 +38,11 @@ async function mapSettingsError(err: unknown): Promise<SettingsActionResult> {
 }
 
 export async function updateStoreCurrencyAction(
+  storeSlug: string,
   input: unknown,
 ): Promise<SettingsActionResult> {
   try {
-    const { tenantId } = await assertRole(ROLES.OWNER);
+    const { tenantId } = await assertRole(storeSlug, ROLES.OWNER);
 
     const parsed = updateCurrencySchema.safeParse(input);
     if (!parsed.success) {
@@ -62,8 +63,8 @@ export async function updateStoreCurrencyAction(
     // drops any already-visited copies from the client router cache, so the new
     // label shows on next navigation without a hard reload. Cart/checkout read
     // live from the session/cookie, so they need no revalidation.
-    revalidatePath("/admin/settings");
-    revalidatePath("/admin/products");
+    revalidatePath(`/admin/${storeSlug}/settings`);
+    revalidatePath(`/admin/${storeSlug}/products`);
     revalidatePath("/products");
     revalidatePath("/products/[slug]", "page");
     return { ok: true };

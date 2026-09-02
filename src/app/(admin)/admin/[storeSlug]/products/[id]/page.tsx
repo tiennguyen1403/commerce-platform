@@ -12,10 +12,10 @@ export const metadata: Metadata = { title: "Edit product" };
 export default async function EditProductPage({
   params,
 }: {
-  params: Promise<{ id: string }>;
+  params: Promise<{ storeSlug: string; id: string }>;
 }) {
-  const { tenantId, currency } = await requireAdminContext();
-  const { id } = await params;
+  const { storeSlug, id } = await params;
+  const { tenantId, currency } = await requireAdminContext(storeSlug);
 
   const product = await catalogService.getAdminProduct(tenantId, id);
   if (!product) notFound();
@@ -42,7 +42,7 @@ export default async function EditProductPage({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex flex-col gap-2">
           <Link
-            href="/admin/products"
+            href={`/admin/${storeSlug}/products`}
             className="text-muted-foreground hover:text-foreground inline-flex w-fit items-center gap-1 text-sm font-medium"
           >
             <ArrowLeft className="size-4" />
@@ -54,6 +54,7 @@ export default async function EditProductPage({
         </div>
         {product.status !== "ARCHIVED" ? (
           <ArchiveProductButton
+            storeSlug={storeSlug}
             productId={product.id}
             productTitle={product.title}
           />
@@ -61,6 +62,7 @@ export default async function EditProductPage({
       </div>
       <ProductForm
         mode="edit"
+        storeSlug={storeSlug}
         productId={product.id}
         initialValues={initialValues}
         storeCurrency={currency}

@@ -43,10 +43,10 @@ function fieldErrorsFromZod(error: ZodError): MemberFieldErrors {
 /** Map a thrown error to the client result — typed domain errors to their
  *  field/form slot, anything else reported and shown as a generic message. */
 async function mapMemberError(err: unknown): Promise<MemberActionResult> {
-  // `assertRole` → `requireAdminContext` can `redirect()` (session expired, no
-  // membership), which throws a control-flow error Next must handle. Re-throw
-  // those first so this catch never swallows a redirect into a generic message
-  // (and never fires the error webhook for a non-error).
+  // `assertRole` → `requireAdminContext` can `redirect()` (no session) or
+  // `notFound()` (unknown store / non-member), a control-flow error Next must
+  // handle. Re-throw those first so this catch never swallows one into a generic
+  // message (and never fires the error webhook for a non-error).
   unstable_rethrow(err);
 
   if (err instanceof InsufficientRoleError) {
@@ -69,10 +69,11 @@ async function mapMemberError(err: unknown): Promise<MemberActionResult> {
 }
 
 export async function addMemberAction(
+  storeSlug: string,
   input: unknown,
 ): Promise<MemberActionResult> {
   try {
-    const { tenantId } = await assertRole(ROLES.OWNER);
+    const { tenantId } = await assertRole(storeSlug, ROLES.OWNER);
 
     const parsed = addMemberSchema.safeParse(input);
     if (!parsed.success) {
@@ -84,7 +85,7 @@ export async function addMemberAction(
       parsed.data.email,
       parsed.data.role,
     );
-    revalidatePath("/admin/members");
+    revalidatePath(`/admin/${storeSlug}/members`);
     return { ok: true };
   } catch (err) {
     return mapMemberError(err);
@@ -92,11 +93,15 @@ export async function addMemberAction(
 }
 
 export async function changeMemberRoleAction(
+  storeSlug: string,
   userId: string,
   role: string,
 ): Promise<MemberActionResult> {
   try {
-    const { tenantId, userId: actingUserId } = await assertRole(ROLES.OWNER);
+    const { tenantId, userId: actingUserId } = await assertRole(
+      storeSlug,
+      ROLES.OWNER,
+    );
 
     // Managing your own membership from here is forbidden (mirrors the disabled
     // row control) — enforced server-side too, since actions are public.
@@ -114,7 +119,7 @@ export async function changeMemberRoleAction(
       parsed.data.userId,
       parsed.data.role,
     );
-    revalidatePath("/admin/members");
+    revalidatePath(`/admin/${storeSlug}/members`);
     return { ok: true };
   } catch (err) {
     return mapMemberError(err);
@@ -122,17 +127,21 @@ export async function changeMemberRoleAction(
 }
 
 export async function removeMemberAction(
+  storeSlug: string,
   userId: string,
 ): Promise<MemberActionResult> {
   try {
-    const { tenantId, userId: actingUserId } = await assertRole(ROLES.OWNER);
+    const { tenantId, userId: actingUserId } = await assertRole(
+      storeSlug,
+      ROLES.OWNER,
+    );
     if (!userId) return { ok: false, formError: "Missing member." };
     if (userId === actingUserId) {
       return { ok: false, formError: "You can't remove yourself." };
     }
 
     await membershipService.removeMember(tenantId, userId);
-    revalidatePath("/admin/members");
+    revalidatePath(`/admin/${storeSlug}/members`);
     return { ok: true };
   } catch (err) {
     return mapMemberError(err);

@@ -22,9 +22,11 @@ import { archiveProductAction } from "./actions";
  * rather than a destructive delete.
  */
 export function ArchiveProductButton({
+  storeSlug,
   productId,
   productTitle,
 }: {
+  storeSlug: string;
   productId: string;
   productTitle: string;
 }) {
@@ -36,10 +38,10 @@ export function ArchiveProductButton({
   function onArchive() {
     setError(null);
     startTransition(async () => {
-      const result = await archiveProductAction(productId);
+      const result = await archiveProductAction(storeSlug, productId);
       if (result.ok) {
         setOpen(false);
-        router.push("/admin/products");
+        router.push(`/admin/${storeSlug}/products`);
         router.refresh();
         return;
       }

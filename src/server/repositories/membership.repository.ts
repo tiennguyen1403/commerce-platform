@@ -29,6 +29,24 @@ export const membershipRepository = {
   },
 
   /**
+   * Every store a user belongs to — their role plus the tenant's slug/name — for
+   * the `/admin` store index and switcher. This is the one deliberately
+   * cross-tenant read: it's scoped by the caller's own `userId` (their
+   * memberships), so it surfaces only stores they're actually a member of, never
+   * another user's. Ordered by store name for a stable list.
+   */
+  listForUser(userId: string) {
+    return prisma.membership.findMany({
+      where: { userId },
+      select: {
+        role: true,
+        tenant: { select: { slug: true, name: true } },
+      },
+      orderBy: { tenant: { name: "asc" } },
+    });
+  },
+
+  /**
    * All members of a tenant with the display fields the admin table needs.
    * Ordered by role then join date: Postgres sorts an enum by its declared
    * order (`OWNER`, `ADMIN`, `STAFF` — see the init migration), which is exactly
