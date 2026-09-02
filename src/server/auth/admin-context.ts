@@ -16,6 +16,9 @@ export interface AdminContext {
   tenantName: string;
   /** The store's single currency (lowercase ISO 4217); variants inherit it. */
   currency: string;
+  /** The store's storefront accent — an OKLCH hue angle (see `src/lib/theme.ts`).
+   *  Read by the OWNER settings editor to seed the accent picker. */
+  themeHue: number;
   role: Role;
   /** The store slug from the URL — thread it back into nav links, redirects,
    *  and Server Action revalidation so they stay scoped to the active store. */
@@ -67,6 +70,7 @@ export const requireAdminContext = cache(
       tenantId: tenant.id,
       tenantName: tenant.name,
       currency: tenant.currency,
+      themeHue: tenant.themeHue,
       role: membership.role,
       storeSlug,
     };
