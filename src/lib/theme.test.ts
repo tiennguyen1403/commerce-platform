@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DEFAULT_THEME_HUE,
   TENANT_THEME_SELECTOR,
+  TENANT_THEME_PORTAL_SELECTOR,
   resolveThemeHue,
   tenantThemeCss,
 } from "@/lib/theme";
@@ -32,11 +33,25 @@ describe("resolveThemeHue", () => {
 describe("tenantThemeCss", () => {
   it("scopes every rule to the theme wrapper and never leaks to :root", () => {
     const css = tenantThemeCss(285);
-    expect(css).toContain(`${TENANT_THEME_SELECTOR}{`);
+    expect(css).toContain(TENANT_THEME_SELECTOR);
     // The override must not target the document root, or it would bleed into
     // (admin)/(auth), which render as siblings under the same <html>.
     expect(css).not.toContain(":root");
     expect(css.toLowerCase()).not.toContain("html");
+  });
+
+  it("also themes portaled overlays via the marker, from the same recipe (#113)", () => {
+    const css = tenantThemeCss(285);
+    // The marker rides alongside the wrapper in BOTH the light rule and the dark
+    // media rule, so a Select/dialog portaled to <body> inherits the store's hue.
+    const scope = `${TENANT_THEME_SELECTOR},${TENANT_THEME_PORTAL_SELECTOR}`;
+    expect(css).toContain(`${scope}{`);
+    expect(css).toContain(`@media (prefers-color-scheme:dark){${scope}{`);
+    // The marker shares the wrapper's accent values (one recipe, no drift) and the
+    // rule stays element-scoped to the marker — never :root, so no (admin)/(auth)
+    // bleed despite the document-wide selector.
+    expect(css).toContain(`${scope}{--primary:oklch(0.5 0.12 285);`);
+    expect(css).not.toContain(":root");
   });
 
   it("re-parametrizes the accent tokens by the given hue (light + dark)", () => {

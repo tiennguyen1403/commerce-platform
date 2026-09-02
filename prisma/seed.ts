@@ -148,8 +148,11 @@ const PRODUCTS: SeedProduct[] = [
 const AURORA_HUE = 285;
 
 // The second store's small catalog — enough to show the themed accent across the
-// grid, a purchase panel, and a low-stock badge (the 14 oz mug sits below the
-// threshold). Slugs are unique per tenant, so they may overlap with `demo`'s.
+// grid, a purchase panel, a low-stock badge (the 14 oz mug sits below the
+// threshold), and a multi-variant **selector** (Borealis Tee) whose dropdown
+// portals to <body>: it's the one storefront accent surface aurora lacked, so it
+// makes the portaled-overlay accent fix visible on a non-default hue (#113).
+// Slugs are unique per tenant, so they may overlap with `demo`'s.
 const AURORA_PRODUCTS: SeedProduct[] = [
   {
     slug: "aurora-candle",
@@ -167,6 +170,17 @@ const AURORA_PRODUCTS: SeedProduct[] = [
     status: "ACTIVE",
     variants: [
       { sku: "AUR-MUG-14", name: "14 oz", priceCents: 1800, stock: 4 },
+    ],
+  },
+  {
+    slug: "borealis-tee",
+    title: "Borealis Tee",
+    description: "Organic-cotton tee in the Aurora colorway.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "AUR-TEE-S", name: "Small", priceCents: 2600, stock: 30 },
+      { sku: "AUR-TEE-M", name: "Medium", priceCents: 2600, stock: 5 },
+      { sku: "AUR-TEE-L", name: "Large", priceCents: 2800, stock: 0 },
     ],
   },
 ];
