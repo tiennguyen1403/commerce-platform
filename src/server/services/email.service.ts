@@ -3,7 +3,10 @@ import { Resend } from "resend";
 import { env } from "@/lib/env";
 import { formatMoney } from "@/lib/utils";
 import { tenantRepository } from "@/server/repositories/tenant.repository";
-import { EmailNotConfiguredError } from "@/server/email.errors";
+import {
+  EmailNotConfiguredError,
+  EmailSendTimeoutError,
+} from "@/server/email.errors";
 import type { OrderWithItems } from "@/server/repositories/order.repository";
 
 /**
@@ -13,8 +16,10 @@ import type { OrderWithItems } from "@/server/repositories/order.repository";
  *
  * The webhook owns the failure policy: this service lets a send failure surface
  * (a Resend `error` response is turned into a throw) so the caller has a single
- * channel to log. The webhook swallows it and still returns 200 — a Resend
- * outage must never turn a real payment into a retryable webhook failure.
+ * channel to log. A send is also bounded by a timeout (#31) and surfaces the same
+ * way, so a hung Resend call can't hold the webhook's response path open. The
+ * webhook swallows it and still returns 200 — a Resend outage (or a slow one)
+ * must never turn a real payment into a retryable webhook failure.
  *
  * Server-only: it holds the Resend secret and is never imported by client code.
  * Email is *optional* config (#39): the client is built lazily so a build — or a
@@ -26,7 +31,10 @@ import type { OrderWithItems } from "@/server/repositories/order.repository";
 // Re-exported so a caller importing the service also gets the error to catch from
 // one module (mirrors `order.service.ts` re-exporting `EmptyCartError`). The class
 // itself lives in the dependency-free `email.errors.ts`.
-export { EmailNotConfiguredError } from "@/server/email.errors";
+export {
+  EmailNotConfiguredError,
+  EmailSendTimeoutError,
+} from "@/server/email.errors";
 
 let resendSingleton: Resend | null = null;
 
@@ -35,6 +43,46 @@ let resendSingleton: Resend | null = null;
 function getResend(apiKey: string): Resend {
   resendSingleton ??= new Resend(apiKey);
   return resendSingleton;
+}
+
+/**
+ * Cap on a single Resend API call. The confirmation send runs on the Stripe
+ * webhook's response path (the immediate best-effort dispatch, #30), so a hung
+ * Resend call would hold the webhook's 200 open toward Stripe's own delivery
+ * timeout — and a late ack provokes a wasteful retry (#31). Resend's SDK offers
+ * no per-request timeout or AbortSignal hook (`CreateEmailRequestOptions` is only
+ * `query`/`headers`/`idempotencyKey`, and `ResendOptions` takes no custom fetch —
+ * verified against resend@6), so we bound the call ourselves. "A few seconds at
+ * most" (#31): comfortably above a healthy send yet well under any webhook deadline.
+ */
+const SEND_TIMEOUT_MS = 5_000;
+
+/**
+ * Resolve/reject with `promise`, or reject with `EmailSendTimeoutError` if it
+ * hasn't settled within `timeoutMs`. The underlying fetch isn't cancelled — the
+ * SDK exposes no handle to abort it — but that's harmless: the webhook only owes
+ * Stripe a prompt 200, and a straggling send that *does* land is deduped by the
+ * outbox's Resend idempotency key when the retry runs (#30), so giving up early
+ * can't double-send. `Promise.race` attaches a reaction to `promise`, so its
+ * eventual settlement is consumed (no unhandled rejection); the timer is always
+ * cleared, so a healthy send leaves nothing pending on the event loop.
+ */
+async function withSendTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new EmailSendTimeoutError(timeoutMs)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Escape the HTML-significant characters. Order titles are admin-authored
@@ -179,8 +227,9 @@ export const emailService = {
    * Branded with the tenant's store name (looked up from `order.tenantId`, since
    * the webhook only carries the id), falling back to a neutral label if the
    * tenant can't be resolved.
-   * Throws on a Resend failure so the caller can log it; never called on a path
-   * where that throw would fail the webhook.
+   * Throws on a Resend failure — or `EmailSendTimeoutError` if the send exceeds
+   * `SEND_TIMEOUT_MS` (#31) — so the caller can log/classify it; never called on
+   * a path where that throw would fail the webhook.
    *
    * `options.idempotencyKey`, when passed (the outbox drain does, #30), rides
    * along as Resend's `Idempotency-Key`: if a send succeeds but the caller then
@@ -209,9 +258,15 @@ export const emailService = {
     // Resend reports API-level failures via `error` rather than throwing; turn
     // it into a throw so callers have a single failure channel to handle. The
     // idempotency key (if any) goes in the request options, not the payload.
-    const { error } = await getResend(apiKey).emails.send(
-      { from, to: order.email, subject, html, text },
-      { idempotencyKey: options?.idempotencyKey },
+    // The call is bounded by `withSendTimeout` (#31) so a hung send can't hold
+    // the webhook's response path open; a timeout surfaces as a throw like any
+    // other failure and the outbox (#30) retries it.
+    const { error } = await withSendTimeout(
+      getResend(apiKey).emails.send(
+        { from, to: order.email, subject, html, text },
+        { idempotencyKey: options?.idempotencyKey },
+      ),
+      SEND_TIMEOUT_MS,
     );
     if (error) {
       throw new Error(
