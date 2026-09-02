@@ -49,9 +49,9 @@ export function SignUpForm({ redirectTo }: { redirectTo: string }) {
       return;
     }
 
-    // A fresh account has no store yet, so this is the storefront by default —
-    // unless the visitor came to create one (e.g. from `/new`), in which case
-    // `redirectTo` sends them there to finish onboarding.
+    // The page supplies an already-sanitized `redirectTo` (its own safe default,
+    // or a safe `?redirect=` target), so just honor it — this form is shared by
+    // the admin and storefront sign-up surfaces and knows nothing of either.
     router.push(redirectTo);
     router.refresh();
   }

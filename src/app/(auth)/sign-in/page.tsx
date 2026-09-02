@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { SignInForm } from "./sign-in-form";
-import { safeInternalPath } from "../safe-redirect";
+import { SignInForm } from "@/components/auth/sign-in-form";
+import { safeInternalPath } from "@/lib/safe-redirect";
 
 export const metadata: Metadata = { title: "Sign in" };
 
