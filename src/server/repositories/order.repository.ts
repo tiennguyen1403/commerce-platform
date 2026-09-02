@@ -49,12 +49,16 @@ export type ReusablePendingQuery = {
 /** A full order to persist. The `id`, `orderNumber`, total, and per-item prices
  *  are all computed by the service (from a fresh variant read) — never the
  *  client. `id` is pre-generated so the linked PaymentIntent can carry it in
- *  metadata while the row is written with the PaymentIntent id in one write. */
+ *  metadata while the row is written with the PaymentIntent id in one write.
+ *  `userId` links the order to a signed-in shopper (resolved server-side from
+ *  the session, never client-supplied) or is null for a guest checkout. */
 export type CreateOrderInput = {
   id: string;
   tenantId: string;
   orderNumber: string;
   email: string;
+  /** The authenticated shopper's global `User` id, or null for a guest. */
+  userId: string | null;
   totalCents: number;
   currency: string;
   stripePaymentIntentId: string;
@@ -218,6 +222,9 @@ export const orderRepository = {
               orderNumber: input.orderNumber,
               status: "PENDING",
               email: input.email,
+              // Null for a guest; a signed-in shopper's global `User` id
+              // otherwise (server-resolved upstream, never from the client).
+              userId: input.userId,
               totalCents: input.totalCents,
               currency: input.currency,
               stripePaymentIntentId: input.stripePaymentIntentId,

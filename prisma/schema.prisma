@@ -77,6 +77,11 @@ model User {
   sessions    Session[]
   accounts    Account[]
   memberships Membership[]
+  // A shopper's orders across the platform (each row stays tenant-scoped by its
+  // own `Order.tenantId`). Back-relation for `Order.user`; nullable there, so a
+  // User may have none, and `onDelete: SetNull` keeps their orders if the
+  // account is ever removed (the order de-links to a guest, never cascades).
+  orders      Order[]
 }
 
 model Session {
@@ -201,6 +206,13 @@ model Order {
   orderNumber           String
   status                OrderStatus @default(PENDING)
   email                 String
+  // The signed-in shopper who placed this order, or null for a guest checkout.
+  // Identity is platform-wide (the global `User`), but the order stays
+  // tenant-scoped by `tenantId` regardless. Resolved server-side from the
+  // session at checkout — never client-supplied (#102). `onDelete: SetNull` (see
+  // the relation below) keeps a paid order's history intact if the account is
+  // later deleted: it de-links to a guest row rather than cascading away.
+  userId                String?
   totalCents            Int
   currency              String      @default("usd")
   stripePaymentIntentId String?     @unique
@@ -215,6 +227,9 @@ model Order {
   updatedAt             DateTime    @updatedAt
 
   tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Nullable link to the global shopper account. SetNull (not Cascade) so
+  // deleting a User never deletes their orders — the order de-links to a guest.
+  user           User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
   items          OrderItem[]
   outboxMessages OutboxMessage[]
 
@@ -224,6 +239,11 @@ model Order {
   // status-filtered. Composite so the tenant scope + `createdAt` ordering is
   // index-served, not a sort over the tenant's whole order history.
   @@index([tenantId, createdAt])
+  // A signed-in shopper's order history within one store (`listByTenantAndUser`,
+  // #92): tenant-scoped first (golden rule 1), then by shopper, newest-first — so
+  // the history read is index-served, not a scan+sort. Tenant-leading like the
+  // other Order indexes; the `userId` it also covers is null for guest orders.
+  @@index([tenantId, userId, createdAt])
   // Abandoned-PENDING sweep (`findStalePending`, #25): the platform-wide cron
   // selects PENDING orders older than a grace window, oldest first, ACROSS all
   // tenants — so it can't use the tenant-scoped index above. Composite [status,

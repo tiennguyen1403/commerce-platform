@@ -49,6 +49,7 @@ function order(o: Partial<Order> = {}): Order {
     orderNumber: "20250101-AAA111",
     status: "PAID",
     email: "shopper@example.com",
+    userId: null,
     totalCents: 3000,
     currency: "usd",
     stripePaymentIntentId: "pi_1",
