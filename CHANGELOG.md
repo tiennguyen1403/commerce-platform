@@ -4,11 +4,52 @@ Notable changes to this project, in [Keep a Changelog](https://keepachangelog.co
 style. Versions tag milestone releases (`vM<n>`), not semver — see
 [`docs/milestones/README.md`](docs/milestones/README.md) for the process,
 [`docs/milestones/M1-commerce-slice/handoff.md`](docs/milestones/M1-commerce-slice/handoff.md)
-for the full M1 writeup, and
+for the full M1 writeup,
 [`docs/milestones/M2-production-grade/handoff.md`](docs/milestones/M2-production-grade/handoff.md)
-for the full M2 writeup.
+for the full M2 writeup, and
+[`docs/milestones/M3-platform/handoff.md`](docs/milestones/M3-platform/handoff.md)
+for the full M3 writeup.
 
 ## [Unreleased]
+
+## [vM3] — platform — 2026-09-03
+
+Turns the single-store app into a real multi-tenant platform: every store gets its own
+subdomain and can be created self-serve, shoppers can create accounts and see their
+order history, the catalog is searchable, and the admin dashboard shows revenue and
+orders over time.
+
+### Added
+
+- Self-serve store creation: sign up and launch your own store on its own subdomain in
+  a few clicks, becoming its owner immediately. A person can own and run more than one
+  store, switching between them from a store picker in the admin.
+- Each store can pick its own accent color for its storefront, and owners can rename
+  their store, from a new branding page in store settings.
+- Shoppers can create an account and sign in on the storefront — kept completely
+  separate from the admin's sign-in — and see a history of their past orders at that
+  store.
+- A search box on the storefront finds products by name or description.
+- The admin now shows revenue and order-volume trend charts for the last 30 days,
+  alongside the existing dashboard figures.
+
+### Changed
+
+- The admin now lives at a per-store address (e.g. `/admin/your-store`) instead of one
+  shared admin — useful once a person runs more than one store.
+- Dashboard revenue is now broken out as gross, refunds, and net, so a refunded order
+  is netted out of the total instead of disappearing from it entirely.
+- Checking out while signed in now links the order to the shopper's account, so it
+  appears in their order history; checking out as a guest still works exactly as
+  before.
+- Resubmitting the same cart while signed in now only ever reuses that same shopper's
+  own in-flight payment, never one matched by a typed-in email alone.
+
+### Fixed
+
+- The link that returns a shopper to where they were right after signing in could be
+  crafted to send them to an external site instead; it's now validated more strictly
+  so it can never leave the site.
 
 ## [vM2] — production-grade — 2026-09-02
 
@@ -93,6 +134,7 @@ Stripe test-mode purchase; an admin manages the catalog behind auth.
   details — it verifies against the live Stripe payment first, closing an
   information-disclosure gap.
 
-[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM2...HEAD
+[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM3...HEAD
+[vm3]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM3
 [vm2]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM2
 [vm1]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM1

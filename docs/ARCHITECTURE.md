@@ -31,17 +31,37 @@ import from `src/server/**` — they go through Server Actions or services invok
   business table (`Product`, `Order`, …). One store = one `Tenant`.
 - **Isolation:** enforced in the repository layer — every read/write is filtered by
   `tenantId`. (Stretch goal: Postgres Row-Level Security for defense in depth.)
+- **Subdomains are live (M3):** each store is addressed at its own subdomain
+  (`{slug}.{app-domain}`). `src/proxy.ts` resolves the tenant slug from the request
+  `Host` header (`src/lib/tenant-host.ts`), strips any inbound `x-tenant-slug` first
+  (anti-spoof), and injects the trusted, host-derived value; `getStoreTenant()`
+  (`src/server/store-context.ts`) is the sole reader — an unknown slug, the apex host,
+  or a reserved word (`www`, `admin`, `api`, …) all 404. Auth, admin, and onboarding
+  stay centralized on the platform's **apex** host (`crossSubDomainCookies` off), so a
+  store subdomain carries no session authority of its own.
 - **Why this model:** simplest to operate solo, cheapest, and still demonstrates real
-  platform architecture. It upgrades cleanly to per-tenant subdomains + Stripe Connect in
-  Phase 3 without a rewrite.
+  platform architecture. Stripe Connect (per-store payouts) remains a deliberately
+  deferred upgrade.
 
 ## 3. Access control (RBAC)
 
 - Users authenticate via **Better Auth** (email/password now; OAuth later). Auth tables:
-  `User`, `Session`, `Account`, `Verification`.
+  `User`, `Session`, `Account`, `Verification`. One Better Auth instance serves both the
+  admin and the storefront; `User.email` is unique platform-wide.
 - A **`Membership`** links a `User` to a `Tenant` with a `Role` (`OWNER` > `ADMIN` >
   `STAFF`, see `src/config/roles.ts`). Authorization = "does this user have a membership
-  in this tenant with at least role X?".
+  in this tenant with at least role X?". A user may hold memberships in — and so
+  administer — more than one tenant.
+- **Admin is path-scoped (M3):** `/admin/[storeSlug]`, not a session-pinned single
+  store. `requireAdminContext(storeSlug)` (`src/server/auth/admin-context.ts`)
+  re-derives the session on every request and authorizes membership in the store named
+  on the URL; an unknown store and a store the caller isn't a member of are both a 404,
+  indistinguishable from each other.
+- **Shoppers are `User`s with no `Membership` (M3)** — signing up on the storefront
+  creates an ordinary `User` row with no tenant membership, so it carries no admin
+  authority anywhere. `Order.userId` (nullable FK, `onDelete: SetNull`) links an order
+  to the signed-in shopper; a shopper's order history is scoped by **both** `tenantId`
+  and `userId`, never `tenantId` alone.
 - A future `platform_admin` (super-admin) operates across tenants.
 
 ## 4. Catalog
@@ -139,5 +159,45 @@ AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
   mocked repos, zero infra), `*.test.tsx` (dom), `*.integration.test.ts` (real
   Postgres, run serial, throwaway-tenant isolation). `server-only` is aliased to a
   no-op only inside the test runner, never in the real build.
+- **Subdomain tenant resolution — "Model A"** (M3) — the tenant is resolved from the
+  request `Host` in the proxy, which strips any inbound `x-tenant-slug` before
+  injecting the trusted, host-derived one (anti-spoof); `getStoreTenant()` is the sole
+  reader. Auth, admin, and onboarding are centralized on the **apex** host so cookies
+  stay host-scoped (`crossSubDomainCookies` off). A bare-loopback→`demo` fallback,
+  keyed on `NEXT_PUBLIC_APP_URL` being localhost, keeps local dev and Playwright
+  working; it's off in production.
+- **Path-scoped admin `/admin/[storeSlug]` + `requireAdminContext(storeSlug)`** (M3) —
+  a user may own many stores, so authorization re-checks membership against the store
+  named on the URL rather than a session-pinned tenant. A non-member and an unknown
+  store are both a 404, indistinguishable — bookmarkable, no hidden session state.
+- **Per-tenant theming via SSR-injected, scoped `<style>`** (M3) — `Tenant.themeHue`
+  (an `Int`, validated 0–359 with a safe fallback) is scoped to `[data-tenant-theme]`
+  (plus a portal marker for body-portaled overlays), rendered with native `oklch()`,
+  and theme-aware; no `:root` bleed.
+- **Shoppers reuse the global `User` model** (M3) — a shopper is a `User` with no
+  `Membership`; one Better Auth instance serves admin and shoppers alike, and email is
+  unique platform-wide (a documented trade-off). `Order.userId` is a nullable FK
+  (`SetNull`); orders stay tenant-scoped regardless.
+- **#92 identity binding** (M3) — in-flight PaymentIntent reuse binds to the
+  session-proven `userId`; the guest branch requires `userId: null` in the `WHERE`
+  (a discriminated union), so a guest-supplied email can't match a signed-in shopper's
+  PENDING order — closes #92 without regressing guest reuse (#25, M2).
+- **Catalog search = raw-SQL `tsvector` + GIN** (M3), not Prisma's preview Postgres
+  full-text-search API — a `GENERATED … STORED` column plus a GIN index, queried with
+  `websearch_to_tsquery` through a parameterized tagged-template `$queryRaw`; ids are
+  hydrated via a second tenant-scoped `findMany` re-ordered in JS. Reads
+  `available = stock - reserved`.
+- **Analytics: raw-SQL `date_trunc` day-buckets (UTC), zero-filled in the service;
+  #93's net-revenue model** (M3) — `grossCents` sums every captured order status
+  (PAID, FULFILLED, and REFUNDED), `netCents = gross − refunded`, so a refund is
+  netted rather than dropping its order from revenue wholesale. Charts are
+  **hand-rolled inline SVG** (server-rendered, zero client JS, theme-token colors,
+  `sr-only` table fallback), not a charting library — Recharts needs a React 19
+  `react-is` override, is client-only, and pulls ~50KB for two small charts.
+- **The `?redirect=` open-redirect guard validates the value it _returns_, not just
+  the parsed input** (M3, #127) — normalization can turn an on-origin parse into a
+  protocol-relative _result_ (`"/..//evil.com"` → `"//evil.com"`); the guard now
+  re-resolves the returned path the way the router will and rejects it if that no
+  longer lands on the same origin.
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).
