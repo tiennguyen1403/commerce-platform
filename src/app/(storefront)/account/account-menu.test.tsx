@@ -124,11 +124,11 @@ describe("AccountMenu", () => {
     expect(screen.getByText("Your account")).toBeInTheDocument();
   });
 
-  it("links My orders to the account page", () => {
+  it("links My orders to the order history page", () => {
     render(<AccountMenu name="Ada Lovelace" email="ada@example.com" />);
     expect(screen.getByRole("link", { name: /my orders/i })).toHaveAttribute(
       "href",
-      "/account",
+      "/account/orders",
     );
   });
 
