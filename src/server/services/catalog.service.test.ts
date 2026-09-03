@@ -21,6 +21,7 @@ vi.mock("@/server/repositories/product.repository", () => ({
     createWithVariants: vi.fn(),
     updateWithVariants: vi.fn(),
     archive: vi.fn(),
+    searchActiveByTenant: vi.fn(),
   },
 }));
 
@@ -28,6 +29,7 @@ const findBySlug = vi.mocked(productRepository.findBySlug);
 const createWithVariants = vi.mocked(productRepository.createWithVariants);
 const updateWithVariants = vi.mocked(productRepository.updateWithVariants);
 const archive = vi.mocked(productRepository.archive);
+const searchActiveByTenant = vi.mocked(productRepository.searchActiveByTenant);
 
 const TENANT = "tenant_1";
 
@@ -129,6 +131,27 @@ describe("catalogService.updateProduct", () => {
     await expect(
       catalogService.updateProduct(TENANT, "ghost", input()),
     ).rejects.toBeInstanceOf(ProductNotFoundError);
+  });
+});
+
+describe("catalogService.searchStorefrontProducts", () => {
+  it("binds the tenant and passes the search params straight through", async () => {
+    const page = { products: [], total: 0 };
+    searchActiveByTenant.mockResolvedValue(page);
+
+    await expect(
+      catalogService.searchStorefrontProducts(TENANT, {
+        query: "classic tee",
+        page: 2,
+        pageSize: 12,
+      }),
+    ).resolves.toBe(page);
+    expect(searchActiveByTenant).toHaveBeenCalledWith({
+      tenantId: TENANT,
+      query: "classic tee",
+      page: 2,
+      pageSize: 12,
+    });
   });
 });
 

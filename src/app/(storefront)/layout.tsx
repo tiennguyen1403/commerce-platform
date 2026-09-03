@@ -8,6 +8,7 @@ import { cartItemCount } from "@/lib/cart";
 import { tenantThemeCss } from "@/lib/theme";
 import { Badge } from "@/components/ui/badge";
 import { AccountMenu } from "./account/account-menu";
+import { SearchForm } from "./search/search-form";
 
 /**
  * Public storefront shell. Resolves the tenant once (cached) and shares its
@@ -43,15 +44,16 @@ export default async function StorefrontLayout({
     <div data-tenant-theme="" className="flex min-h-dvh flex-col">
       <style dangerouslySetInnerHTML={{ __html: tenantThemeCss(themeHue) }} />
       <header className="border-b">
-        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 px-6 py-4">
+        <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-4 gap-y-3 px-6 py-4">
           <Link
             href="/products"
-            className="inline-flex items-center gap-2 font-semibold tracking-tight"
+            className="inline-flex shrink-0 items-center gap-2 font-semibold tracking-tight"
           >
             <Store className="text-primary size-5" />
             {tenantName}
           </Link>
-          <nav className="flex items-center gap-4 text-sm">
+          <SearchForm className="order-last w-full min-w-0 sm:order-none sm:ml-auto sm:w-56" />
+          <nav className="ml-auto flex shrink-0 items-center gap-4 text-sm sm:ml-0">
             <Link
               href="/products"
               className="text-muted-foreground hover:text-foreground transition-colors"
