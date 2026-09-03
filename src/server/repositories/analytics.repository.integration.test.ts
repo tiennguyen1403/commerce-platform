@@ -10,12 +10,12 @@ import {
 
 /**
  * Integration tests for the analytics repository against a real Postgres. The
- * new `aggregate`/`groupBy`/relation-scoped reads have no in-repo precedent, so
- * these prove three things a mocked unit test can't: `revenueTotalCents` sums
- * exactly the captured statuses (not more, not fewer), `orderCountsByStatus`
- * really omits empty groups (the behaviour the service backfills around), and
- * `listActiveVariantStock` both filters on the Product relation's `status` and
- * is tenant-isolated.
+ * `aggregate`/`groupBy`/relation-scoped reads have no in-repo precedent, so these
+ * prove three things a mocked unit test can't: `revenueBreakdown` sums exactly
+ * the captured statuses into gross/refunds/net (not more, not fewer),
+ * `orderCountsByStatus` really omits empty groups (the behaviour the service
+ * backfills around), and `listActiveVariantStock` both filters on the Product
+ * relation's `status` and is tenant-isolated.
  */
 
 const tenantIds: string[] = [];
@@ -81,27 +81,31 @@ function seedProductWithVariants(
   });
 }
 
-describe("analyticsRepository.revenueTotalCents (integration)", () => {
-  it("sums only PAID + FULFILLED orders, excluding PENDING/CANCELLED/REFUNDED", async () => {
+describe("analyticsRepository.revenueBreakdown (integration)", () => {
+  it("splits gross/refunds/net across the captured statuses, excluding PENDING/CANCELLED", async () => {
     const tenant = await freshTenant();
-    await seedOrder(tenant.id, "PENDING", 1000);
+    await seedOrder(tenant.id, "PENDING", 1000); // never charged — excluded
     await seedOrder(tenant.id, "PAID", 2000);
     await seedOrder(tenant.id, "FULFILLED", 3000);
-    await seedOrder(tenant.id, "CANCELLED", 4000);
+    await seedOrder(tenant.id, "CANCELLED", 4000); // pre-capture — excluded
     await seedOrder(tenant.id, "REFUNDED", 5000);
 
-    const total = await analyticsRepository.revenueTotalCents(tenant.id);
+    const revenue = await analyticsRepository.revenueBreakdown(tenant.id);
 
-    expect(total).toBe(5000); // 2000 (PAID) + 3000 (FULFILLED) only
+    expect(revenue).toEqual({
+      grossCents: 10000, // 2000 PAID + 3000 FULFILLED + 5000 REFUNDED
+      refundedCents: 5000, // the whole REFUNDED order (full refunds only)
+      netCents: 5000, // gross − refunds == PAID + FULFILLED
+    });
   });
 
-  it("returns 0 (not null) for a tenant with no captured orders", async () => {
+  it("returns all-zero (not null) for a tenant with no captured orders", async () => {
     const tenant = await freshTenant();
     await seedOrder(tenant.id, "PENDING", 1000);
 
-    const total = await analyticsRepository.revenueTotalCents(tenant.id);
+    const revenue = await analyticsRepository.revenueBreakdown(tenant.id);
 
-    expect(total).toBe(0);
+    expect(revenue).toEqual({ grossCents: 0, refundedCents: 0, netCents: 0 });
   });
 });
 
