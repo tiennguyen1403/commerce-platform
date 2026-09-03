@@ -152,11 +152,28 @@ model Product {
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
 
+  // Full-text search vector (#105). A Postgres STORED generated column — the
+  // database recomputes `setweight(to_tsvector(title),'A') ‖
+  // setweight(to_tsvector(description),'B')` on every write, never Prisma. The
+  // real DDL (the column and its GIN index) is hand-authored in the migration,
+  // because a Prisma model can't express GENERATED/tsvector. This field mirrors
+  // that column in the exact form `prisma db pull` emits — `Unsupported` +
+  // `@default(dbgenerated(...))`, with `@@index(..., type: Gin)` below — so the
+  // schema matches the DB and `migrate` proposes no drift. Prisma omits it from
+  // the generated client's selects and writes (Unsupported + DB-generated), so
+  // `searchActiveByTenant` reaches it through a parameterized `$queryRaw`
+  // (`@@ websearch_to_tsquery`) served by the GIN index. See docs/DATABASE.md.
+  searchVector Unsupported("tsvector")? @default(dbgenerated("(setweight(to_tsvector('english'::regconfig, COALESCE(title, ''::text)), 'A'::\"char\") || setweight(to_tsvector('english'::regconfig, COALESCE(description, ''::text)), 'B'::\"char\"))"))
+
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   variants ProductVariant[]
 
   @@unique([tenantId, slug])
   @@index([tenantId])
+  // GIN index over the generated `searchVector` (created in the migration); the
+  // search query rides it. Declared here in `prisma db pull`'s form so the
+  // schema and DB agree and no spurious drop-index migration is ever generated.
+  @@index([searchVector], type: Gin)
 }
 
 model ProductVariant {

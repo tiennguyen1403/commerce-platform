@@ -31,6 +31,33 @@ function mapWriteError(err: unknown): never {
   throw err;
 }
 
+/** Parameters for the tenant-scoped catalog search (#105). `page` is 1-based;
+ *  `pageSize` bounds the rows returned. `query` is the raw shopper input, passed
+ *  straight to `websearch_to_tsquery` (which tolerates any junk without throwing);
+ *  the calling boundary still zod-validates `page`/`pageSize` as positive ints. */
+export type SearchProductsParams = {
+  tenantId: string;
+  query: string;
+  page: number;
+  pageSize: number;
+};
+
+/** A single ranked hit: a product with its variants — the same shape the
+ *  storefront listing (`listActiveByTenant`) returns, so results reuse the same
+ *  card and `availableUnits`. Typed via `Prisma.ProductGetPayload` (a static
+ *  helper), never `ReturnType<typeof productRepository.…>`, which would collapse
+ *  the whole repo object to `any` (TS7022/TS2456 — see the analytics repo note). */
+export type ProductSearchHit = Prisma.ProductGetPayload<{
+  include: { variants: true };
+}>;
+
+/** One page of ranked search hits (rank order preserved) plus `total` — the count
+ *  of all matches for the same scope, for the caller's page math. */
+export type ProductSearchPage = {
+  products: ProductSearchHit[];
+  total: number;
+};
+
 export const productRepository = {
   listActiveByTenant(tenantId: string) {
     return prisma.product.findMany({
@@ -38,6 +65,83 @@ export const productRepository = {
       include: { variants: true },
       orderBy: { createdAt: "desc" },
     });
+  },
+
+  /**
+   * Full-text catalog search for the storefront — tenant-scoped and ACTIVE-only,
+   * ranked by relevance, offset-paginated. Runs over the `searchVector` generated
+   * column (title weighted A, description B) through its GIN index, so a title
+   * hit outranks a description-only one.
+   *
+   * Injection-safe by construction: every value is bound through a tagged-template
+   * `$queryRaw` (never `$queryRawUnsafe`), and `websearch_to_tsquery` reads the raw
+   * shopper `query` leniently — unbalanced quotes, bare operators and other junk
+   * yield an empty match, never an error. An empty/whitespace query short-circuits
+   * to an empty page (no term, no results), sparing a round-trip.
+   *
+   * The ranked-id read and the `count(*)::int` read are batched into one
+   * `$transaction` (a single round-trip; `::int` returns a JS number, not a
+   * bigint). Hydration is a second `findMany(id in rankedIds)` — tenant-scoped
+   * again (golden rule 1) — re-ordered in JS to the rank sequence, since an
+   * `IN (…)` does not preserve order. Each hit carries its variants so the caller
+   * derives `available = stock - reserved` exactly as the rest of the storefront
+   * does (`availableUnits`). `page`/`pageSize` are floored defensively (never a
+   * negative offset, `take` never < 1); the boundary still zod-validates them.
+   */
+  async searchActiveByTenant({
+    tenantId,
+    query,
+    page,
+    pageSize,
+  }: SearchProductsParams): Promise<ProductSearchPage> {
+    if (!query.trim()) return { products: [], total: 0 };
+
+    const take = Math.max(1, pageSize);
+    const offset = Math.max(0, (page - 1) * pageSize);
+
+    // Ranked ids + total match count in one round-trip. Tagged templates only —
+    // every `${}` is a bound parameter, so the raw `query` can't inject SQL and a
+    // malformed one is interpreted, never fatal. `status::text = 'ACTIVE'` casts
+    // the enum for the raw comparison (mirrors membership.repository).
+    const [ranked, [{ count: total }]] = await prisma.$transaction([
+      prisma.$queryRaw<{ id: string }[]>`
+        SELECT "id"
+        FROM "Product"
+        WHERE "tenantId" = ${tenantId}
+          AND "status"::text = 'ACTIVE'
+          AND "searchVector" @@ websearch_to_tsquery('english', ${query})
+        ORDER BY
+          ts_rank("searchVector", websearch_to_tsquery('english', ${query})) DESC,
+          "createdAt" DESC,
+          "id" DESC
+        LIMIT ${take} OFFSET ${offset}
+      `,
+      prisma.$queryRaw<{ count: number }[]>`
+        SELECT count(*)::int AS count
+        FROM "Product"
+        WHERE "tenantId" = ${tenantId}
+          AND "status"::text = 'ACTIVE'
+          AND "searchVector" @@ websearch_to_tsquery('english', ${query})
+      `,
+    ]);
+
+    const rankedIds = ranked.map((row) => row.id);
+    if (rankedIds.length === 0) return { products: [], total };
+
+    // Hydrate the page. Tenant-scoped again (defence in depth — the ids are
+    // already this tenant's) so no catalog read escapes the tenant boundary.
+    const rows = await prisma.product.findMany({
+      where: { id: { in: rankedIds }, tenantId },
+      include: { variants: true },
+    });
+
+    // `IN (…)` returns rows in an arbitrary order; restore the rank sequence.
+    const byId = new Map(rows.map((product) => [product.id, product]));
+    const products = rankedIds
+      .map((id) => byId.get(id))
+      .filter((product): product is ProductSearchHit => product !== undefined);
+
+    return { products, total };
   },
 
   /** Admin listing: every status (incl. DRAFT/ARCHIVED), newest edits first. */
