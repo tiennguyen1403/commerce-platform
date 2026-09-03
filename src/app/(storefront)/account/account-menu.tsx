@@ -81,7 +81,10 @@ export function AccountMenu({
           <span className="truncate font-normal">{email}</span>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuLinkItem closeOnClick render={<Link href="/account" />}>
+        <DropdownMenuLinkItem
+          closeOnClick
+          render={<Link href="/account/orders" />}
+        >
           <Package aria-hidden />
           My orders
         </DropdownMenuLinkItem>

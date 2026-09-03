@@ -58,6 +58,21 @@ export const listOrdersParamsSchema = z.object({
 
 export type ListOrdersParamsInput = z.infer<typeof listOrdersParamsSchema>;
 
+/**
+ * Parse the shopper account order-history list's URL search params (#104). Only
+ * `page` is user-controlled — a shopper's list has no status filter (they see
+ * all their own orders) — and forgiving like `listOrdersParamsSchema`, so a
+ * mistyped `?page` renders page 1 rather than erroring. `pageSize` is a server
+ * constant, not parsed here.
+ */
+export const accountOrdersParamsSchema = z.object({
+  page: z.coerce.number().int().positive().catch(1),
+});
+
+export type AccountOrdersParamsInput = z.infer<
+  typeof accountOrdersParamsSchema
+>;
+
 /** Discriminated result every order lifecycle Server Action returns to the
  *  client (cancel / fulfil / refund). No payload on success — the client just
  *  refreshes the server-rendered detail to reflect the new status. */

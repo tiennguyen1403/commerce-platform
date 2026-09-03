@@ -8,6 +8,7 @@ import {
   orderRepository,
   type CreateOrderInput,
   type ListOrdersParams,
+  type ListUserOrdersParams,
   type OrdersPage,
   type OrderWithItems,
   type StalePendingOrder,
@@ -726,6 +727,38 @@ export const orderService = {
     orderId: string,
   ): Promise<OrderWithItems | null> {
     return orderRepository.findByIdForTenant(tenantId, orderId);
+  },
+
+  /**
+   * A single shopper's own orders within a tenant — the storefront account order
+   * history (#104), newest first, paginated. A thin pass-through to the
+   * repository read scoped by BOTH `tenantId` and the session-proven `userId`
+   * (never the tenant-only `listByTenant`), so a shopper only ever sees their own
+   * orders. The calling page resolves `userId` from the session and zod-validates
+   * `page` before calling in.
+   */
+  async listOrdersForUser(
+    tenantId: string,
+    userId: string,
+    params: ListUserOrdersParams,
+  ): Promise<OrdersPage> {
+    return orderRepository.listByTenantAndUser(tenantId, userId, params);
+  },
+
+  /**
+   * One of a shopper's own orders with its line items — the storefront order
+   * detail page (#104), scoped to BOTH the tenant AND the session-proven `userId`
+   * — or null when no such order exists for that shopper (the page maps null to a
+   * real 404). Thin pass-through to the user-scoped repository read; deliberately
+   * NOT the tenant-only `getOrder`, so one shopper can never open another's order
+   * by guessing its id.
+   */
+  async getOrderForUser(
+    tenantId: string,
+    userId: string,
+    orderId: string,
+  ): Promise<OrderWithItems | null> {
+    return orderRepository.findByIdForTenantAndUser(tenantId, userId, orderId);
   },
 
   /**

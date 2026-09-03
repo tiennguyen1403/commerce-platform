@@ -167,6 +167,14 @@ export type ListOrdersParams = {
   pageSize: number;
 };
 
+/** Paginated query over a single shopper's own orders within a tenant — the
+ *  storefront account order history (#104). `page` is 1-based; `pageSize` bounds
+ *  the rows. No `status` filter: a shopper's list shows all their orders. */
+export type ListUserOrdersParams = {
+  page: number;
+  pageSize: number;
+};
+
 /** One page of a tenant's orders (bare rows, newest first) plus `total` — the
  *  count matching the same filter, for the caller's page math. */
 export type OrdersPage = {
@@ -285,6 +293,25 @@ export const orderRepository = {
   findByIdForTenant(tenantId: string, id: string) {
     return prisma.order.findFirst({
       where: { tenantId, id },
+      include: { items: true },
+    });
+  },
+
+  /**
+   * One of a shopper's orders by id, scoped to BOTH the tenant AND the
+   * session-proven `userId`, with its line items — the storefront order detail
+   * (#104). Deliberately NOT a reuse of the tenant-only `findByIdForTenant`:
+   * scoping by `tenantId` alone would let a signed-in shopper open another
+   * shopper's order in the same store by guessing or altering its id. With
+   * `userId` in the WHERE a foreign (or guest, `userId: null`) order resolves to
+   * null and the page renders a real 404. Return type left to inference like the
+   * other `include: { items: true }` reads — annotating it `OrderWithItems` would
+   * make `orderRepository`'s type reference a type derived from `orderRepository`
+   * (a circular reference); the inferred shape is structurally `OrderWithItems`.
+   */
+  findByIdForTenantAndUser(tenantId: string, userId: string, id: string) {
+    return prisma.order.findFirst({
+      where: { tenantId, userId, id },
       include: { items: true },
     });
   },
@@ -547,6 +574,39 @@ export const orderRepository = {
       tenantId,
       ...(status ? { status } : {}),
     };
+    const [orders, total] = await prisma.$transaction([
+      prisma.order.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        skip: Math.max(0, (page - 1) * pageSize),
+        take: Math.max(1, pageSize),
+      }),
+      prisma.order.count({ where }),
+    ]);
+    return { orders, total };
+  },
+
+  /**
+   * A single shopper's orders within a tenant, newest first — the storefront
+   * account order history (#104). Scoped by BOTH `tenantId` AND the
+   * session-proven `userId` (never `tenantId` alone), so one shopper can never
+   * see another's orders even within the same store. Offset-paginated (`page` is
+   * 1-based) exactly like the admin `listByTenant`, ordered `createdAt DESC` with
+   * `id` as a stable tiebreak — served by the `[tenantId, userId, createdAt]`
+   * index (#102). Returns bare orders (no items): a list row shows
+   * number/date/status/total, while the detail page loads items via
+   * `findByIdForTenantAndUser`. `total` is the count for the same scope (for the
+   * caller's page math); the two reads are batched into one transaction (a single
+   * round-trip). `page`/`pageSize` are floored defensively here (never a negative
+   * `skip`, and `take` never flips into Prisma's reverse pagination); the calling
+   * boundary must still zod-validate them as positive ints.
+   */
+  async listByTenantAndUser(
+    tenantId: string,
+    userId: string,
+    { page, pageSize }: ListUserOrdersParams,
+  ): Promise<OrdersPage> {
+    const where: Prisma.OrderWhereInput = { tenantId, userId };
     const [orders, total] = await prisma.$transaction([
       prisma.order.findMany({
         where,

@@ -48,11 +48,18 @@ export default async function AccountPage() {
             Orders
           </CardTitle>
           <CardDescription>
-            Your order history will appear here once you place an order.
+            Review the orders you&rsquo;ve placed with this store.
           </CardDescription>
         </CardHeader>
-        <CardContent>
-          <Button nativeButton={false} render={<Link href="/products" />}>
+        <CardContent className="flex flex-wrap gap-3">
+          <Button nativeButton={false} render={<Link href="/account/orders" />}>
+            View order history
+          </Button>
+          <Button
+            variant="outline"
+            nativeButton={false}
+            render={<Link href="/products" />}
+          >
             Continue shopping
           </Button>
         </CardContent>
