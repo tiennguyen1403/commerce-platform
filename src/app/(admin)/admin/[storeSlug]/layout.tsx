@@ -71,6 +71,12 @@ export default async function AdminLayout({
               >
                 Orders
               </Link>
+              <Link
+                href={`${base}/analytics`}
+                className="text-muted-foreground hover:text-foreground transition-colors"
+              >
+                Analytics
+              </Link>
               {isOwner ? (
                 <>
                   <Link
