@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Tenant" ADD COLUMN     "themeHue" INTEGER NOT NULL DEFAULT 162;

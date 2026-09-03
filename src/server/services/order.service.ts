@@ -8,6 +8,7 @@ import {
   orderRepository,
   type CreateOrderInput,
   type ListOrdersParams,
+  type ListUserOrdersParams,
   type OrdersPage,
   type OrderWithItems,
   type StalePendingOrder,
@@ -254,27 +255,43 @@ function orderMatchesCart(order: OrderWithItems, cart: CartView): boolean {
  * shopper who submits, hits an error or *Back to cart*, then submits the same cart
  * again used to create a *second* PENDING order + chargeable-shaped PaymentIntent
  * (and a second inventory hold); this collapses that. Looks for a recent PENDING
- * order for this tenant+email whose currency, total, and line-set match the
- * freshly-repriced cart, then confirms the linked PaymentIntent is still awaiting
- * payment (and its amount/currency still match) before handing back its existing
- * client secret. Returns null — meaning "create a fresh intent" — on any miss: no
- * candidate, a line-set mismatch, an unreadable or non-reusable intent, or a
- * drifted amount. Price stays the security boundary: the match is against the
- * re-priced cart (`cart.totalCents`), never a stored total.
+ * order for this tenant + caller identity whose currency, total, and line-set match
+ * the freshly-repriced cart, then confirms the linked PaymentIntent is still
+ * awaiting payment (and its amount/currency still match) before handing back its
+ * existing client secret. Returns null — meaning "create a fresh intent" — on any
+ * miss: no candidate, a line-set mismatch, an unreadable or non-reusable intent, or
+ * a drifted amount.
+ *
+ * Identity is the security boundary for *who* may reuse an intent (#92): a signed-in
+ * shopper (`userId !== null`) is matched on the session-proven `userId` — never the
+ * client-supplied `email`, which anyone could type; a guest (`userId === null`) stays
+ * email-keyed but is pinned to `userId: null`, so a guest can't reuse a signed-in
+ * shopper's in-flight intent by supplying their email. Price stays the security
+ * boundary for *how much*: the match is against the re-priced cart
+ * (`cart.totalCents`), never a stored total.
  */
 async function tryReuseInFlightIntent(
   tenantId: string,
+  userId: string | null,
   email: string,
   cart: CartView,
 ): Promise<StartCheckoutResult | null> {
-  const candidates = await orderRepository.findReusablePendingCandidates({
+  const filters = {
     tenantId,
-    email,
     totalCents: cart.totalCents,
     currency: cart.currency,
     createdAfter: new Date(Date.now() - PENDING_REUSE_WINDOW_MS),
     limit: REUSE_CANDIDATE_LIMIT,
-  });
+  };
+  const candidates = await orderRepository.findReusablePendingCandidates(
+    // Bind reuse to identity (#92): an authenticated shopper matches on the
+    // session-proven `userId` (never the client-supplied email); a guest stays
+    // email-keyed but pinned to `userId: null`. Two complete literals, one per arm
+    // of the identity union, so the trust boundary holds at the type level too.
+    userId !== null
+      ? { ...filters, userId }
+      : { ...filters, userId: null, email },
+  );
 
   const stripe = getStripe();
   for (const candidate of candidates) {
@@ -527,6 +544,7 @@ export const orderService = {
     lines: CartLine[],
     email: string,
     currency: string,
+    userId: string | null,
   ): Promise<StartCheckoutResult> {
     const cart = await cartService.getCartView(tenantId, lines, currency);
     if (cart.items.length === 0) throw new EmptyCartError();
@@ -535,7 +553,10 @@ export const orderService = {
     // existing intent rather than minting a second PENDING order + chargeable
     // PaymentIntent (and a second inventory hold). A miss just falls through to a
     // fresh create; the sweep below is the safety net for anything left abandoned.
-    const reused = await tryReuseInFlightIntent(tenantId, email, cart);
+    // Reuse is bound to identity (#92): a signed-in shopper matches on the
+    // session-proven `userId`, a guest on `userId: null` + email — so a guest can't
+    // hand back a signed-in shopper's in-flight intent by typing their email.
+    const reused = await tryReuseInFlightIntent(tenantId, userId, email, cart);
     if (reused) return reused;
 
     const orderId = randomUUID();
@@ -573,6 +594,10 @@ export const orderService = {
         id: orderId,
         tenantId,
         email,
+        // Server-resolved from the session at the action boundary, threaded down
+        // — never client-supplied. Links a signed-in shopper's order to their
+        // global `User`; a guest's stays null (#102).
+        userId,
         totalCents: cart.totalCents,
         currency: cart.currency,
         stripePaymentIntentId: paymentIntent.id,
@@ -702,6 +727,38 @@ export const orderService = {
     orderId: string,
   ): Promise<OrderWithItems | null> {
     return orderRepository.findByIdForTenant(tenantId, orderId);
+  },
+
+  /**
+   * A single shopper's own orders within a tenant — the storefront account order
+   * history (#104), newest first, paginated. A thin pass-through to the
+   * repository read scoped by BOTH `tenantId` and the session-proven `userId`
+   * (never the tenant-only `listByTenant`), so a shopper only ever sees their own
+   * orders. The calling page resolves `userId` from the session and zod-validates
+   * `page` before calling in.
+   */
+  async listOrdersForUser(
+    tenantId: string,
+    userId: string,
+    params: ListUserOrdersParams,
+  ): Promise<OrdersPage> {
+    return orderRepository.listByTenantAndUser(tenantId, userId, params);
+  },
+
+  /**
+   * One of a shopper's own orders with its line items — the storefront order
+   * detail page (#104), scoped to BOTH the tenant AND the session-proven `userId`
+   * — or null when no such order exists for that shopper (the page maps null to a
+   * real 404). Thin pass-through to the user-scoped repository read; deliberately
+   * NOT the tenant-only `getOrder`, so one shopper can never open another's order
+   * by guessing its id.
+   */
+  async getOrderForUser(
+    tenantId: string,
+    userId: string,
+    orderId: string,
+  ): Promise<OrderWithItems | null> {
+    return orderRepository.findByIdForTenantAndUser(tenantId, userId, orderId);
   },
 
   /**

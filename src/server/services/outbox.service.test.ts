@@ -100,6 +100,7 @@ function orderWithItems(o: Partial<OrderWithItems> = {}): OrderWithItems {
     orderNumber: "20260115-ABCDEF",
     status: "PAID",
     email: "shopper@example.com",
+    userId: null,
     totalCents: 2500,
     currency: "usd",
     stripePaymentIntentId: "pi_1",

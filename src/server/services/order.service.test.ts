@@ -114,6 +114,7 @@ function order(o: Partial<Order> = {}): Order {
     orderNumber: "20250101-AAA111",
     status: "PENDING",
     email: EMAIL,
+    userId: null,
     totalCents: 3000,
     currency: "usd",
     stripePaymentIntentId: "pi_1",
@@ -193,6 +194,7 @@ describe("orderService.startCheckout", () => {
       lines,
       EMAIL,
       "usd",
+      null,
     );
 
     expect(getCartView).toHaveBeenCalledWith(TENANT, lines, "usd");
@@ -229,6 +231,8 @@ describe("orderService.startCheckout", () => {
     });
     // Line title is the "product — variant" snapshot the service builds.
     expect(writeInput.items[0].titleSnapshot).toMatch(/^Tee \S Blue$/);
+    // Guest checkout (no signed-in shopper resolved) → userId defaults to null.
+    expect(writeInput.userId).toBeNull();
 
     expect(result).toEqual({
       clientSecret: "cs_1",
@@ -255,6 +259,7 @@ describe("orderService.startCheckout", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     expect(createWithItems).toHaveBeenCalledTimes(3);
@@ -283,6 +288,7 @@ describe("orderService.startCheckout", () => {
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
         "usd",
+        null,
       ),
     ).rejects.toBeInstanceOf(OrderNumberTakenError);
 
@@ -306,6 +312,7 @@ describe("orderService.startCheckout", () => {
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
         "usd",
+        null,
       ),
     ).rejects.toBeInstanceOf(InsufficientStockError);
 
@@ -332,6 +339,7 @@ describe("orderService.startCheckout", () => {
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
         "usd",
+        null,
       ),
     ).rejects.toBe(writeError);
 
@@ -345,7 +353,7 @@ describe("orderService.startCheckout", () => {
     );
 
     await expect(
-      orderService.startCheckout(TENANT, [], EMAIL, "usd"),
+      orderService.startCheckout(TENANT, [], EMAIL, "usd", null),
     ).rejects.toBeInstanceOf(EmptyCartError);
     expect(paymentIntents.create).not.toHaveBeenCalled();
   });
@@ -364,10 +372,30 @@ describe("orderService.startCheckout", () => {
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
         "usd",
+        null,
       ),
     ).rejects.toThrow("Stripe did not return a client secret");
     expect(paymentIntents.cancel).toHaveBeenCalledWith("pi_2");
     expect(createWithItems).not.toHaveBeenCalled();
+  });
+
+  it("links the order to the signed-in shopper's userId (server-resolved)", async () => {
+    getCartView.mockResolvedValue(cartView());
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+      "user_123",
+    );
+
+    expect(createWithItems.mock.calls[0][0].userId).toBe("user_123");
   });
 });
 
@@ -746,6 +774,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     expect(result).toEqual({
@@ -776,6 +805,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "eur",
+      null,
     );
 
     expect(findReusable).toHaveBeenCalledWith(
@@ -793,6 +823,55 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
     expect(createdAfter.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
+  it("binds an authenticated reuse to the session userId, never the typed email (#92)", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([]);
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+      "user_alice",
+    );
+
+    // The dedupe read is keyed on the session-proven userId; the client-supplied
+    // email is NOT part of an authenticated match, so it can't widen who an
+    // in-flight intent may be handed back to (the crux of #92).
+    const arg = findReusable.mock.calls[0][0];
+    expect(arg).toMatchObject({ tenantId: TENANT, userId: "user_alice" });
+    expect("email" in arg).toBe(false);
+  });
+
+  it("keeps a guest reuse email-keyed but pinned to userId:null (#92)", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([]);
+    paymentIntents.create.mockResolvedValue({
+      id: "pi_1",
+      client_secret: "cs_1",
+    });
+    createWithItems.mockResolvedValue(order());
+
+    await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      "usd",
+      null,
+    );
+
+    // A guest carries userId:null in the WHERE — the pin that stops a guest email
+    // from matching a signed-in shopper's PENDING order — alongside the email.
+    expect(findReusable).toHaveBeenCalledWith(
+      expect.objectContaining({ tenantId: TENANT, userId: null, email: EMAIL }),
+    );
+  });
+
   it("creates fresh when there is no candidate to reuse", async () => {
     getCartView.mockResolvedValue(cartView());
     findReusable.mockResolvedValue([]);
@@ -807,6 +886,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     expect(paymentIntents.create).toHaveBeenCalledTimes(1);
@@ -833,6 +913,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     // A mismatch is rejected before any Stripe retrieve; checkout mints fresh.
@@ -862,6 +943,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     expect(paymentIntents.create).toHaveBeenCalledTimes(1);
@@ -889,6 +971,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     expect(paymentIntents.create).toHaveBeenCalledTimes(1);
@@ -912,6 +995,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     expect(paymentIntents.create).toHaveBeenCalledTimes(1);
@@ -943,6 +1027,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
       "usd",
+      null,
     );
 
     expect(result.orderId).toBe("order_existing");

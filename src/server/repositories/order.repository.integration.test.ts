@@ -34,8 +34,29 @@ async function freshTenant() {
   return tenant;
 }
 
+// `User` is platform-wide (not tenant-scoped), so `deleteTenantDeep` never
+// touches it — track and clean up any test-seeded shopper separately.
+const userIds: string[] = [];
+/** Seed a minimal global shopper `User` row (id/name/email are its only
+ *  required fields) for a `userId`-linkage test. */
+async function freshUser() {
+  const user = await prisma.user.create({
+    data: {
+      id: uniqueId("user"),
+      name: "Test Shopper",
+      email: `${uniqueId("shopper")}@example.com`,
+    },
+  });
+  userIds.push(user.id);
+  return user;
+}
+
 afterEach(async () => {
   await Promise.all(tenantIds.splice(0).map(deleteTenantDeep));
+  // Orders referencing these users are already gone via deleteTenantDeep above
+  // (Order.user is onDelete: SetNull, but the row itself is deleted, not
+  // de-linked), so this is a plain, unconstrained delete.
+  await prisma.user.deleteMany({ where: { id: { in: userIds.splice(0) } } });
 });
 
 afterAll(async () => {
@@ -108,9 +129,10 @@ async function seedPendingOrder(
 }
 
 /** Seed an order in any status (with optional lines and an explicit `createdAt`
- *  for ordering tests). `email`/`currency`/`totalCents` are overridable so the
- *  reuse-candidate filter suite can vary them independently of the lines. Used by
- *  the lifecycle, list, sweep, and reuse suites below. */
+ *  for ordering tests). `email`/`currency`/`totalCents`/`userId` are overridable so
+ *  the reuse-candidate filter suite can vary them independently of the lines
+ *  (`userId` defaults to null — a guest order). Used by the lifecycle, list, sweep,
+ *  and reuse suites below. */
 async function seedOrder(
   tenantId: string,
   opts: {
@@ -121,6 +143,7 @@ async function seedOrder(
     email?: string;
     currency?: string;
     totalCents?: number;
+    userId?: string | null;
   } = {},
 ) {
   const lines = opts.lines ?? [];
@@ -130,6 +153,7 @@ async function seedOrder(
       orderNumber: uniqueId("order"),
       status: opts.status ?? "PENDING",
       email: opts.email ?? "shopper@example.com",
+      userId: opts.userId ?? null,
       totalCents:
         opts.totalCents ??
         lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
@@ -157,6 +181,7 @@ function orderInput(
     id?: string;
     orderNumber?: string;
     stripePaymentIntentId?: string;
+    userId?: string | null;
   } = {},
 ): CreateOrderInput {
   return {
@@ -164,6 +189,7 @@ function orderInput(
     tenantId,
     orderNumber: overrides.orderNumber ?? uniqueId("order"),
     email: "shopper@example.com",
+    userId: overrides.userId ?? null,
     totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
     currency: "usd",
     stripePaymentIntentId: overrides.stripePaymentIntentId ?? uniqueId("pi"),
@@ -705,6 +731,36 @@ describe("orderRepository.createWithItems (reservation, integration)", () => {
       where: { id: variant.id },
     });
     expect(afterRetry.reserved).toBe(2);
+  });
+
+  it("persists the signed-in shopper's userId, and defaults to null for a guest (#102)", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 10 });
+    const shopper = await freshUser();
+
+    const linked = await orderRepository.createWithItems(
+      orderInput(
+        tenant.id,
+        [{ variantId: variant.id, qty: 1, priceCents: 1000 }],
+        { userId: shopper.id },
+      ),
+    );
+    const persistedLinked = await prisma.order.findUniqueOrThrow({
+      where: { id: linked.id },
+    });
+    expect(persistedLinked.userId).toBe(shopper.id);
+
+    // Guest checkout: the default `orderInput` (no override) must persist a real
+    // null, not leave the column undefined/omitted.
+    const guestOrder = await orderRepository.createWithItems(
+      orderInput(tenant.id, [
+        { variantId: variant.id, qty: 1, priceCents: 1000 },
+      ]),
+    );
+    const persistedGuest = await prisma.order.findUniqueOrThrow({
+      where: { id: guestOrder.id },
+    });
+    expect(persistedGuest.userId).toBeNull();
   });
 });
 
@@ -1361,9 +1417,21 @@ describe("orderRepository.findStalePending (integration)", () => {
 describe("orderRepository.findReusablePendingCandidates (integration)", () => {
   const EMAIL = "reuse-shopper@example.com";
   const recent = () => new Date(Date.now() - 60_000); // 1 min ago (inside window)
+  // The default query is a *guest* read (`userId: null` + email) — the identity
+  // arm the pre-#92 tests exercised. Authenticated reads pass `{ userId }` instead.
   const query = (tenantId: string) => ({
     tenantId,
+    userId: null,
     email: EMAIL,
+    totalCents: 3000,
+    currency: "usd",
+    createdAfter: new Date(Date.now() - 15 * 60_000),
+    limit: 5,
+  });
+  // An *authenticated* read: keyed on the session-proven userId, carrying no email.
+  const authQuery = (tenantId: string, userId: string) => ({
+    tenantId,
+    userId,
     totalCents: 3000,
     currency: "usd",
     createdAfter: new Date(Date.now() - 15 * 60_000),
@@ -1495,5 +1563,294 @@ describe("orderRepository.findReusablePendingCandidates (integration)", () => {
       limit: 2,
     });
     expect(found).toHaveLength(2);
+  });
+
+  // --- Identity binding (#92) -------------------------------------------------
+  // The reuse read closes a guest-checkout hole: a client-supplied email must not
+  // hand back a signed-in shopper's in-flight PaymentIntent. Authenticated reuse
+  // binds to the session-proven userId; guest reuse is pinned to userId:null.
+
+  it("matches an authenticated shopper on userId, ignoring the order's email (#92)", async () => {
+    const t = await freshTenant();
+    const shopper = await freshUser();
+    const variant = await seedVariant(t.id, { stock: 10, priceCents: 1500 });
+    const o = await seedOrder(t.id, {
+      userId: shopper.id,
+      // Whatever email happened to be on the order — an authenticated read never
+      // filters on it, so it must not affect the match.
+      email: "typed-something-else@example.com",
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+      lines: [{ variantId: variant.id, qty: 2, priceCents: 1500 }],
+    });
+
+    const found = await orderRepository.findReusablePendingCandidates(
+      authQuery(t.id, shopper.id),
+    );
+
+    expect(found.map((x) => x.id)).toEqual([o.id]);
+    expect(found[0].items).toHaveLength(1);
+  });
+
+  it("never lets a guest email match a signed-in shopper's in-flight order (#92)", async () => {
+    const t = await freshTenant();
+    const victim = await freshUser();
+    // Alice (signed in) has a PENDING order; an attacker knows her email + cart.
+    await seedOrder(t.id, {
+      userId: victim.id,
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+
+    // A GUEST checkout with Alice's email + identical cart total. The guest read is
+    // pinned to userId:null, so Alice's userId-bound order is invisible — the exact
+    // hole #92 closes (pre-fix, this returned her order + its client secret).
+    expect(
+      await orderRepository.findReusablePendingCandidates(query(t.id)),
+    ).toHaveLength(0);
+  });
+
+  it("does not match a different signed-in shopper's order (#92)", async () => {
+    const t = await freshTenant();
+    const alice = await freshUser();
+    const bob = await freshUser();
+    await seedOrder(t.id, {
+      userId: alice.id,
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+
+    // Bob's authenticated read must not pick up Alice's order.
+    expect(
+      await orderRepository.findReusablePendingCandidates(
+        authQuery(t.id, bob.id),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("an authenticated read does not pick up a guest (userId-null) order (#92)", async () => {
+    const t = await freshTenant();
+    const shopper = await freshUser();
+    // A guest order (userId null) with an otherwise-matching email/total/currency.
+    await seedOrder(t.id, {
+      userId: null,
+      email: EMAIL,
+      currency: "usd",
+      totalCents: 3000,
+      createdAt: recent(),
+    });
+
+    expect(
+      await orderRepository.findReusablePendingCandidates(
+        authQuery(t.id, shopper.id),
+      ),
+    ).toHaveLength(0);
+  });
+});
+
+/**
+ * `listByTenantAndUser` — the storefront account order history (#104). The
+ * guarantee is isolation: the read is scoped by BOTH `tenantId` AND the
+ * session-proven `userId`, so a shopper sees only their own orders — never
+ * another shopper's, never a guest's, and never their own order placed on a
+ * different store. Same offset pagination + newest-first ordering as the admin
+ * `listByTenant`.
+ */
+describe("orderRepository.listByTenantAndUser (integration)", () => {
+  it("returns only the shopper's own orders within the tenant, newest-first, with a total", async () => {
+    const tenant = await freshTenant();
+    const alice = await freshUser();
+    const bob = await freshUser();
+    const aliceOld = await seedOrder(tenant.id, {
+      userId: alice.id,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+    });
+    const aliceNew = await seedOrder(tenant.id, {
+      userId: alice.id,
+      createdAt: new Date("2026-02-01T00:00:00.000Z"),
+    });
+    // Bob's order in the same store must never appear in Alice's history.
+    const bobOrder = await seedOrder(tenant.id, { userId: bob.id });
+
+    const page = await orderRepository.listByTenantAndUser(
+      tenant.id,
+      alice.id,
+      {
+        page: 1,
+        pageSize: 10,
+      },
+    );
+
+    expect(page.total).toBe(2);
+    expect(page.orders.map((o) => o.id)).toEqual([aliceNew.id, aliceOld.id]);
+    expect(page.orders.map((o) => o.id)).not.toContain(bobOrder.id);
+  });
+
+  it("excludes guest (userId-null) orders", async () => {
+    const tenant = await freshTenant();
+    const alice = await freshUser();
+    await seedOrder(tenant.id, { userId: alice.id });
+    // A guest checkout in the same store carries userId null — not Alice's.
+    await seedOrder(tenant.id, { userId: null });
+
+    const page = await orderRepository.listByTenantAndUser(
+      tenant.id,
+      alice.id,
+      {
+        page: 1,
+        pageSize: 10,
+      },
+    );
+
+    expect(page.total).toBe(1);
+    expect(page.orders.every((o) => o.userId === alice.id)).toBe(true);
+  });
+
+  it("does not cross the tenant boundary — the same shopper's order on another store is excluded", async () => {
+    const storeA = await freshTenant();
+    const storeB = await freshTenant();
+    // One global shopper who has shopped at both stores.
+    const alice = await freshUser();
+    const atA = await seedOrder(storeA.id, { userId: alice.id });
+    await seedOrder(storeB.id, { userId: alice.id });
+
+    const page = await orderRepository.listByTenantAndUser(
+      storeA.id,
+      alice.id,
+      {
+        page: 1,
+        pageSize: 10,
+      },
+    );
+
+    // Scoped by tenant too: only the order placed on store A, never store B's.
+    expect(page.total).toBe(1);
+    expect(page.orders.map((o) => o.id)).toEqual([atA.id]);
+  });
+
+  it("paginates — each page continues where the last left off", async () => {
+    const tenant = await freshTenant();
+    const alice = await freshUser();
+    const dates = [
+      "2026-01-01",
+      "2026-01-02",
+      "2026-01-03",
+      "2026-01-04",
+      "2026-01-05",
+    ];
+    const created: { id: string }[] = [];
+    for (const d of dates) {
+      created.push(
+        await seedOrder(tenant.id, {
+          userId: alice.id,
+          createdAt: new Date(`${d}T00:00:00.000Z`),
+        }),
+      );
+    }
+    const newestFirst = [...created].reverse().map((o) => o.id);
+
+    const p1 = await orderRepository.listByTenantAndUser(tenant.id, alice.id, {
+      page: 1,
+      pageSize: 2,
+    });
+    const p2 = await orderRepository.listByTenantAndUser(tenant.id, alice.id, {
+      page: 2,
+      pageSize: 2,
+    });
+    const p3 = await orderRepository.listByTenantAndUser(tenant.id, alice.id, {
+      page: 3,
+      pageSize: 2,
+    });
+
+    expect(p1.total).toBe(5);
+    expect(p1.orders.map((o) => o.id)).toEqual(newestFirst.slice(0, 2));
+    expect(p2.orders.map((o) => o.id)).toEqual(newestFirst.slice(2, 4));
+    expect(p3.orders.map((o) => o.id)).toEqual(newestFirst.slice(4, 5));
+  });
+});
+
+/**
+ * `findByIdForTenantAndUser` — the storefront order detail read (#104). The
+ * security-critical guarantee: with `userId` in the WHERE alongside `tenantId`,
+ * a shopper can open ONLY their own order — another shopper's id (even in the
+ * same store), a guest order, or an order on a different store all resolve to
+ * null, and the page renders a real 404. This is why the issue forbids reusing
+ * the tenant-only `findByIdForTenant`, which would leak across shoppers.
+ */
+describe("orderRepository.findByIdForTenantAndUser (integration)", () => {
+  it("returns the shopper's own order with its items", async () => {
+    const tenant = await freshTenant();
+    const alice = await freshUser();
+    const variant = await seedVariant(tenant.id, {
+      stock: 10,
+      priceCents: 1500,
+    });
+    const order = await seedOrder(tenant.id, {
+      userId: alice.id,
+      lines: [{ variantId: variant.id, qty: 2, priceCents: 1500 }],
+    });
+
+    const found = await orderRepository.findByIdForTenantAndUser(
+      tenant.id,
+      alice.id,
+      order.id,
+    );
+
+    expect(found?.id).toBe(order.id);
+    expect(found?.items).toHaveLength(1);
+    expect(found?.items[0]).toMatchObject({
+      variantId: variant.id,
+      quantity: 2,
+    });
+  });
+
+  it("returns null for another shopper's order in the same tenant (no cross-shopper leak)", async () => {
+    const tenant = await freshTenant();
+    const alice = await freshUser();
+    const bob = await freshUser();
+    const bobOrder = await seedOrder(tenant.id, { userId: bob.id });
+
+    // Alice guessing/altering the id to Bob's order must get nothing back — the
+    // core acceptance criterion of #104.
+    const found = await orderRepository.findByIdForTenantAndUser(
+      tenant.id,
+      alice.id,
+      bobOrder.id,
+    );
+    expect(found).toBeNull();
+  });
+
+  it("returns null for a guest (userId-null) order", async () => {
+    const tenant = await freshTenant();
+    const alice = await freshUser();
+    const guestOrder = await seedOrder(tenant.id, { userId: null });
+
+    const found = await orderRepository.findByIdForTenantAndUser(
+      tenant.id,
+      alice.id,
+      guestOrder.id,
+    );
+    expect(found).toBeNull();
+  });
+
+  it("does not cross the tenant boundary — a foreign store's order is invisible", async () => {
+    const storeA = await freshTenant();
+    const storeB = await freshTenant();
+    const alice = await freshUser();
+    // Alice's own order, but placed on store B.
+    const atB = await seedOrder(storeB.id, { userId: alice.id });
+
+    // Reading it under store A's scope (with Alice's id) must resolve to null.
+    const found = await orderRepository.findByIdForTenantAndUser(
+      storeA.id,
+      alice.id,
+      atB.id,
+    );
+    expect(found).toBeNull();
   });
 });

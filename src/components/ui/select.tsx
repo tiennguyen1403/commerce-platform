@@ -4,6 +4,7 @@ import * as React from "react";
 import { Select as SelectPrimitive } from "@base-ui/react/select";
 
 import { cn } from "@/lib/utils";
+import { TENANT_THEME_PORTAL_ATTR } from "@/lib/theme";
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react";
 
 const Select = SelectPrimitive.Root;
@@ -83,6 +84,13 @@ function SelectContent({
         <SelectPrimitive.Popup
           data-slot="select-content"
           data-align-trigger={alignItemWithTrigger}
+          // #113: this popup portals to <body>, escaping the storefront's
+          // [data-tenant-theme] wrapper, so the per-tenant accent would not reach
+          // its items. Stamping this marker lets the storefront's injected <style>
+          // re-apply the accent here; it is inert under (admin)/(auth), which never
+          // mount that <style>. The attribute name is the single source of truth in
+          // @/lib/theme, shared with the CSS emitter so the two can't drift.
+          {...{ [TENANT_THEME_PORTAL_ATTR]: "" }}
           className={cn(
             "bg-popover text-popover-foreground ring-foreground/10 data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 relative isolate z-50 max-h-(--available-height) w-(--anchor-width) min-w-36 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg shadow-md ring-1 duration-100 data-[align-trigger=true]:animate-none",
             className,

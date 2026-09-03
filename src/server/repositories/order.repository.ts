@@ -31,30 +31,45 @@ export type StalePendingOrder = {
   stripePaymentIntentId: string | null;
 };
 
-/** Query for reusable in-flight checkout candidates (the #25 dedupe read). The
- *  equality filters — tenant, shopper email, currency, and re-priced total — are
- *  pushed to the DB; the remaining line-set match and the live PaymentIntent-status
- *  check stay in the service, which owns that business logic. */
+/** Who a reuse read is on behalf of — the identity binding that closes #92. A
+ *  discriminated union: an authenticated shopper passes `{ userId }` and is matched
+ *  on that session-proven id alone; a guest passes `{ userId: null, email }` and is
+ *  matched on email but pinned to guest (userId-null) orders, so a guest-supplied
+ *  email can never match — and reuse — a signed-in shopper's order. The `email?:
+ *  never` on the authenticated arm makes crossing the trust boundary a *type* error
+ *  (a client-supplied email can't ride along on an authenticated match); the query
+ *  builder also reads `email` only in the guest branch, so it's enforced at runtime
+ *  too. */
+export type ReusablePendingIdentity =
+  { userId: string; email?: never } | { userId: null; email: string };
+
+/** Query for reusable in-flight checkout candidates (the #25 dedupe read, identity-
+ *  bound in #92). The equality filters — tenant, caller identity, currency, and
+ *  re-priced total — are pushed to the DB; the remaining line-set match and the live
+ *  PaymentIntent-status check stay in the service, which owns that business logic. */
 export type ReusablePendingQuery = {
   tenantId: string;
-  email: string;
   totalCents: number;
   currency: string;
   /** Lower bound on `createdAt` — the reuse window (a soon-to-be-swept order isn't
    *  worth reusing). */
   createdAfter: Date;
   limit: number;
-};
+} & ReusablePendingIdentity;
 
 /** A full order to persist. The `id`, `orderNumber`, total, and per-item prices
  *  are all computed by the service (from a fresh variant read) — never the
  *  client. `id` is pre-generated so the linked PaymentIntent can carry it in
- *  metadata while the row is written with the PaymentIntent id in one write. */
+ *  metadata while the row is written with the PaymentIntent id in one write.
+ *  `userId` links the order to a signed-in shopper (resolved server-side from
+ *  the session, never client-supplied) or is null for a guest checkout. */
 export type CreateOrderInput = {
   id: string;
   tenantId: string;
   orderNumber: string;
   email: string;
+  /** The authenticated shopper's global `User` id, or null for a guest. */
+  userId: string | null;
   totalCents: number;
   currency: string;
   stripePaymentIntentId: string;
@@ -152,6 +167,14 @@ export type ListOrdersParams = {
   pageSize: number;
 };
 
+/** Paginated query over a single shopper's own orders within a tenant — the
+ *  storefront account order history (#104). `page` is 1-based; `pageSize` bounds
+ *  the rows. No `status` filter: a shopper's list shows all their orders. */
+export type ListUserOrdersParams = {
+  page: number;
+  pageSize: number;
+};
+
 /** One page of a tenant's orders (bare rows, newest first) plus `total` — the
  *  count matching the same filter, for the caller's page math. */
 export type OrdersPage = {
@@ -218,6 +241,9 @@ export const orderRepository = {
               orderNumber: input.orderNumber,
               status: "PENDING",
               email: input.email,
+              // Null for a guest; a signed-in shopper's global `User` id
+              // otherwise (server-resolved upstream, never from the client).
+              userId: input.userId,
               totalCents: input.totalCents,
               currency: input.currency,
               stripePaymentIntentId: input.stripePaymentIntentId,
@@ -272,6 +298,25 @@ export const orderRepository = {
   },
 
   /**
+   * One of a shopper's orders by id, scoped to BOTH the tenant AND the
+   * session-proven `userId`, with its line items — the storefront order detail
+   * (#104). Deliberately NOT a reuse of the tenant-only `findByIdForTenant`:
+   * scoping by `tenantId` alone would let a signed-in shopper open another
+   * shopper's order in the same store by guessing or altering its id. With
+   * `userId` in the WHERE a foreign (or guest, `userId: null`) order resolves to
+   * null and the page renders a real 404. Return type left to inference like the
+   * other `include: { items: true }` reads — annotating it `OrderWithItems` would
+   * make `orderRepository`'s type reference a type derived from `orderRepository`
+   * (a circular reference); the inferred shape is structurally `OrderWithItems`.
+   */
+  findByIdForTenantAndUser(tenantId: string, userId: string, id: string) {
+    return prisma.order.findFirst({
+      where: { tenantId, userId, id },
+      include: { items: true },
+    });
+  },
+
+  /**
    * PENDING orders created before `olderThan`, oldest first, up to `limit` — the
    * abandoned-checkout sweep's work list (#25). Like the outbox drain's `findDue`,
    * this is a **platform-wide** cron query and deliberately spans all tenants — the
@@ -298,11 +343,19 @@ export const orderRepository = {
    * Recent PENDING orders (newest first) that could be the *same* in-flight
    * checkout a shopper is re-submitting — the dedupe read behind
    * `orderService.startCheckout` (#25). Scoped to the tenant (golden rule #1) and
-   * the shopper's `email`, and pre-filtered to the re-priced cart's exact
+   * the caller's identity (#92), and pre-filtered to the re-priced cart's exact
    * `currency` + `totalCents`, so a stale-priced prior attempt can never be a
    * candidate; `createdAfter` bounds it to the reuse window. Returns the orders
    * *with items* so the service can confirm the line-set matches before reusing the
    * linked PaymentIntent's client secret. Newest first so the freshest attempt wins.
+   *
+   * Identity binding (#92) is the fix for a guest reuse trusting a client-supplied
+   * email: an authenticated shopper (`q.userId !== null`) matches on the
+   * session-proven `userId` alone — the typed email is never part of the match; a
+   * guest (`q.userId === null`) matches on `email` but is pinned to `userId: null`,
+   * so a guest-supplied email can't match — and hand back — a signed-in shopper's
+   * in-flight order. Both branches are served by the `[tenantId, userId, createdAt]`
+   * index (#102): `userId` is an equality (a value or `null`) either way.
    *
    * Return type is left to inference (like the other `include: { items: true }`
    * reads here): annotating it `OrderWithItems[]` would make `orderRepository`'s
@@ -313,11 +366,16 @@ export const orderRepository = {
     return prisma.order.findMany({
       where: {
         tenantId: q.tenantId,
-        email: q.email,
         status: "PENDING",
         currency: q.currency,
         totalCents: q.totalCents,
         createdAt: { gte: q.createdAfter },
+        // Identity binding (#92): a signed-in shopper is matched on the
+        // session-proven `userId`; a guest on `email`, but pinned to `userId: null`
+        // so a guest email can never reuse a signed-in shopper's in-flight order.
+        ...(q.userId !== null
+          ? { userId: q.userId }
+          : { userId: null, email: q.email }),
       },
       orderBy: { createdAt: "desc" },
       take: q.limit,
@@ -516,6 +574,39 @@ export const orderRepository = {
       tenantId,
       ...(status ? { status } : {}),
     };
+    const [orders, total] = await prisma.$transaction([
+      prisma.order.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        skip: Math.max(0, (page - 1) * pageSize),
+        take: Math.max(1, pageSize),
+      }),
+      prisma.order.count({ where }),
+    ]);
+    return { orders, total };
+  },
+
+  /**
+   * A single shopper's orders within a tenant, newest first — the storefront
+   * account order history (#104). Scoped by BOTH `tenantId` AND the
+   * session-proven `userId` (never `tenantId` alone), so one shopper can never
+   * see another's orders even within the same store. Offset-paginated (`page` is
+   * 1-based) exactly like the admin `listByTenant`, ordered `createdAt DESC` with
+   * `id` as a stable tiebreak — served by the `[tenantId, userId, createdAt]`
+   * index (#102). Returns bare orders (no items): a list row shows
+   * number/date/status/total, while the detail page loads items via
+   * `findByIdForTenantAndUser`. `total` is the count for the same scope (for the
+   * caller's page math); the two reads are batched into one transaction (a single
+   * round-trip). `page`/`pageSize` are floored defensively here (never a negative
+   * `skip`, and `take` never flips into Prisma's reverse pagination); the calling
+   * boundary must still zod-validate them as positive ints.
+   */
+  async listByTenantAndUser(
+    tenantId: string,
+    userId: string,
+    { page, pageSize }: ListUserOrdersParams,
+  ): Promise<OrdersPage> {
+    const where: Prisma.OrderWhereInput = { tenantId, userId };
     const [orders, total] = await prisma.$transaction([
       prisma.order.findMany({
         where,

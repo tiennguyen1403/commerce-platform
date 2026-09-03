@@ -1,11 +1,12 @@
 import type { Appearance } from "@stripe/stripe-js";
 
 import { oklchToSrgb } from "@/lib/color";
+import { TENANT_THEME_SELECTOR } from "@/lib/theme";
 
 /**
  * Build the Stripe Payment Element `appearance` from the app's live design
- * tokens, so the embedded card widget matches the storefront's emerald palette
- * and radius instead of Stripe's default blue-on-white / blue-on-night presets.
+ * tokens, so the embedded card widget matches the active store's accent and
+ * radius instead of Stripe's default blue-on-white / blue-on-night presets.
  *
  * Why read the tokens at runtime rather than hardcode a hex palette: the Stripe
  * iframe can't see our `:root` custom properties, so the values must be
@@ -17,6 +18,12 @@ import { oklchToSrgb } from "@/lib/color";
  * conversion deterministically, so we never depend on how a browser happens to
  * serialize a resolved color.
  *
+ * We read from the per-tenant theme wrapper (`[data-tenant-theme]`, #98), not the
+ * document root, so `--primary` resolves to the *active store's* accent — the
+ * widget matches whichever hue the storefront is showing. The neutral tokens
+ * (background, text, borders) aren't overridden there, so they inherit from
+ * `:root` and read identically either way.
+ *
  * Everything degrades gracefully: a token that can't be read/parsed is simply
  * omitted, leaving Stripe's base `theme` value for that property — so the worst
  * case is the pre-existing "night"/"stripe" preset, never a broken widget.
@@ -24,6 +31,17 @@ import { oklchToSrgb } from "@/lib/color";
 
 /** The slice of `CSSStyleDeclaration` we need — injectable so this is unit-testable. */
 type TokenSource = Pick<CSSStyleDeclaration, "getPropertyValue">;
+
+/**
+ * Live design tokens for the active storefront: the per-tenant theme wrapper when
+ * present (so `--primary` is the store's accent), else the document root. `null`
+ * during SSR (no `document`), where the caller falls back to the base Stripe theme.
+ */
+function defaultTokenSource(): TokenSource | null {
+  if (typeof document === "undefined") return null;
+  const themed = document.querySelector(TENANT_THEME_SELECTOR);
+  return getComputedStyle(themed ?? document.documentElement);
+}
 
 export function buildCheckoutAppearance(
   prefersDark: boolean,
@@ -33,11 +51,7 @@ export function buildCheckoutAppearance(
   // pick a theme, then override with variables); our overrides sit on top.
   const theme: Appearance["theme"] = prefersDark ? "night" : "stripe";
 
-  const styles =
-    source ??
-    (typeof document !== "undefined"
-      ? getComputedStyle(document.documentElement)
-      : null);
+  const styles = source ?? defaultTokenSource();
   if (!styles) return { theme };
 
   const raw = (name: string) => styles.getPropertyValue(name).trim();

@@ -25,6 +25,12 @@ model Tenant {
   // per-variant currency, so a cart/order can never mix currencies. One store =
   // one currency (M1 is single-tenant; a store-settings editor is a follow-up).
   currency  String   @default("usd")
+  // Per-tenant storefront accent: an OKLCH hue angle (0–359°) fed to the scoped
+  // theme in `(storefront)/layout.tsx` (see src/lib/theme.ts). Defaults to the
+  // platform emerald (162°, see globals.css / docs/DESIGN.md), so an existing
+  // store is a visual no-op. NOT NULL + DEFAULT keeps the migration safe on
+  // non-empty tables (docs/DATABASE.md migration guard).
+  themeHue  Int      @default(162)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -71,6 +77,11 @@ model User {
   sessions    Session[]
   accounts    Account[]
   memberships Membership[]
+  // A shopper's orders across the platform (each row stays tenant-scoped by its
+  // own `Order.tenantId`). Back-relation for `Order.user`; nullable there, so a
+  // User may have none, and `onDelete: SetNull` keeps their orders if the
+  // account is ever removed (the order de-links to a guest, never cascades).
+  orders      Order[]
 }
 
 model Session {
@@ -141,11 +152,28 @@ model Product {
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
 
+  // Full-text search vector (#105). A Postgres STORED generated column — the
+  // database recomputes `setweight(to_tsvector(title),'A') ‖
+  // setweight(to_tsvector(description),'B')` on every write, never Prisma. The
+  // real DDL (the column and its GIN index) is hand-authored in the migration,
+  // because a Prisma model can't express GENERATED/tsvector. This field mirrors
+  // that column in the exact form `prisma db pull` emits — `Unsupported` +
+  // `@default(dbgenerated(...))`, with `@@index(..., type: Gin)` below — so the
+  // schema matches the DB and `migrate` proposes no drift. Prisma omits it from
+  // the generated client's selects and writes (Unsupported + DB-generated), so
+  // `searchActiveByTenant` reaches it through a parameterized `$queryRaw`
+  // (`@@ websearch_to_tsquery`) served by the GIN index. See docs/DATABASE.md.
+  searchVector Unsupported("tsvector")? @default(dbgenerated("(setweight(to_tsvector('english'::regconfig, COALESCE(title, ''::text)), 'A'::\"char\") || setweight(to_tsvector('english'::regconfig, COALESCE(description, ''::text)), 'B'::\"char\"))"))
+
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   variants ProductVariant[]
 
   @@unique([tenantId, slug])
   @@index([tenantId])
+  // GIN index over the generated `searchVector` (created in the migration); the
+  // search query rides it. Declared here in `prisma db pull`'s form so the
+  // schema and DB agree and no spurious drop-index migration is ever generated.
+  @@index([searchVector], type: Gin)
 }
 
 model ProductVariant {
@@ -195,6 +223,13 @@ model Order {
   orderNumber           String
   status                OrderStatus @default(PENDING)
   email                 String
+  // The signed-in shopper who placed this order, or null for a guest checkout.
+  // Identity is platform-wide (the global `User`), but the order stays
+  // tenant-scoped by `tenantId` regardless. Resolved server-side from the
+  // session at checkout — never client-supplied (#102). `onDelete: SetNull` (see
+  // the relation below) keeps a paid order's history intact if the account is
+  // later deleted: it de-links to a guest row rather than cascading away.
+  userId                String?
   totalCents            Int
   currency              String      @default("usd")
   stripePaymentIntentId String?     @unique
@@ -209,6 +244,9 @@ model Order {
   updatedAt             DateTime    @updatedAt
 
   tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // Nullable link to the global shopper account. SetNull (not Cascade) so
+  // deleting a User never deletes their orders — the order de-links to a guest.
+  user           User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
   items          OrderItem[]
   outboxMessages OutboxMessage[]
 
@@ -218,6 +256,11 @@ model Order {
   // status-filtered. Composite so the tenant scope + `createdAt` ordering is
   // index-served, not a sort over the tenant's whole order history.
   @@index([tenantId, createdAt])
+  // A signed-in shopper's order history within one store (`listByTenantAndUser`,
+  // #92): tenant-scoped first (golden rule 1), then by shopper, newest-first — so
+  // the history read is index-served, not a scan+sort. Tenant-leading like the
+  // other Order indexes; the `userId` it also covers is null for guest orders.
+  @@index([tenantId, userId, createdAt])
   // Abandoned-PENDING sweep (`findStalePending`, #25): the platform-wide cron
   // selects PENDING orders older than a grace window, oldest first, ACROSS all
   // tenants — so it can't use the tenant-scoped index above. Composite [status,

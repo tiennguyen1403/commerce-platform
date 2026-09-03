@@ -1,0 +1,172 @@
+import { z } from "zod";
+
+/**
+ * Per-tenant storefront accent theming.
+ *
+ * Each store carries a single hue (`Tenant.themeHue`, an OKLCH hue angle). The
+ * storefront layout wraps its subtree in `[data-tenant-theme]` and injects the
+ * CSS this module builds, which re-parametrizes the accent tokens by that hue —
+ * so two stores render distinct accents from one shared recipe, SSR'd and
+ * theme-aware, with no cross-tenant bleed: the override lives on the wrapper, not
+ * `:root`, so it never reaches the `(admin)`/`(auth)` trees rendered as siblings
+ * under the root layout.
+ *
+ * Only the *hue-carrying* tokens are overridden; lightness and chroma are copied
+ * verbatim from `globals.css`, so a store on {@link DEFAULT_THEME_HUE} is a
+ * pixel-for-pixel no-op. Everything neutral (background, text, borders) is left
+ * untouched — a store gets its own accent, not a full re-skin.
+ */
+
+/**
+ * The platform's default accent hue — emerald (see docs/DESIGN.md). Matches the
+ * `162` in every accent token in `globals.css` (and the `Tenant.themeHue` column
+ * default in `schema.prisma`), so a tenant on this hue renders identically to the
+ * base theme. Also the fallback for an invalid stored value.
+ */
+export const DEFAULT_THEME_HUE = 162;
+
+/**
+ * Selector for the storefront theme wrapper. The layout stamps this attribute on
+ * its root element; the generated CSS ({@link tenantThemeCss}) and the checkout
+ * appearance both target it. Shared here so the three sides can never drift.
+ */
+export const TENANT_THEME_SELECTOR = "[data-tenant-theme]";
+
+/**
+ * Marker attribute a storefront overlay stamps on its *portaled* surface so the
+ * injected theme CSS still reaches it (#113). CSS custom properties inherit down
+ * the DOM tree, so an overlay rendered through a portal to `document.body` — e.g.
+ * `SelectContent` (`src/components/ui/select.tsx`) — escapes
+ * {@link TENANT_THEME_SELECTOR} and would fall back to the `:root` platform
+ * accent. {@link tenantThemeCss} re-emits the accent recipe for
+ * {@link TENANT_THEME_PORTAL_SELECTOR} alongside the wrapper; the rule is
+ * document-wide, but it exists *only while the storefront `<style>` is mounted* —
+ * never in the `(admin)`/`(auth)` trees — so the #98 isolation holds. `select.tsx`
+ * stamps this exact constant, so the marker and the CSS can never drift; any
+ * future storefront overlay portaled to `<body>` (dialog, popover, toast) should
+ * stamp it too. Deliberately distinct from the wrapper attribute: checkout locates
+ * the wrapper via `querySelector(TENANT_THEME_SELECTOR)`, which must never match an
+ * overlay.
+ */
+export const TENANT_THEME_PORTAL_ATTR = "data-tenant-theme-portal";
+
+/** CSS-selector form of {@link TENANT_THEME_PORTAL_ATTR}, targeted by {@link tenantThemeCss}. */
+export const TENANT_THEME_PORTAL_SELECTOR = `[${TENANT_THEME_PORTAL_ATTR}]`;
+
+/**
+ * A valid OKLCH hue: an integer degree in [0, 359]. This is the CSS-injection
+ * boundary — only a bare integer can reach the interpolated `oklch()` string —
+ * and it rejects out-of-range/non-integer values (NaN included, via `.int()`) so
+ * a bad stored hue falls back to the default instead of emitting broken CSS.
+ */
+export const themeHueSchema = z.number().int().min(0).max(359);
+
+/**
+ * Coerce a stored hue to a safe value. Returns the hue when it's a valid integer
+ * degree, else {@link DEFAULT_THEME_HUE}. The column defaults to a valid hue and
+ * a future store-settings editor will validate on the way in, so an invalid value
+ * is only reachable by a raw DB write — this keeps even that from breaking a page.
+ */
+export function resolveThemeHue(raw: number): number {
+  const parsed = themeHueSchema.safeParse(raw);
+  return parsed.success ? parsed.data : DEFAULT_THEME_HUE;
+}
+
+/**
+ * The hue-carrying subset of the OKLCH token recipe in `globals.css`, as
+ * `[token, lightness, chroma]` tuples per color scheme. The per-tenant hue is
+ * injected into each; L and C are copied verbatim from `:root` / the dark
+ * `@media` block, so {@link DEFAULT_THEME_HUE} reproduces the base theme exactly.
+ * Keep in sync with `globals.css` — these are the only tokens whose value depends
+ * on the accent. (Light `--primary-foreground` is achromatic, so its hue is inert;
+ * it's kept in the recipe for a uniform light/dark shape.)
+ */
+const TOKEN_RECIPE: Record<
+  "light" | "dark",
+  ReadonlyArray<readonly [token: string, l: number, c: number]>
+> = {
+  light: [
+    ["--primary", 0.5, 0.12],
+    ["--primary-foreground", 0.985, 0],
+    ["--accent", 0.96, 0.02],
+    ["--accent-foreground", 0.35, 0.09],
+    ["--ring", 0.55, 0.13],
+  ],
+  dark: [
+    ["--primary", 0.72, 0.14],
+    ["--primary-foreground", 0.18, 0.02],
+    ["--accent", 0.27, 0.02],
+    ["--accent-foreground", 0.9, 0.03],
+    ["--ring", 0.62, 0.13],
+  ],
+};
+
+function declarations(
+  tokens: (typeof TOKEN_RECIPE)["light"],
+  hue: number,
+): string {
+  return tokens
+    .map(([name, l, c]) => `${name}:oklch(${l} ${c} ${hue});`)
+    .join("");
+}
+
+/**
+ * Build the scoped `<style>` body that re-themes the storefront to `hue`. Emits
+ * the light recipe and, inside the same `prefers-color-scheme: dark` media query
+ * `globals.css` uses, the dark recipe — so the accent follows the OS scheme
+ * exactly like the base tokens do — for two selectors: the in-flow wrapper
+ * ({@link TENANT_THEME_SELECTOR}) and any overlay portaled out of it
+ * ({@link TENANT_THEME_PORTAL_SELECTOR}, #113). `hue` is validated here (the
+ * interpolation boundary), so any caller value is safe.
+ */
+export function tenantThemeCss(hue: number): string {
+  const safe = resolveThemeHue(hue);
+  // Theme the in-flow wrapper and any overlay portaled out of it (#113) from the
+  // one recipe. The portal selector is document-wide, but this rule lives only in
+  // the storefront subtree's <style>, so it never reaches (admin)/(auth).
+  const scope = `${TENANT_THEME_SELECTOR},${TENANT_THEME_PORTAL_SELECTOR}`;
+  return (
+    `${scope}{${declarations(TOKEN_RECIPE.light, safe)}}\n` +
+    `@media (prefers-color-scheme:dark){` +
+    `${scope}{${declarations(TOKEN_RECIPE.dark, safe)}}}`
+  );
+}
+
+/** The concrete accent colors for a hue, as ready-to-use `oklch()` strings. */
+export interface AccentPreview {
+  /** Storefront primary — buttons, links, the active accent. */
+  primary: string;
+  /** Readable text/icon color on top of {@link primary}. */
+  primaryForeground: string;
+  /** Focus-ring / slider accent. */
+  ring: string;
+}
+
+/**
+ * Resolve a hue to its concrete accent swatches, for UI that must show the
+ * accent *outside* the themed storefront subtree — the admin settings picker
+ * lives under the platform theme, so it can't read the per-tenant tokens off the
+ * cascade and instead renders these values inline. Uses the light-scheme L/C
+ * from {@link TOKEN_RECIPE} (a mid-tone primary reads fine on either admin
+ * scheme), and validates the hue via {@link resolveThemeHue} so an out-of-range
+ * value previews the default rather than emitting a broken `oklch()`. Derived
+ * from the recipe by token name, so the preview can never drift from the CSS the
+ * storefront actually ships.
+ */
+export function accentPreview(hue: number): AccentPreview {
+  const safe = resolveThemeHue(hue);
+  const byToken = new Map(
+    TOKEN_RECIPE.light.map(([name, l, c]) => [
+      name,
+      `oklch(${l} ${c} ${safe})`,
+    ]),
+  );
+  // The recipe always carries these tokens; the fallback only satisfies the
+  // types and is never reached.
+  const fallback = `oklch(0.5 0.12 ${safe})`;
+  return {
+    primary: byToken.get("--primary") ?? fallback,
+    primaryForeground: byToken.get("--primary-foreground") ?? fallback,
+    ring: byToken.get("--ring") ?? fallback,
+  };
+}

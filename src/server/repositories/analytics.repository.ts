@@ -26,22 +26,117 @@ export type VariantStockRow = {
   productId: string;
 };
 
+/** The tenant's revenue split three ways, all integer cents (#93):
+ *  - `grossCents` — every captured order (PAID + FULFILLED + REFUNDED): money that
+ *    was actually collected at the card, before any reversal.
+ *  - `refundedCents` — fully-refunded orders (REFUNDED). M2/M3 support full refunds
+ *    only, so a REFUNDED order's whole `totalCents` IS the refunded amount; the
+ *    REFUND transition rewrites `status` alone and never the total
+ *    (`order.repository.markRefundedByPaymentIntent`), so the sale's snapshot
+ *    survives to be netted out here.
+ *  - `netCents` — `grossCents − refundedCents`: revenue the store still holds. Equal
+ *    to the PAID + FULFILLED sum (the single figure the dashboard reported before
+ *    #93, when a refund dropped its whole order rather than being netted), but now
+ *    derived so it can be surfaced *as* net alongside the gross it comes from. */
+export type RevenueBreakdown = {
+  grossCents: number;
+  refundedCents: number;
+  netCents: number;
+};
+
+/** One UTC day's revenue + order-count aggregates from `revenueTimeSeries`,
+ *  straight off the `$queryRaw` (before the service zero-fills the missing days).
+ *  Declared standalone for the same reason as `VariantStockRow` — a
+ *  `ReturnType<typeof analyticsRepository.…>`-derived type would collapse the repo
+ *  object to `any` (TS7022/TS2456). `day` is the `date_trunc('day')` bucket
+ *  rendered as a `YYYY-MM-DD` string in SQL (see the method), so there is no
+ *  `timestamp`→`Date` timezone round-trip to reason about; the cent figures come
+ *  from `COALESCE(SUM(…), 0)::int`, so they are always real integers, never null. */
+export type RevenueTimeSeriesRow = {
+  day: string;
+  orderCount: number;
+  grossCents: number;
+  refundedCents: number;
+};
+
 export const analyticsRepository = {
   /**
-   * Sum of captured revenue (integer cents) for the tenant: every PAID or
-   * FULFILLED order counts, reusing the captured-state set from the refund
-   * guard in `order.repository.markRefundedByPaymentIntent`. `_sum.totalCents`
-   * is `null` when no order matches, coalesced to 0. Sums raw `totalCents` under
-   * the single-currency-per-tenant invariant (each order snapshots its own
-   * `currency`, always equal to the tenant's today) — revisit if multi-currency
-   * ships and one tenant can hold orders in mixed currencies.
+   * Revenue split into gross / refunds / net for the tenant (#93). One `groupBy`
+   * sums `totalCents` per captured status: PENDING and CANCELLED never represent
+   * collected money (a PENDING order was never charged; CANCELLED is only ever
+   * reached from PENDING, before capture), so they're excluded by the `where`.
+   * REFUNDED stays in — its snapshot is the refunded amount, netted below.
+   *
+   * `groupBy` omits empty groups, so a missing status contributes 0 via `sumFor`;
+   * `_sum.totalCents` is otherwise a real integer (never null for a present
+   * group). Sums raw `totalCents` under the single-currency-per-tenant invariant
+   * (each order snapshots its own `currency`, always equal to the tenant's today)
+   * — revisit if multi-currency ships and one tenant holds mixed currencies.
    */
-  async revenueTotalCents(tenantId: string): Promise<number> {
-    const result = await prisma.order.aggregate({
-      where: { tenantId, status: { in: ["PAID", "FULFILLED"] } },
+  async revenueBreakdown(tenantId: string): Promise<RevenueBreakdown> {
+    const rows = await prisma.order.groupBy({
+      by: ["status"],
+      where: { tenantId, status: { in: ["PAID", "FULFILLED", "REFUNDED"] } },
       _sum: { totalCents: true },
     });
-    return result._sum.totalCents ?? 0;
+    const sumFor = (status: OrderStatus) =>
+      rows.find((row) => row.status === status)?._sum.totalCents ?? 0;
+    const grossCents =
+      sumFor("PAID") + sumFor("FULFILLED") + sumFor("REFUNDED");
+    const refundedCents = sumFor("REFUNDED");
+    // Net = gross − refunds (== PAID + FULFILLED). Derived from the same sums, so
+    // the two figures can never drift and net is guaranteed ≤ gross.
+    return { grossCents, refundedCents, netCents: grossCents - refundedCents };
+  },
+
+  /**
+   * Revenue and order counts bucketed by UTC day for the tenant, from `since`
+   * (inclusive) onward — the raw material for the analytics trend charts (#107).
+   * One `$queryRaw` because Prisma's `groupBy` can't `date_trunc` a timestamp
+   * into day buckets; the fixed tagged template binds only `tenantId` and `since`
+   * (no dynamic SQL), so it stays a plain parameterised query like the raw reads
+   * in `product.repository`.
+   *
+   * The status split mirrors `revenueBreakdown` EXACTLY — `grossCents` sums every
+   * captured status (PAID + FULFILLED + REFUNDED), `refundedCents` sums REFUNDED —
+   * so a day's figures and the all-time headline can never disagree. `orderCount`
+   * is every order created that day regardless of status (a placed order counts as
+   * volume even before capture). PENDING/CANCELLED contribute to the count but not
+   * to the money, via the `FILTER` clauses.
+   *
+   * `createdAt` is a `timestamp` (no zone) holding Prisma's UTC value, so
+   * `date_trunc('day', …)` needs no session-timezone reasoning; `to_char(…,
+   * 'YYYY-MM-DD')` returns the bucket as a plain string, side-stepping any
+   * `timestamp`→`Date` interpretation on the way back and giving the service a
+   * ready-made join key. Returns ONE row per day that HAD at least one order
+   * (gaps are absent, not zero — the service zero-fills the window), oldest first.
+   * Every camelCase alias is double-quoted so Postgres doesn't fold it to
+   * lowercase (which would read back `undefined`); counts/sums are `::int` so the
+   * typed row is always an integer, never a `bigint`.
+   */
+  async revenueTimeSeries(
+    tenantId: string,
+    since: Date,
+  ): Promise<RevenueTimeSeriesRow[]> {
+    return prisma.$queryRaw<RevenueTimeSeriesRow[]>`
+      SELECT
+        to_char(date_trunc('day', "createdAt"), 'YYYY-MM-DD') AS "day",
+        count(*)::int AS "orderCount",
+        COALESCE(
+          sum("totalCents") FILTER (
+            WHERE "status"::text IN ('PAID', 'FULFILLED', 'REFUNDED')
+          ),
+          0
+        )::int AS "grossCents",
+        COALESCE(
+          sum("totalCents") FILTER (WHERE "status"::text = 'REFUNDED'),
+          0
+        )::int AS "refundedCents"
+      FROM "Order"
+      WHERE "tenantId" = ${tenantId} AND "createdAt" >= ${since}
+      GROUP BY 1
+      ORDER BY 1
+    `;
   },
 
   /**

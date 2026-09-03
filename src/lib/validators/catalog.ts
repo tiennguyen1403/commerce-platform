@@ -30,8 +30,10 @@ export const CURRENCY_LABELS: Record<CurrencyValue, string> = {
   gbp: "GBP",
 };
 
-// Lowercase words joined by single hyphens, e.g. "classic-tee".
-const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+// Lowercase words joined by single hyphens, e.g. "classic-tee". Exported and
+// reused by store-slug (subdomain) onboarding validation — one shape rule for
+// every user-facing slug in the app, never redefined.
+export const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 // Ceilings that keep an obviously-bad value (a typo, a tampered payload) out of
 // the database without getting in a real admin's way. $1,000,000 max price.
@@ -107,3 +109,30 @@ export type FieldErrors = Record<string, string>;
 export type ActionResult =
   | { ok: true; id: string }
   | { ok: false; formError?: string; fieldErrors?: FieldErrors };
+
+// --- Storefront search (#106) ------------------------------------------------
+
+/** Max length for a storefront search query. Long enough for any real phrase,
+ *  short enough to keep a tampered/pathological `?q` out of the tsquery path —
+ *  the repository imposes no cap of its own, so this is the only one. */
+const MAX_SEARCH_QUERY_LENGTH = 100;
+
+/**
+ * Parse the storefront catalog-search URL params (#106). Forgiving like the
+ * order-list schemas: an absent/whitespace `q` collapses to "" (the empty-query
+ * prompt), a non-string or mistyped `?page` falls back to 1 — a fiddled query
+ * string should render a clean view, never error a page a shopper is browsing.
+ * `q` is trimmed and length-capped here (the only cap downstream); `pageSize` is
+ * a server constant, not user input, so it isn't parsed.
+ */
+export const searchProductsParamsSchema = z.object({
+  q: z
+    .string()
+    .catch("")
+    .transform((value) => value.trim().slice(0, MAX_SEARCH_QUERY_LENGTH)),
+  page: z.coerce.number().int().positive().catch(1),
+});
+
+export type SearchProductsParamsInput = z.infer<
+  typeof searchProductsParamsSchema
+>;

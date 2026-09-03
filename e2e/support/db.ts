@@ -65,3 +65,63 @@ export function readOrderByPaymentIntent(paymentIntentId: string) {
     include: { items: true },
   });
 }
+
+// --- Onboarding (self-serve store creation) ---------------------------------
+//
+// The onboarding spec checks the outcome `createStore` produces — a tenant and
+// its OWNER membership — straight from Postgres. Unlike the checkout reads above
+// these aren't scoped to the demo store: onboarding mints a brand-new tenant,
+// looked up by the unique slug the run chose.
+
+/**
+ * The store an onboarding run created, by its unique slug. Selects its identity
+ * (`id`, `slug`) and `name` — the spec looks up the OWNER membership by `id` and
+ * asserts the store's `name`. Throws if none exists: the browser only reaches
+ * `/admin/<slug>` after the write, so a missing row is a real failure, not an
+ * empty state.
+ */
+export function readTenantBySlug(slug: string) {
+  return db().tenant.findUniqueOrThrow({
+    where: { slug },
+    select: { id: true, slug: true, name: true },
+  });
+}
+
+/**
+ * The account a sign-up created, by its unique email — the spec needs its id to
+ * look up the OWNER membership below. Throws if none: sign-up persists the user
+ * before the store write that follows, so a missing row is a real failure.
+ */
+export function readUserByEmail(email: string) {
+  return db().user.findUniqueOrThrow({
+    where: { email },
+    select: { id: true, email: true },
+  });
+}
+
+/**
+ * The membership binding a user to a tenant (the `@@unique([userId, tenantId])`
+ * pair). The spec asserts it exists with role OWNER — proof self-serve
+ * onboarding made the creator the store's owner alongside the store itself.
+ * Throws if none.
+ */
+export function readMembership(tenantId: string, userId: string) {
+  return db().membership.findUniqueOrThrow({
+    where: { userId_tenantId: { userId, tenantId } },
+    select: { role: true, tenantId: true, userId: true },
+  });
+}
+
+/**
+ * Delete every artifact an onboarding run creates, matched by the shared test
+ * prefix (see `onboarding.spec.ts`): the stores and the accounts. Deleting a
+ * tenant cascades its membership (`Membership.tenant` is `onDelete: Cascade`);
+ * deleting a user cascades its sessions, accounts, and any membership too — so
+ * this pair is FK-safe in either order and leaves nothing orphaned. `deleteMany`
+ * is a no-op when nothing matches, so it runs unconditionally and self-heals
+ * leftovers from an earlier interrupted run.
+ */
+export async function deleteOnboardingArtifacts(prefix: string): Promise<void> {
+  await db().tenant.deleteMany({ where: { slug: { startsWith: prefix } } });
+  await db().user.deleteMany({ where: { email: { startsWith: prefix } } });
+}

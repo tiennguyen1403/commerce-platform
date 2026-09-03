@@ -143,19 +143,56 @@ const PRODUCTS: SeedProduct[] = [
   },
 ];
 
-async function main() {
-  const tenant = await prisma.tenant.upsert({
-    where: { slug: DEMO_TENANT_SLUG },
-    update: {},
-    create: { slug: DEMO_TENANT_SLUG, name: "Demo Store", currency: "usd" },
-  });
+// A distinct accent hue for the second store so per-tenant theming (#98) is
+// visible side by side: violet, well clear of the platform emerald (162°).
+const AURORA_HUE = 285;
 
-  for (const product of PRODUCTS) {
+// The second store's small catalog — enough to show the themed accent across the
+// grid, a purchase panel, a low-stock badge (the 14 oz mug sits below the
+// threshold), and a multi-variant **selector** (Borealis Tee) whose dropdown
+// portals to <body>: it's the one storefront accent surface aurora lacked, so it
+// makes the portaled-overlay accent fix visible on a non-default hue (#113).
+// Slugs are unique per tenant, so they may overlap with `demo`'s.
+const AURORA_PRODUCTS: SeedProduct[] = [
+  {
+    slug: "aurora-candle",
+    title: "Aurora Candle",
+    description: "Hand-poured soy candle with a midnight-plum scent.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "AUR-CNDL", name: "One size", priceCents: 2400, stock: 60 },
+    ],
+  },
+  {
+    slug: "midnight-mug",
+    title: "Midnight Mug",
+    description: "Matte-violet stoneware mug that keeps coffee hot longer.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "AUR-MUG-14", name: "14 oz", priceCents: 1800, stock: 4 },
+    ],
+  },
+  {
+    slug: "borealis-tee",
+    title: "Borealis Tee",
+    description: "Organic-cotton tee in the Aurora colorway.",
+    status: "ACTIVE",
+    variants: [
+      { sku: "AUR-TEE-S", name: "Small", priceCents: 2600, stock: 30 },
+      { sku: "AUR-TEE-M", name: "Medium", priceCents: 2600, stock: 5 },
+      { sku: "AUR-TEE-L", name: "Large", priceCents: 2800, stock: 0 },
+    ],
+  },
+];
+
+/** Upsert a tenant's catalog (idempotent by `[tenantId, slug]`). */
+async function seedProducts(tenantId: string, products: SeedProduct[]) {
+  for (const product of products) {
     await prisma.product.upsert({
-      where: { tenantId_slug: { tenantId: tenant.id, slug: product.slug } },
+      where: { tenantId_slug: { tenantId, slug: product.slug } },
       update: {},
       create: {
-        tenantId: tenant.id,
+        tenantId,
         title: product.title,
         slug: product.slug,
         description: product.description,
@@ -171,13 +208,42 @@ async function main() {
       },
     });
   }
+}
 
-  const owner = await seedMembers(tenant.id);
+async function main() {
+  // Primary store, on the platform default hue (162° emerald) — themeHue is left
+  // to the column default, so it stays a visual no-op (#98).
+  const demo = await prisma.tenant.upsert({
+    where: { slug: DEMO_TENANT_SLUG },
+    update: {},
+    create: { slug: DEMO_TENANT_SLUG, name: "Demo Store", currency: "usd" },
+  });
+  await seedProducts(demo.id, PRODUCTS);
+  const owner = await seedMembers(demo.id);
+
+  // A second store on a distinct hue so per-tenant theming is visible at a glance:
+  // `demo.localhost:3000` renders emerald, `aurora.localhost:3000` violet, from
+  // the one shared token recipe. `update` re-applies the hue on re-seed.
+  // Deliberately storefront-only (no members): the admin-auth e2e assumes the
+  // seeded admin owns exactly one store, so `admin@demo.test` must NOT own aurora.
+  const aurora = await prisma.tenant.upsert({
+    where: { slug: "aurora" },
+    update: { themeHue: AURORA_HUE },
+    create: {
+      slug: "aurora",
+      name: "Aurora",
+      currency: "usd",
+      themeHue: AURORA_HUE,
+    },
+  });
+  await seedProducts(aurora.id, AURORA_PRODUCTS);
 
   console.log(
-    `Seeded tenant "${tenant.slug}" with ${PRODUCTS.length} products, ` +
-      `owner "${owner.email}" (OWNER), a STAFF member (staff@demo.test), and ` +
-      `an unassigned account (teammate@demo.test) to add via the members page.`,
+    `Seeded "${demo.slug}" (emerald, ${PRODUCTS.length} products) and ` +
+      `"${aurora.slug}" (violet hue ${AURORA_HUE}, ${AURORA_PRODUCTS.length} products, ` +
+      `storefront-only); owner "${owner.email}" (OWNER of ${demo.slug}), a STAFF member ` +
+      `(staff@demo.test), and an unassigned account (teammate@demo.test) to add via the ` +
+      `members page.`,
   );
 }
 

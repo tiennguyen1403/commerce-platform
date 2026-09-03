@@ -68,6 +68,26 @@ pnpm dev                    # http://localhost:3000
 
 Health check: <http://localhost:3000/api/health>
 
+### Local subdomains (per-tenant dev)
+
+The storefront resolves its tenant from the request **host** — `{slug}.{app-domain}` —
+so the subdomain picks the store. Modern browsers resolve `*.localhost` to
+loopback automatically (no `/etc/hosts` edits), so nothing to install:
+
+| URL                   | Resolves to                                  |
+| --------------------- | -------------------------------------------- |
+| `demo.localhost:3000` | the seeded **demo** store                    |
+| `localhost:3000`      | also the demo store (bare-loopback fallback) |
+| `acme.localhost:3000` | an unknown tenant → a real **404**           |
+| `www.localhost:3000`  | the platform/apex landing (a reserved word)  |
+
+A store host's `/` redirects to `/products`. The bare-loopback → `demo` fallback
+is active only while `NEXT_PUBLIC_APP_URL` points at `localhost` (local dev and
+the Playwright suite, which builds against `localhost`), so plain `localhost:3000`
+keeps working; it's off for any real deployment. `next dev` also relies on the
+`allowedDevOrigins: ["*.localhost"]` entry in `next.config.ts` (already set) to
+serve HMR/dev assets across those subdomains.
+
 ### Testing Stripe webhooks locally
 
 The webhook — not the browser redirect — is what marks an order `PAID`, so it
