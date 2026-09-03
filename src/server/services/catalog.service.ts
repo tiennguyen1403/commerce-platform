@@ -1,5 +1,6 @@
 import "server-only";
 import { productRepository } from "@/server/repositories/product.repository";
+import type { SearchProductsParams } from "@/server/repositories/product.repository";
 import type { ProductInput } from "@/lib/validators/catalog";
 import { ProductNotFoundError, SlugTakenError } from "@/server/catalog.errors";
 
@@ -29,6 +30,21 @@ export const catalogService = {
 
   getProductBySlug(tenantId: string, slug: string) {
     return productRepository.findBySlug(tenantId, slug);
+  },
+
+  /**
+   * Storefront catalog search (#106). A thin pass-through to the repository's
+   * tenant-scoped, ACTIVE-only ranked search — this layer binds the tenant to
+   * the query and adds no other rule (the page zod-validates `page`/`pageSize`
+   * and the raw `query`; the repository owns ranking, offset pagination, and the
+   * empty-query short-circuit). Kept here so pages never import the repository
+   * directly (golden rule 2).
+   */
+  searchStorefrontProducts(
+    tenantId: string,
+    params: Omit<SearchProductsParams, "tenantId">,
+  ) {
+    return productRepository.searchActiveByTenant({ tenantId, ...params });
   },
 
   // --- Admin reads ----------------------------------------------------------
