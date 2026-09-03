@@ -74,7 +74,7 @@ export default async function AccountOrdersPage({
       {total === 0 ? (
         <Card>
           <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
-            <Receipt className="text-muted-foreground size-8" />
+            <Receipt className="text-muted-foreground size-8" aria-hidden />
             <div className="flex flex-col gap-1">
               <p className="font-medium">No orders yet</p>
               <p className="text-muted-foreground text-sm">
@@ -161,7 +161,7 @@ export default async function AccountOrdersPage({
               </p>
               <div className="flex gap-2">
                 <PageLink href={ordersHref(page - 1)} disabled={page <= 1}>
-                  <ChevronLeft />
+                  <ChevronLeft aria-hidden />
                   Previous
                 </PageLink>
                 <PageLink
@@ -169,7 +169,7 @@ export default async function AccountOrdersPage({
                   disabled={page >= totalPages}
                 >
                   Next
-                  <ChevronRight />
+                  <ChevronRight aria-hidden />
                 </PageLink>
               </div>
             </div>

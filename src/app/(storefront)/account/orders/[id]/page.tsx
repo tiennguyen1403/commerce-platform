@@ -37,7 +37,14 @@ export default async function AccountOrderDetailPage({
   // Authoritative gate: a guest is bounced to sign-in and returns to this order
   // once authenticated. The session's `userId` scopes the read below.
   const session = await getShopperSession();
-  if (!session) redirect(`/account/sign-in?redirect=/account/orders/${id}`);
+  if (!session) {
+    // Encode the id in the querystring value (it's a path segment we control, so
+    // safe in practice, but this stays robust to any id shape and matches the
+    // sign-in page's own encodeURIComponent forwarding).
+    redirect(
+      `/account/sign-in?redirect=/account/orders/${encodeURIComponent(id)}`,
+    );
+  }
 
   const { tenantId } = await getStoreTenant();
 
@@ -63,7 +70,7 @@ export default async function AccountOrderDetailPage({
           href="/account/orders"
           className="text-muted-foreground hover:text-foreground inline-flex w-fit items-center gap-1 text-sm font-medium"
         >
-          <ArrowLeft className="size-4" />
+          <ArrowLeft className="size-4" aria-hidden />
           Back to orders
         </Link>
         <div className="flex flex-col gap-1">
