@@ -40,6 +40,19 @@ describe("safeInternalPath", () => {
     expect(safeInternalPath("/\t/\\evil.com")).toBeNull();
   });
 
+  it("rejects dot-segment open-redirect bypasses (/..//evil.com)", () => {
+    // A leading "/.." normalizes away, leaving the *returned* pathname
+    // protocol-relative ("//evil.com") even though the initial parse stayed
+    // on-origin — so it re-resolves to https://evil.com at the router. Each
+    // must be refused.
+    expect(safeInternalPath("/..//evil.com")).toBeNull();
+    expect(safeInternalPath("/.//evil.com")).toBeNull();
+    expect(safeInternalPath("/a/../..//evil.com")).toBeNull();
+    expect(safeInternalPath("/%2e%2e//evil.com")).toBeNull();
+    // A dot-segment that resolves to an ordinary same-origin path is still fine.
+    expect(safeInternalPath("/admin/../new")).toBe("/new");
+  });
+
   it("never returns a value that resolves to a foreign origin", () => {
     const ORIGIN = "https://store.example.com";
     const probes = [
@@ -51,6 +64,10 @@ describe("safeInternalPath", () => {
       "/\n//evil.com",
       "/\r//evil.com",
       "/ /evil.com",
+      "/..//evil.com",
+      "/.//evil.com",
+      "/a/../..//evil.com",
+      "/%2e%2e//evil.com",
       "https://evil.com",
     ];
     for (const probe of probes) {
