@@ -31,20 +31,31 @@ export type StalePendingOrder = {
   stripePaymentIntentId: string | null;
 };
 
-/** Query for reusable in-flight checkout candidates (the #25 dedupe read). The
- *  equality filters — tenant, shopper email, currency, and re-priced total — are
- *  pushed to the DB; the remaining line-set match and the live PaymentIntent-status
- *  check stay in the service, which owns that business logic. */
+/** Who a reuse read is on behalf of — the identity binding that closes #92. A
+ *  discriminated union: an authenticated shopper passes `{ userId }` and is matched
+ *  on that session-proven id alone; a guest passes `{ userId: null, email }` and is
+ *  matched on email but pinned to guest (userId-null) orders, so a guest-supplied
+ *  email can never match — and reuse — a signed-in shopper's order. The `email?:
+ *  never` on the authenticated arm makes crossing the trust boundary a *type* error
+ *  (a client-supplied email can't ride along on an authenticated match); the query
+ *  builder also reads `email` only in the guest branch, so it's enforced at runtime
+ *  too. */
+export type ReusablePendingIdentity =
+  { userId: string; email?: never } | { userId: null; email: string };
+
+/** Query for reusable in-flight checkout candidates (the #25 dedupe read, identity-
+ *  bound in #92). The equality filters — tenant, caller identity, currency, and
+ *  re-priced total — are pushed to the DB; the remaining line-set match and the live
+ *  PaymentIntent-status check stay in the service, which owns that business logic. */
 export type ReusablePendingQuery = {
   tenantId: string;
-  email: string;
   totalCents: number;
   currency: string;
   /** Lower bound on `createdAt` — the reuse window (a soon-to-be-swept order isn't
    *  worth reusing). */
   createdAfter: Date;
   limit: number;
-};
+} & ReusablePendingIdentity;
 
 /** A full order to persist. The `id`, `orderNumber`, total, and per-item prices
  *  are all computed by the service (from a fresh variant read) — never the
@@ -305,11 +316,19 @@ export const orderRepository = {
    * Recent PENDING orders (newest first) that could be the *same* in-flight
    * checkout a shopper is re-submitting — the dedupe read behind
    * `orderService.startCheckout` (#25). Scoped to the tenant (golden rule #1) and
-   * the shopper's `email`, and pre-filtered to the re-priced cart's exact
+   * the caller's identity (#92), and pre-filtered to the re-priced cart's exact
    * `currency` + `totalCents`, so a stale-priced prior attempt can never be a
    * candidate; `createdAfter` bounds it to the reuse window. Returns the orders
    * *with items* so the service can confirm the line-set matches before reusing the
    * linked PaymentIntent's client secret. Newest first so the freshest attempt wins.
+   *
+   * Identity binding (#92) is the fix for a guest reuse trusting a client-supplied
+   * email: an authenticated shopper (`q.userId !== null`) matches on the
+   * session-proven `userId` alone — the typed email is never part of the match; a
+   * guest (`q.userId === null`) matches on `email` but is pinned to `userId: null`,
+   * so a guest-supplied email can't match — and hand back — a signed-in shopper's
+   * in-flight order. Both branches are served by the `[tenantId, userId, createdAt]`
+   * index (#102): `userId` is an equality (a value or `null`) either way.
    *
    * Return type is left to inference (like the other `include: { items: true }`
    * reads here): annotating it `OrderWithItems[]` would make `orderRepository`'s
@@ -320,11 +339,16 @@ export const orderRepository = {
     return prisma.order.findMany({
       where: {
         tenantId: q.tenantId,
-        email: q.email,
         status: "PENDING",
         currency: q.currency,
         totalCents: q.totalCents,
         createdAt: { gte: q.createdAfter },
+        // Identity binding (#92): a signed-in shopper is matched on the
+        // session-proven `userId`; a guest on `email`, but pinned to `userId: null`
+        // so a guest email can never reuse a signed-in shopper's in-flight order.
+        ...(q.userId !== null
+          ? { userId: q.userId }
+          : { userId: null, email: q.email }),
       },
       orderBy: { createdAt: "desc" },
       take: q.limit,
