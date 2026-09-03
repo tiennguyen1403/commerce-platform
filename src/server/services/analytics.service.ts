@@ -2,6 +2,7 @@ import "server-only";
 import type { Order } from "@prisma/client";
 import {
   analyticsRepository,
+  type RevenueBreakdown,
   type VariantStockRow,
 } from "@/server/repositories/analytics.repository";
 import { orderService } from "@/server/services/order.service";
@@ -31,8 +32,11 @@ export type LowStockVariant = VariantStockRow & { available: number };
 
 /** Everything the `/admin` dashboard renders, in one tenant-scoped read. */
 export type DashboardSummary = {
-  /** Captured revenue (integer cents): PAID + FULFILLED orders. */
-  revenueCents: number;
+  /** Revenue split into gross (captured) / refunds / net (held) — integer cents.
+   *  `netCents` is the figure to lead with (money still on hand); the gross it's
+   *  netted from and the refunds subtracted give it context, so the headline can't
+   *  be misread as gross sales (#93). */
+  revenue: RevenueBreakdown;
   /** Total orders across every status. */
   totalOrders: number;
   /** All 5 statuses, in `ORDER_STATUSES` order, zero-filled. */
@@ -56,16 +60,15 @@ export const analyticsService = {
    * never reaches past the service layer.
    */
   async getDashboard(tenantId: string): Promise<DashboardSummary> {
-    const [revenueCents, rawCounts, variantRows, ordersPage] =
-      await Promise.all([
-        analyticsRepository.revenueTotalCents(tenantId),
-        analyticsRepository.orderCountsByStatus(tenantId),
-        analyticsRepository.listActiveVariantStock(tenantId),
-        orderService.listOrders(tenantId, {
-          page: 1,
-          pageSize: RECENT_ORDERS_LIMIT,
-        }),
-      ]);
+    const [revenue, rawCounts, variantRows, ordersPage] = await Promise.all([
+      analyticsRepository.revenueBreakdown(tenantId),
+      analyticsRepository.orderCountsByStatus(tenantId),
+      analyticsRepository.listActiveVariantStock(tenantId),
+      orderService.listOrders(tenantId, {
+        page: 1,
+        pageSize: RECENT_ORDERS_LIMIT,
+      }),
+    ]);
 
     // Backfill: groupBy omits empty groups, so map over the canonical tuple to
     // guarantee all 5 statuses appear (zero-filled) and in a stable order.
@@ -91,7 +94,7 @@ export const analyticsService = {
       );
 
     return {
-      revenueCents,
+      revenue,
       totalOrders,
       ordersByStatus,
       lowStock: lowStockRanked.slice(0, LOW_STOCK_LIMIT),

@@ -19,7 +19,7 @@ import { LOW_STOCK_THRESHOLD } from "@/config/constants";
 
 vi.mock("@/server/repositories/analytics.repository", () => ({
   analyticsRepository: {
-    revenueTotalCents: vi.fn(),
+    revenueBreakdown: vi.fn(),
     orderCountsByStatus: vi.fn(),
     listActiveVariantStock: vi.fn(),
   },
@@ -28,7 +28,7 @@ vi.mock("@/server/services/order.service", () => ({
   orderService: { listOrders: vi.fn() },
 }));
 
-const revenueTotalCents = vi.mocked(analyticsRepository.revenueTotalCents);
+const revenueBreakdown = vi.mocked(analyticsRepository.revenueBreakdown);
 const orderCountsByStatus = vi.mocked(analyticsRepository.orderCountsByStatus);
 const listActiveVariantStock = vi.mocked(
   analyticsRepository.listActiveVariantStock,
@@ -77,19 +77,28 @@ beforeEach(() => {
   vi.resetAllMocks();
   // Sane defaults so a test that only cares about one leg of the `Promise.all`
   // still resolves the other three (the service awaits all four together).
-  revenueTotalCents.mockResolvedValue(0);
+  revenueBreakdown.mockResolvedValue({
+    grossCents: 0,
+    refundedCents: 0,
+    netCents: 0,
+  });
   orderCountsByStatus.mockResolvedValue([]);
   listActiveVariantStock.mockResolvedValue([]);
   listOrders.mockResolvedValue({ orders: [], total: 0 });
 });
 
 describe("analyticsService.getDashboard", () => {
-  it("passes the repository's revenue total through unchanged", async () => {
-    revenueTotalCents.mockResolvedValue(123456);
+  it("passes the repository's revenue breakdown through unchanged", async () => {
+    const breakdown = {
+      grossCents: 123456,
+      refundedCents: 23456,
+      netCents: 100000,
+    };
+    revenueBreakdown.mockResolvedValue(breakdown);
 
     const summary = await analyticsService.getDashboard(TENANT);
 
-    expect(summary.revenueCents).toBe(123456);
+    expect(summary.revenue).toEqual(breakdown);
   });
 
   it("backfills a partial status list to all 5, in ORDER_STATUSES order, and sums the total", async () => {
@@ -253,8 +262,8 @@ describe("analyticsService.getDashboard", () => {
     // Each mock resolved exactly once with the caller's tenantId — proof the
     // Promise.all fan-out reaches all four reads (none skipped/short-circuited)
     // and none defaults to some other tenant.
-    expect(revenueTotalCents).toHaveBeenCalledTimes(1);
-    expect(revenueTotalCents).toHaveBeenCalledWith(tenantId);
+    expect(revenueBreakdown).toHaveBeenCalledTimes(1);
+    expect(revenueBreakdown).toHaveBeenCalledWith(tenantId);
     expect(orderCountsByStatus).toHaveBeenCalledTimes(1);
     expect(orderCountsByStatus).toHaveBeenCalledWith(tenantId);
     expect(listActiveVariantStock).toHaveBeenCalledTimes(1);

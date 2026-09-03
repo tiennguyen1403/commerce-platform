@@ -48,6 +48,22 @@ export default async function AdminHome({
   const dashboard = await analyticsService.getDashboard(tenantId);
   const base = `/admin/${storeSlug}`;
 
+  // Revenue is reported as net (held) — gross minus refunds — so a refunded order
+  // is netted out, not silently dropped, and the headline can't be read as gross
+  // sales (#93). Gross/refunds ride along as sub-context on the card. A store with
+  // no captured orders yet (gross 0) shows the bare $0.00 with no hint — "No
+  // refunds" under a zero is noise, not information.
+  const { grossCents, refundedCents, netCents } = dashboard.revenue;
+  const revenueHint =
+    grossCents === 0
+      ? undefined
+      : refundedCents > 0
+        ? `Gross ${formatMoney(grossCents, currency)} · less ${formatMoney(
+            refundedCents,
+            currency,
+          )} refunded`
+        : "No refunds";
+
   // The single "money's in, not yet shipped" figure the operator acts on next.
   const awaitingFulfillment =
     dashboard.ordersByStatus.find((s) => s.status === "PAID")?.count ?? 0;
@@ -64,9 +80,10 @@ export default async function AdminHome({
       {/* KPI cards */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
-          label="Revenue · paid + fulfilled"
-          value={formatMoney(dashboard.revenueCents, currency)}
+          label="Net revenue"
+          value={formatMoney(netCents, currency)}
           icon={Banknote}
+          hint={revenueHint}
         />
         <StatCard
           label="Total orders"
@@ -247,17 +264,21 @@ export default async function AdminHome({
   );
 }
 
-/** A single KPI: a muted label, a large value, and a decorative corner icon.
+/** A single KPI: a muted label, a large value, a decorative corner icon, and an
+ *  optional muted sub-line (`hint`) for secondary context beneath the value.
  *  Mirrors the shadcn stat-card layout (description + title + action in the card
- *  header grid). */
+ *  header grid); the hint is a third row in column 1, so the icon still spans the
+ *  first two and stays pinned top-right. */
 function StatCard({
   label,
   value,
   icon: Icon,
+  hint,
 }: {
   label: string;
   value: string | number;
   icon: LucideIcon;
+  hint?: string;
 }) {
   return (
     <Card>
@@ -266,6 +287,11 @@ function StatCard({
         <CardTitle className="text-2xl font-semibold tabular-nums">
           {value}
         </CardTitle>
+        {hint ? (
+          <p className="text-muted-foreground col-start-1 text-xs tabular-nums">
+            {hint}
+          </p>
+        ) : null}
         <CardAction>
           <Icon className="text-muted-foreground size-4" aria-hidden />
         </CardAction>
