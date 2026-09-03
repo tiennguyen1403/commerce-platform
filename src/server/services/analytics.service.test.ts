@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { Order } from "@prisma/client";
 import { analyticsService } from "@/server/services/analytics.service";
 import {
   analyticsRepository,
+  type RevenueTimeSeriesRow,
   type VariantStockRow,
 } from "@/server/repositories/analytics.repository";
 import { orderService } from "@/server/services/order.service";
@@ -22,6 +23,7 @@ vi.mock("@/server/repositories/analytics.repository", () => ({
     revenueBreakdown: vi.fn(),
     orderCountsByStatus: vi.fn(),
     listActiveVariantStock: vi.fn(),
+    revenueTimeSeries: vi.fn(),
   },
 }));
 vi.mock("@/server/services/order.service", () => ({
@@ -33,14 +35,16 @@ const orderCountsByStatus = vi.mocked(analyticsRepository.orderCountsByStatus);
 const listActiveVariantStock = vi.mocked(
   analyticsRepository.listActiveVariantStock,
 );
+const revenueTimeSeries = vi.mocked(analyticsRepository.revenueTimeSeries);
 const listOrders = vi.mocked(orderService.listOrders);
 
 const TENANT = "tenant_1";
 
 // Module-local in the service (not exported); duplicated here as the expected
-// recent-orders page size / low-stock cap.
+// recent-orders page size / low-stock cap / trend-chart window length.
 const RECENT_ORDERS_LIMIT = 5;
 const LOW_STOCK_LIMIT = 5;
+const ANALYTICS_WINDOW_DAYS = 30;
 
 function order(o: Partial<Order> = {}): Order {
   return {
@@ -84,6 +88,7 @@ beforeEach(() => {
   });
   orderCountsByStatus.mockResolvedValue([]);
   listActiveVariantStock.mockResolvedValue([]);
+  revenueTimeSeries.mockResolvedValue([]);
   listOrders.mockResolvedValue({ orders: [], total: 0 });
 });
 
@@ -273,5 +278,114 @@ describe("analyticsService.getDashboard", () => {
       page: 1,
       pageSize: RECENT_ORDERS_LIMIT,
     });
+  });
+});
+
+describe("analyticsService.getRevenueTimeSeries", () => {
+  // Freeze "now" so the generated UTC-day window is deterministic. 2026-09-03 (a
+  // mid-day UTC instant) ⇒ a 30-day window of 2026-08-05 … 2026-09-03 inclusive.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-03T09:30:00.000Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function row(
+    day: string,
+    o: Partial<RevenueTimeSeriesRow> = {},
+  ): RevenueTimeSeriesRow {
+    return { day, orderCount: 0, grossCents: 0, refundedCents: 0, ...o };
+  }
+
+  it("returns one contiguous, oldest-first point per UTC day across the window", async () => {
+    const points = await analyticsService.getRevenueTimeSeries(TENANT);
+
+    expect(points).toHaveLength(ANALYTICS_WINDOW_DAYS);
+    expect(points[0].date).toBe("2026-08-05");
+    expect(points.at(-1)?.date).toBe("2026-09-03");
+    // Every step is exactly one calendar day — no gaps, no repeats, ascending.
+    for (let i = 1; i < points.length; i++) {
+      const prev = Date.parse(`${points[i - 1].date}T00:00:00Z`);
+      const curr = Date.parse(`${points[i].date}T00:00:00Z`);
+      expect(curr - prev).toBe(86_400_000);
+    }
+  });
+
+  it("asks the repository for `since` = UTC midnight, window − 1 days back", async () => {
+    await analyticsService.getRevenueTimeSeries(TENANT);
+
+    expect(revenueTimeSeries).toHaveBeenCalledTimes(1);
+    expect(revenueTimeSeries).toHaveBeenCalledWith(
+      TENANT,
+      new Date("2026-08-05T00:00:00.000Z"),
+    );
+  });
+
+  it("zero-fills every day when the tenant had no orders in the window", async () => {
+    revenueTimeSeries.mockResolvedValue([]);
+
+    const points = await analyticsService.getRevenueTimeSeries(TENANT);
+
+    expect(points).toHaveLength(ANALYTICS_WINDOW_DAYS);
+    expect(
+      points.every(
+        (p) =>
+          p.grossCents === 0 &&
+          p.refundedCents === 0 &&
+          p.netCents === 0 &&
+          p.orderCount === 0,
+      ),
+    ).toBe(true);
+  });
+
+  it("buckets each raw day, derives net = gross − refunded, and leaves the gaps zero-filled", async () => {
+    revenueTimeSeries.mockResolvedValue([
+      row("2026-08-10", { orderCount: 3, grossCents: 5000, refundedCents: 0 }),
+      row("2026-09-03", {
+        orderCount: 2,
+        grossCents: 6000,
+        refundedCents: 5000,
+      }),
+    ]);
+
+    const points = await analyticsService.getRevenueTimeSeries(TENANT);
+    const byDate = new Map(points.map((p) => [p.date, p]));
+
+    expect(byDate.get("2026-08-10")).toEqual({
+      date: "2026-08-10",
+      grossCents: 5000,
+      refundedCents: 0,
+      netCents: 5000,
+      orderCount: 3,
+    });
+    expect(byDate.get("2026-09-03")).toEqual({
+      date: "2026-09-03",
+      grossCents: 6000,
+      refundedCents: 5000,
+      netCents: 1000,
+      orderCount: 2,
+    });
+    // A day the repository never returned is present and zeroed, not missing.
+    expect(byDate.get("2026-08-11")).toEqual({
+      date: "2026-08-11",
+      grossCents: 0,
+      refundedCents: 0,
+      netCents: 0,
+      orderCount: 0,
+    });
+  });
+
+  it("honours a custom window length", async () => {
+    const points = await analyticsService.getRevenueTimeSeries(TENANT, 7);
+
+    expect(points).toHaveLength(7);
+    expect(points[0].date).toBe("2026-08-28");
+    expect(points.at(-1)?.date).toBe("2026-09-03");
+    expect(revenueTimeSeries).toHaveBeenCalledWith(
+      TENANT,
+      new Date("2026-08-28T00:00:00.000Z"),
+    );
   });
 });

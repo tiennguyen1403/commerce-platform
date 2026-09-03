@@ -17,6 +17,7 @@ import {
 import { LOW_STOCK_THRESHOLD } from "@/config/constants";
 import { buttonVariants } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { RevenueTrendChart } from "@/components/charts/trend-chart";
 import {
   Card,
   CardAction,
@@ -45,7 +46,12 @@ export default async function AdminHome({
   // Reuses the layout's cached admin context — no second DB round-trip.
   const { tenantId, tenantName, currency } =
     await requireAdminContext(storeSlug);
-  const dashboard = await analyticsService.getDashboard(tenantId);
+  // Two independent tenant-scoped reads — the dashboard summary and the revenue
+  // time series behind the compact trend chart — run concurrently.
+  const [dashboard, revenueSeries] = await Promise.all([
+    analyticsService.getDashboard(tenantId),
+    analyticsService.getRevenueTimeSeries(tenantId),
+  ]);
   const base = `/admin/${storeSlug}`;
 
   // Revenue is reported as net (held) — gross minus refunds — so a refunded order
@@ -101,6 +107,30 @@ export default async function AdminHome({
           icon={TriangleAlert}
         />
       </div>
+
+      {/* Revenue trend */}
+      <section className="flex flex-col gap-3">
+        <div className="flex items-center justify-between gap-4">
+          <h2 className="text-lg font-semibold tracking-tight">
+            Revenue trend
+          </h2>
+          <Link
+            href={`${base}/analytics`}
+            className={buttonVariants({ variant: "outline", size: "sm" })}
+          >
+            View full analytics
+          </Link>
+        </div>
+        <Card>
+          <CardContent>
+            <RevenueTrendChart
+              points={revenueSeries}
+              currency={currency}
+              size="compact"
+            />
+          </CardContent>
+        </Card>
+      </section>
 
       {/* Orders by status */}
       <section className="flex flex-col gap-3">
