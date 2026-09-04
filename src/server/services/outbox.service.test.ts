@@ -5,10 +5,16 @@ import { outboxRepository } from "@/server/repositories/outbox.repository";
 import type { OutboxMessageSummary } from "@/server/repositories/outbox.repository";
 import { orderRepository } from "@/server/repositories/order.repository";
 import { emailService } from "@/server/services/email.service";
+import { fulfillmentService } from "@/server/services/fulfillment.service";
 import {
   EmailNotConfiguredError,
   EmailSendTimeoutError,
 } from "@/server/email.errors";
+import {
+  FulfillmentNotConfiguredError,
+  FulfillmentNotMappedError,
+  FulfillmentRejectedError,
+} from "@/server/fulfillment.errors";
 import { reportError } from "@/server/observability/error-reporter";
 import type { OrderWithItems } from "@/server/repositories/order.repository";
 
@@ -38,6 +44,9 @@ vi.mock("@/server/repositories/order.repository", () => ({
 vi.mock("@/server/services/email.service", () => ({
   emailService: { sendOrderConfirmation: vi.fn() },
 }));
+vi.mock("@/server/services/fulfillment.service", () => ({
+  fulfillmentService: { submitOrder: vi.fn() },
+}));
 vi.mock("@/server/observability/error-reporter", () => ({
   reportError: vi.fn(),
 }));
@@ -61,6 +70,7 @@ const reschedule = vi.mocked(outboxRepository.reschedule);
 const markDead = vi.mocked(outboxRepository.markDead);
 const findOrder = vi.mocked(orderRepository.findByIdForTenant);
 const sendOrderConfirmation = vi.mocked(emailService.sendOrderConfirmation);
+const submitOrder = vi.mocked(fulfillmentService.submitOrder);
 const report = vi.mocked(reportError);
 
 // Frozen clock so `new Date()` / `Date.now()` in the service are deterministic —
@@ -141,6 +151,7 @@ beforeEach(() => {
   markDead.mockResolvedValue(undefined);
   findOrder.mockResolvedValue(orderWithItems());
   sendOrderConfirmation.mockResolvedValue(undefined);
+  submitOrder.mockResolvedValue(undefined);
   report.mockResolvedValue(undefined);
 });
 
@@ -314,6 +325,89 @@ describe("outboxService.drain", () => {
     expect(claim).toHaveBeenCalledTimes(1);
     expect(claim).toHaveBeenCalledWith("msg_1", expect.any(Date));
     expect(result).toMatchObject({ sent: 1 });
+  });
+});
+
+describe("outboxService.drain — FULFILLMENT_SUBMISSION (M4 #139)", () => {
+  const fulfillmentMsg = (o: Partial<OutboxMessageSummary> = {}) =>
+    summary({
+      type: "FULFILLMENT_SUBMISSION",
+      idempotencyKey: "fs_order_1",
+      ...o,
+    });
+
+  it("dispatches to the fulfillment service and marks SENT on success", async () => {
+    findDue.mockResolvedValue([fulfillmentMsg()]);
+
+    const result = await outboxService.drain();
+
+    expect(claim).toHaveBeenCalledWith("msg_1", NOW);
+    expect(submitOrder).toHaveBeenCalledWith("tenant_1", "order_1");
+    // This type has its own send path — the confirmation email is not touched, and
+    // the service re-reads the order itself (no order re-read in the drain).
+    expect(sendOrderConfirmation).not.toHaveBeenCalled();
+    expect(findOrder).not.toHaveBeenCalled();
+    expect(markSent).toHaveBeenCalledWith("msg_1");
+    expect(result).toMatchObject({ sent: 1, failed: 0, dead: 0 });
+  });
+
+  it("marks DEAD and alerts on an unmapped variant (permanent)", async () => {
+    findDue.mockResolvedValue([fulfillmentMsg({ attempts: 0 })]);
+    submitOrder.mockRejectedValue(new FulfillmentNotMappedError(["HOOD-M"]));
+
+    const result = await outboxService.drain();
+
+    // A typed FulfillmentError is permanent: dies on the first attempt...
+    expect(markDead).toHaveBeenCalledOnce();
+    expect(reschedule).not.toHaveBeenCalled();
+    // ...and an unmapped variant is a real incident an operator must fix — alert.
+    expect(report).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ dead: 1, failed: 0 });
+  });
+
+  it("marks DEAD and alerts on a provider soft-rejection (permanent)", async () => {
+    findDue.mockResolvedValue([fulfillmentMsg({ attempts: 0 })]);
+    submitOrder.mockRejectedValue(
+      new FulfillmentRejectedError("order_1", "printful"),
+    );
+
+    const result = await outboxService.drain();
+
+    expect(markDead).toHaveBeenCalledOnce();
+    expect(report).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ dead: 1 });
+  });
+
+  it("marks DEAD WITHOUT alerting when fulfillment is simply not configured", async () => {
+    findDue.mockResolvedValue([fulfillmentMsg({ attempts: 0 })]);
+    submitOrder.mockRejectedValue(new FulfillmentNotConfiguredError());
+
+    const result = await outboxService.drain();
+
+    // Permanent, but an unconfigured provider is an expected setup state, not an
+    // incident — mirrors EmailNotConfiguredError: DEAD, no alert.
+    expect(markDead).toHaveBeenCalledOnce();
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ dead: 1 });
+  });
+
+  it("reschedules a transient provider fault (retry, never DEAD)", async () => {
+    // A plain Error (a 5xx/timeout the adapter throws) is NOT a FulfillmentError,
+    // so it is transient — backoff-and-retry, exactly like a Resend blip.
+    findDue.mockResolvedValue([fulfillmentMsg({ attempts: 0 })]);
+    submitOrder.mockRejectedValue(new Error("Printful 503"));
+
+    const result = await outboxService.drain();
+
+    expect(reschedule).toHaveBeenCalledWith(
+      "msg_1",
+      new Date(NOW.getTime() + BACKOFF_FIRST_MS),
+      "Error: Printful 503",
+    );
+    expect(markDead).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ failed: 1, dead: 0 });
   });
 });
 

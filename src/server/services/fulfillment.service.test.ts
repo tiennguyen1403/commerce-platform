@@ -14,25 +14,38 @@ import {
   FulfillmentAddressMissingError,
   FulfillmentNotConfiguredError,
   FulfillmentNotMappedError,
+  FulfillmentRejectedError,
 } from "@/server/fulfillment.errors";
 
 /**
  * Unit tests for the fulfillment service, run entirely against the deterministic
- * mock provider. The provider selector is mocked at the same seam
- * `order.service.test.ts` mocks `getStripe` (a module-level factory the service
- * calls), and the order repository is mocked so no DB is touched. Under test is
- * what the SERVICE owns: the not-configured guard, the tenant-scoped read, the
- * all-or-nothing `sku → providerVariantId` resolution, the address narrowing, and
- * the exact `CreateFulfillmentInput` handed to the provider.
+ * mock provider with the order repository mocked (no DB). The provider selector is
+ * mocked at the same seam `order.service.test.ts` mocks `getStripe`. Under test is
+ * everything the SERVICE owns: the not-configured guard, the tenant-scoped read,
+ * the all-or-nothing `sku → providerVariantId` resolution, the address narrowing,
+ * the exact `CreateFulfillmentInput` handed to the provider, the two-layer
+ * idempotency (the order-level NOT_SUBMITTED → SUBMITTING claim gating the provider
+ * call), and the outcome persistence — SUBMITTED with the external id on success,
+ * FAILED on every permanent failure, and *nothing* (order left SUBMITTING) on a
+ * transient provider fault. The DB-level atomicity of the claim itself is proven in
+ * `order.repository.integration.test.ts`, not here.
  */
 
 vi.mock("@/server/fulfillment", () => ({ getFulfillmentProvider: vi.fn() }));
 vi.mock("@/server/repositories/order.repository", () => ({
-  orderRepository: { findForFulfillment: vi.fn() },
+  orderRepository: {
+    findForFulfillment: vi.fn(),
+    claimForSubmission: vi.fn(),
+    markSubmitted: vi.fn(),
+    markFulfillmentFailed: vi.fn(),
+  },
 }));
 
 const getProvider = vi.mocked(getFulfillmentProvider);
 const findForFulfillment = vi.mocked(orderRepository.findForFulfillment);
+const claimForSubmission = vi.mocked(orderRepository.claimForSubmission);
+const markSubmitted = vi.mocked(orderRepository.markSubmitted);
+const markFulfillmentFailed = vi.mocked(orderRepository.markFulfillmentFailed);
 
 const TENANT = "tenant_1";
 
@@ -98,6 +111,11 @@ beforeEach(() => {
   // assert the exact input AND get a real submitted/failed result back.
   vi.spyOn(provider, "createOrder");
   getProvider.mockReturnValue(provider);
+  // Happy-path repository defaults; individual tests override.
+  findForFulfillment.mockResolvedValue(fulfillmentOrder());
+  claimForSubmission.mockResolvedValue(true);
+  markSubmitted.mockResolvedValue(true);
+  markFulfillmentFailed.mockResolvedValue(undefined);
 });
 
 /** The spied `createOrder`, typed for `.mock`/`toHaveBeenCalled*` assertions. */
@@ -105,13 +123,15 @@ function createOrderMock() {
   return vi.mocked(provider.createOrder);
 }
 
-describe("fulfillmentService.submitOrder", () => {
-  it("submits a mapped order with the built CreateFulfillmentInput", async () => {
+describe("fulfillmentService.submitOrder — submission + persistence", () => {
+  it("claims, submits the built CreateFulfillmentInput, and persists SUBMITTED", async () => {
     findForFulfillment.mockResolvedValue(fulfillmentOrder());
 
-    const result = await fulfillmentService.submitOrder(TENANT, "order_1");
+    await fulfillmentService.submitOrder(TENANT, "order_1");
 
     expect(findForFulfillment).toHaveBeenCalledWith(TENANT, "order_1");
+    // Layer-2 guard is claimed before the provider is ever called.
+    expect(claimForSubmission).toHaveBeenCalledWith(TENANT, "order_1");
     expect(createOrderMock()).toHaveBeenCalledWith({
       orderId: "order_1",
       items: [{ sku: "TEE-S", quantity: 2, providerVariantId: "4011" }],
@@ -125,7 +145,14 @@ describe("fulfillmentService.submitOrder", () => {
         country: "US",
       },
     });
-    expect(result).toEqual({ externalId: "mock_order_1", status: "submitted" });
+    // Success persists the provider's external id + name and moves to SUBMITTED.
+    expect(markSubmitted).toHaveBeenCalledWith(
+      TENANT,
+      "order_1",
+      "mock_order_1",
+      "mock",
+    );
+    expect(markFulfillmentFailed).not.toHaveBeenCalled();
   });
 
   it("resolves each line's providerVariantId from its variant, not the snapshot", async () => {
@@ -159,27 +186,56 @@ describe("fulfillmentService.submitOrder", () => {
     expect(input.shippingAddress.line2).toBeUndefined();
     expect(input.shippingAddress.state).toBeUndefined();
   });
+});
 
-  it("throws FulfillmentNotConfiguredError when no provider is configured", async () => {
+describe("fulfillmentService.submitOrder — idempotency (the SUBMITTING claim)", () => {
+  it("does not call the provider — or persist — when the claim is lost", async () => {
+    // The order is already SUBMITTING/SUBMITTED/SHIPPED/FAILED, or a concurrent
+    // worker won the claim: this attempt must NOT re-submit. Returning without a
+    // throw settles the outbox message SENT; a stuck-SUBMITTING order stays put for
+    // a human (never auto-resubmitted).
+    claimForSubmission.mockResolvedValue(false);
+
+    await expect(
+      fulfillmentService.submitOrder(TENANT, "order_1"),
+    ).resolves.toBeUndefined();
+
+    expect(createOrderMock()).not.toHaveBeenCalled();
+    expect(markSubmitted).not.toHaveBeenCalled();
+    expect(markFulfillmentFailed).not.toHaveBeenCalled();
+  });
+
+  it("claims BEFORE submitting (guard precedes the provider call)", async () => {
+    const order: string[] = [];
+    claimForSubmission.mockImplementation(async () => {
+      order.push("claim");
+      return true;
+    });
+    createOrderMock().mockImplementation(async () => {
+      order.push("createOrder");
+      return { externalId: "mock_order_1", status: "submitted" as const };
+    });
+
+    await fulfillmentService.submitOrder(TENANT, "order_1");
+
+    expect(order).toEqual(["claim", "createOrder"]);
+  });
+});
+
+describe("fulfillmentService.submitOrder — permanent failures record FAILED", () => {
+  it("marks FAILED and throws FulfillmentNotConfiguredError when no provider is configured", async () => {
     getProvider.mockReturnValue(null);
 
     await expect(
       fulfillmentService.submitOrder(TENANT, "order_1"),
     ).rejects.toBeInstanceOf(FulfillmentNotConfiguredError);
-    // Never even reads the order it could not submit anywhere.
+    // Never even reads the order it could not submit anywhere...
     expect(findForFulfillment).not.toHaveBeenCalled();
+    // ...but records the order FAILED so the admin sees a terminal state.
+    expect(markFulfillmentFailed).toHaveBeenCalledWith(TENANT, "order_1");
   });
 
-  it("throws OrderNotFoundError when no order matches the tenant", async () => {
-    findForFulfillment.mockResolvedValue(null);
-
-    await expect(
-      fulfillmentService.submitOrder(TENANT, "missing"),
-    ).rejects.toBeInstanceOf(OrderNotFoundError);
-    expect(createOrderMock()).not.toHaveBeenCalled();
-  });
-
-  it("fails all-or-nothing with FulfillmentNotMappedError when any line is unmapped", async () => {
+  it("marks FAILED (all-or-nothing) with FulfillmentNotMappedError when any line is unmapped", async () => {
     findForFulfillment.mockResolvedValue(
       fulfillmentOrder({
         items: [
@@ -199,8 +255,11 @@ describe("fulfillmentService.submitOrder", () => {
 
     expect(err).toBeInstanceOf(FulfillmentNotMappedError);
     expect((err as FulfillmentNotMappedError).skus).toEqual(["HOOD-M"]);
-    // No partial submission: the provider is never called.
+    // No partial submission and no claim: the provider is never called, and the
+    // order is recorded FAILED (still NOT_SUBMITTED → FAILED, never claimed).
+    expect(claimForSubmission).not.toHaveBeenCalled();
     expect(createOrderMock()).not.toHaveBeenCalled();
+    expect(markFulfillmentFailed).toHaveBeenCalledWith(TENANT, "order_1");
   });
 
   it("reports an unmapped line before a missing address when both are wrong", async () => {
@@ -223,7 +282,7 @@ describe("fulfillmentService.submitOrder", () => {
     expect(createOrderMock()).not.toHaveBeenCalled();
   });
 
-  it("throws FulfillmentAddressMissingError when the order has no shipping address", async () => {
+  it("marks FAILED and throws FulfillmentAddressMissingError when the order has no shipping address", async () => {
     findForFulfillment.mockResolvedValue(
       fulfillmentOrder({
         shipName: null,
@@ -237,10 +296,12 @@ describe("fulfillmentService.submitOrder", () => {
     await expect(
       fulfillmentService.submitOrder(TENANT, "order_1"),
     ).rejects.toBeInstanceOf(FulfillmentAddressMissingError);
+    expect(claimForSubmission).not.toHaveBeenCalled();
     expect(createOrderMock()).not.toHaveBeenCalled();
+    expect(markFulfillmentFailed).toHaveBeenCalledWith(TENANT, "order_1");
   });
 
-  it("passes a soft provider rejection through as a failed result (does not throw)", async () => {
+  it("marks FAILED and throws FulfillmentRejectedError on a soft provider rejection", async () => {
     findForFulfillment.mockResolvedValue(
       fulfillmentOrder({
         items: [
@@ -251,8 +312,49 @@ describe("fulfillmentService.submitOrder", () => {
       }),
     );
 
-    const result = await fulfillmentService.submitOrder(TENANT, "order_1");
+    const err = await fulfillmentService
+      .submitOrder(TENANT, "order_1")
+      .catch((e: unknown) => e);
 
-    expect(result.status).toBe("failed");
+    // A soft "failed" result is a resolved value from the provider, promoted to a
+    // permanent error here so the outbox settles the message DEAD.
+    expect(err).toBeInstanceOf(FulfillmentRejectedError);
+    expect((err as FulfillmentRejectedError).provider).toBe("mock");
+    // Recorded FAILED (from SUBMITTING), and NOT persisted as SUBMITTED — the
+    // provider's placeholder id must never be stored.
+    expect(markFulfillmentFailed).toHaveBeenCalledWith(TENANT, "order_1");
+    expect(markSubmitted).not.toHaveBeenCalled();
+  });
+});
+
+describe("fulfillmentService.submitOrder — non-FAILED outcomes", () => {
+  it("throws OrderNotFoundError without recording FAILED when no order matches the tenant", async () => {
+    findForFulfillment.mockResolvedValue(null);
+
+    await expect(
+      fulfillmentService.submitOrder(TENANT, "missing"),
+    ).rejects.toBeInstanceOf(OrderNotFoundError);
+    // A missing order is not a FulfillmentError — nothing to record, nothing to
+    // claim or submit.
+    expect(claimForSubmission).not.toHaveBeenCalled();
+    expect(createOrderMock()).not.toHaveBeenCalled();
+    expect(markFulfillmentFailed).not.toHaveBeenCalled();
+  });
+
+  it("leaves the order SUBMITTING (no FAILED) when the provider throws transiently after the claim", async () => {
+    // A 5xx/timeout the adapter throws as a plain Error: transient, so the outbox
+    // retries. But the SUBMITTING claim is already taken, so a re-drain won't
+    // re-submit — the order deliberately stays stuck for manual reconciliation
+    // rather than risk a duplicate physical shipment (Printful has no idempotency
+    // key). Critically, it must NOT be recorded FAILED.
+    createOrderMock().mockRejectedValueOnce(new Error("Printful 503"));
+
+    await expect(
+      fulfillmentService.submitOrder(TENANT, "order_1"),
+    ).rejects.toThrow("Printful 503");
+
+    expect(claimForSubmission).toHaveBeenCalledOnce();
+    expect(markSubmitted).not.toHaveBeenCalled();
+    expect(markFulfillmentFailed).not.toHaveBeenCalled();
   });
 });

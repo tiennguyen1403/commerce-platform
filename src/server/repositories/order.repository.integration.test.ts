@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
-import type { OrderStatus } from "@prisma/client";
+import type { FulfillmentStatus, OrderStatus } from "@prisma/client";
 import {
   orderRepository,
   type CreateOrderInput,
@@ -102,11 +102,14 @@ type SeedLine = {
   titleSnapshot?: string;
 };
 
-/** Seed a PENDING order carrying the given lines and PaymentIntent id. */
+/** Seed a PENDING order carrying the given lines and PaymentIntent id. Pass
+ *  `opts.shipping` to persist a complete shipping address (the FULFILLMENT_SUBMISSION
+ *  enqueue gate, #139); omit it for a guest/legacy order that has none. */
 async function seedPendingOrder(
   tenantId: string,
   stripePaymentIntentId: string,
   lines: SeedLine[],
+  opts: { shipping?: ShippingAddress } = {},
 ) {
   return prisma.order.create({
     data: {
@@ -117,6 +120,17 @@ async function seedPendingOrder(
       totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
       currency: "usd",
       stripePaymentIntentId,
+      ...(opts.shipping
+        ? {
+            shipName: opts.shipping.name,
+            shipLine1: opts.shipping.line1,
+            shipLine2: opts.shipping.line2?.trim() || null,
+            shipCity: opts.shipping.city,
+            shipState: opts.shipping.state?.trim() || null,
+            shipPostalCode: opts.shipping.postalCode,
+            shipCountry: opts.shipping.country,
+          }
+        : {}),
       items: {
         create: lines.map((l) => ({
           variantId: l.variantId,
@@ -145,6 +159,7 @@ async function seedOrder(
     currency?: string;
     totalCents?: number;
     userId?: string | null;
+    fulfillmentStatus?: FulfillmentStatus;
   } = {},
 ) {
   const lines = opts.lines ?? [];
@@ -160,6 +175,9 @@ async function seedOrder(
         lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
       currency: opts.currency ?? "usd",
       stripePaymentIntentId: opts.stripePaymentIntentId ?? uniqueId("pi"),
+      ...(opts.fulfillmentStatus
+        ? { fulfillmentStatus: opts.fulfillmentStatus }
+        : {}),
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
       items: {
         create: lines.map((l) => ({
@@ -279,6 +297,59 @@ describe("orderRepository.markPaidByPaymentIntent (integration)", () => {
       attempts: 0,
       idempotencyKey: `oc_${order.id}`,
     });
+  });
+
+  it("also enqueues a FULFILLMENT_SUBMISSION in the flip transaction when the order has a shipping address", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, {
+      stock: 5,
+      priceCents: 1000,
+    });
+    const intent = uniqueId("pi");
+    const order = await seedPendingOrder(
+      tenant.id,
+      intent,
+      [{ variantId: variant.id, qty: 1, priceCents: 1000 }],
+      { shipping: TEST_SHIPPING },
+    );
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    // A shippable paid order queues BOTH the confirmation and the provider
+    // submission (M4 #139), atomically with the flip, under distinct keys.
+    const messages = await prisma.outboxMessage.findMany({
+      where: { tenantId: tenant.id, orderId: order.id },
+    });
+    expect(messages.map((m) => m.type).sort()).toEqual([
+      "FULFILLMENT_SUBMISSION",
+      "ORDER_CONFIRMATION",
+    ]);
+    expect(
+      messages.find((m) => m.type === "FULFILLMENT_SUBMISSION"),
+    ).toMatchObject({
+      status: "PENDING",
+      attempts: 0,
+      idempotencyKey: `fs_${order.id}`,
+    });
+  });
+
+  it("does not enqueue a FULFILLMENT_SUBMISSION when the order has no shipping address", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 5 });
+    const intent = uniqueId("pi");
+    // seedPendingOrder without `shipping` → a guest/legacy order with no address.
+    const order = await seedPendingOrder(tenant.id, intent, [
+      { variantId: variant.id, qty: 1, priceCents: 1000 },
+    ]);
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    // Nowhere to ship, so no submission is enqueued — it could only fail with a
+    // missing address. The confirmation email still goes out.
+    const types = (
+      await prisma.outboxMessage.findMany({ where: { orderId: order.id } })
+    ).map((m) => m.type);
+    expect(types).toEqual(["ORDER_CONFIRMATION"]);
   });
 
   it("does not enqueue a second outbox message on a duplicate delivery", async () => {
@@ -1878,5 +1949,212 @@ describe("orderRepository.findByIdForTenantAndUser (integration)", () => {
       atB.id,
     );
     expect(found).toBeNull();
+  });
+});
+
+/**
+ * The order-level fulfillment-submission guards (M4 #139) — the SECOND idempotency
+ * layer behind provider submission. Their guarantees live in the database's row
+ * lock + status-guarded `updateMany`, not the code, so (like `markPaid`) they can
+ * only be proven against real Postgres: exactly one of two racing submissions
+ * claims the order, a lost worker's order stays stuck in SUBMITTING (never
+ * re-submitted), and the terminal writes are guarded against regression. A
+ * duplicate POD order is real money + a physical shipment, so this is the crux of
+ * #139.
+ */
+describe("orderRepository fulfillment submission guards (integration)", () => {
+  const readFulfillment = (id: string) =>
+    prisma.order.findUniqueOrThrow({ where: { id } });
+
+  it("claimForSubmission moves NOT_SUBMITTED → SUBMITTING and returns true", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" }); // NOT_SUBMITTED
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      true,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTING",
+    );
+  });
+
+  it("is won by exactly one of two racing claims — so exactly one createOrder (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" });
+
+    // Two submissions land at once (an immediate dispatch racing the cron, or two
+    // cron runs after a stale-claim recovery). Row locking on the guarded
+    // `updateMany({ fulfillmentStatus: NOT_SUBMITTED })` must let exactly one flip
+    // to SUBMITTING — only that winner would call provider.createOrder. Never both.
+    const [a, b] = await Promise.all([
+      orderRepository.claimForSubmission(tenant.id, order.id),
+      orderRepository.claimForSubmission(tenant.id, order.id),
+    ]);
+
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTING",
+    );
+  });
+
+  it("returns false for an order stuck in SUBMITTING — the lost-worker path is never re-submitted", async () => {
+    const tenant = await freshTenant();
+    // A lost worker left the order SUBMITTING: createOrder may have reached the
+    // provider, but the SUBMITTED write never landed. A re-drain must NOT resubmit.
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTING",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    // Untouched — stuck in SUBMITTING for a human to reconcile.
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTING",
+    );
+  });
+
+  it("returns false for an already-terminal (SUBMITTED) order", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTED",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTED",
+    );
+  });
+
+  it("returns false for a REFUNDED order — a refunded order is never submitted", async () => {
+    const tenant = await freshTenant();
+    // A refund landed after PAID: `markRefundedByPaymentIntent` flips only `status`,
+    // leaving fulfillmentStatus NOT_SUBMITTED and the queued fs_ message pending.
+    // The claim's `status: PAID` guard must refuse it — otherwise we'd ship an order
+    // the customer was already refunded (real money + a physical shipment).
+    const order = await seedOrder(tenant.id, {
+      status: "REFUNDED",
+      fulfillmentStatus: "NOT_SUBMITTED",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "NOT_SUBMITTED",
+    );
+  });
+
+  it("returns false for a manually-FULFILLED order — no provider double-fulfilment", async () => {
+    const tenant = await freshTenant();
+    // An admin hand-attested FULFILLED (`markFulfilled`) before the fs_ message
+    // drained. Auto-submitting to the provider now would double-fulfil the order.
+    const order = await seedOrder(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "NOT_SUBMITTED",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "NOT_SUBMITTED",
+    );
+  });
+
+  it("claimForSubmission does not cross the tenant boundary — a foreign order is untouched", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedOrder(owner.id, { status: "PAID" });
+
+    expect(await orderRepository.claimForSubmission(other.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "NOT_SUBMITTED",
+    );
+  });
+
+  it("markSubmitted moves SUBMITTING → SUBMITTED and persists the external id + provider", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTING",
+    });
+
+    expect(
+      await orderRepository.markSubmitted(
+        tenant.id,
+        order.id,
+        "pf_12345",
+        "printful",
+      ),
+    ).toBe(true);
+
+    expect(await readFulfillment(order.id)).toMatchObject({
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: "pf_12345",
+      fulfillmentProvider: "printful",
+    });
+  });
+
+  it("markSubmitted no-ops on a non-SUBMITTING order (guarded — no external id leak)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" }); // NOT_SUBMITTED
+
+    expect(
+      await orderRepository.markSubmitted(
+        tenant.id,
+        order.id,
+        "pf_x",
+        "printful",
+      ),
+    ).toBe(false);
+
+    const persisted = await readFulfillment(order.id);
+    expect(persisted.fulfillmentStatus).toBe("NOT_SUBMITTED");
+    expect(persisted.fulfillmentExternalId).toBeNull();
+    expect(persisted.fulfillmentProvider).toBeNull();
+  });
+
+  it("markFulfillmentFailed moves NOT_SUBMITTED → FAILED (a pre-claim permanent failure)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" }); // NOT_SUBMITTED
+
+    await orderRepository.markFulfillmentFailed(tenant.id, order.id);
+
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe("FAILED");
+  });
+
+  it("markFulfillmentFailed moves SUBMITTING → FAILED (a soft rejection after the claim)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTING",
+    });
+
+    await orderRepository.markFulfillmentFailed(tenant.id, order.id);
+
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe("FAILED");
+  });
+
+  it("markFulfillmentFailed does not regress an already-SUBMITTED order", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTED",
+    });
+
+    await orderRepository.markFulfillmentFailed(tenant.id, order.id);
+
+    // The guard excludes SUBMITTED/SHIPPED — a stray late failure can't undo a
+    // recorded success.
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTED",
+    );
   });
 });
