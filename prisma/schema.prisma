@@ -311,6 +311,23 @@ model Order {
   // ship. Null for every normally-progressing order (SHIPPED long before the
   // threshold). Nullable, no default → safe to add on non-empty tables (golden rule 6).
   fulfillmentStuckAt    DateTime?
+  // Round-robin re-poll key for the deprioritised flagged-stuck poll tail (M4 #164).
+  // #158 sorts flagged-stuck orders (a never-resolving provider hold) to the TAIL of
+  // `findSubmittedForPolling` so they can't starve fresh orders; but it keyed that tail
+  // on the write-once `fulfillmentStuckAt`, so the tail order was stable across runs and
+  // a backlog past `POLL_BATCH_SIZE` could permanently starve the newest-flagged orders
+  // WITHIN the tail (a hold that later ships would never reconcile). This key fixes that:
+  // the poll stamps it `now()` on every re-poll of a flagged order (`markStuckRepolled`),
+  // and the tail sorts by it ascending — least-recently-repolled first — so re-polling
+  // ROTATES fairly and every flagged order is eventually reached. Set == `fulfillmentStuckAt`
+  // the instant an order is flagged (`markFulfillmentStuck`) and bumped thereafter, so it
+  // is non-null IFF the order is flagged-stuck — which is exactly why it (not the group
+  // discriminator `fulfillmentStuckAt`) is now the poll's primary `orderBy` key: `nulls:
+  // "first"` floats every not-yet-flagged order ahead of every flagged one, unchanged for
+  // fresh orders. Nullable, no default → safe on non-empty tables (golden rule 6); the #164
+  // migration backfills it = `fulfillmentStuckAt` for already-flagged rows so the invariant
+  // holds from the first post-deploy poll. Written only by the poll cron.
+  fulfillmentStuckPolledAt DateTime?
   // Consecutive failed `getTracking` polls for this SUBMITTED order (M4 #163). The
   // poll increments it each run `getTracking` throws (a persistent 4xx/5xx, a
   // bad/stale external id, a provider data problem) and resets it to 0 on any poll
@@ -363,8 +380,9 @@ model Order {
   // (a selective first term) and — the stronger reason — for non-redundancy with the
   // `[status, createdAt]` index above: a `status`-leading composite would overlap it,
   // whereas for this two-equality predicate the index seek localises equally whichever
-  // term leads. The residual `fulfillmentStuckAt NULLS FIRST, createdAt` ordering (#158
-  // deprioritises flagged-stuck rows to the tail) runs as a cheap sort over the small
+  // term leads. The residual `fulfillmentStuckPolledAt NULLS FIRST, createdAt` ordering
+  // (#158 deprioritises flagged-stuck rows to the tail; #164 rotates that tail by re-poll
+  // time) runs as a cheap sort over the small
   // filtered set — Prisma can't express NULLS FIRST in an index (only the runtime
   // `orderBy` can), and the filtered set is small, so covering the sort isn't worth it.
   @@index([fulfillmentStatus, status])

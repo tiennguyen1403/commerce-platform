@@ -46,6 +46,7 @@ vi.mock("@/server/repositories/order.repository", () => ({
     markShipped: vi.fn(),
     markFulfillmentFailedAfterSubmission: vi.fn(),
     markFulfillmentStuck: vi.fn(),
+    markStuckRepolled: vi.fn(),
     recordFulfillmentPollError: vi.fn(),
     resetFulfillmentPollErrors: vi.fn(),
   },
@@ -64,6 +65,7 @@ const markFulfillmentFailedAfterSubmission = vi.mocked(
   orderRepository.markFulfillmentFailedAfterSubmission,
 );
 const markFulfillmentStuck = vi.mocked(orderRepository.markFulfillmentStuck);
+const markStuckRepolled = vi.mocked(orderRepository.markStuckRepolled);
 const recordFulfillmentPollError = vi.mocked(
   orderRepository.recordFulfillmentPollError,
 );
@@ -120,6 +122,7 @@ function fulfillmentOrder(
     trackingNumber: null,
     trackingUrl: null,
     fulfillmentStuckAt: null,
+    fulfillmentStuckPolledAt: null,
     fulfillmentErrorCount: 0,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
@@ -148,6 +151,7 @@ beforeEach(() => {
   markShipped.mockResolvedValue(true);
   markFulfillmentFailedAfterSubmission.mockResolvedValue(true);
   markFulfillmentStuck.mockResolvedValue(true);
+  markStuckRepolled.mockResolvedValue(undefined);
   // A low, sub-threshold streak by default: a transient getTracking fault stays
   // "errored" and never alerts, so every pre-existing poll case is unaffected. The
   // #163-specific tests override the returned count to drive the surface-once path.
@@ -771,6 +775,10 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
     // terminal-exit writer ever runs.
     expect(markShipped).not.toHaveBeenCalled();
     expect(markFulfillmentFailedAfterSubmission).not.toHaveBeenCalled();
+    // The rotation key (#164) is seeded INSIDE markFulfillmentStuck on the flagging run,
+    // not via a re-poll bump — markStuckRepolled fires only on LATER re-polls of an
+    // already-flagged order, so it must not be called the run the order is first flagged.
+    expect(markStuckRepolled).not.toHaveBeenCalled();
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
@@ -782,7 +790,7 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
     });
   });
 
-  it("does not re-flag an order already surfaced as stuck", async () => {
+  it("re-polls an order already surfaced as stuck — bumps its rotation key (#164), never re-alerts", async () => {
     findSubmittedForPolling.mockResolvedValue([
       submitted({ createdAt: STUCK_AGO, fulfillmentStuckAt: new Date() }),
     ]);
@@ -790,9 +798,15 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
 
     const result = await fulfillmentService.pollOpenShipments();
 
-    // Short-circuited by the non-null marker — the guarded write is never even
-    // attempted a second time.
+    // Already surfaced (non-null marker) → no second alert; the guarded stuck-flag write is
+    // never attempted again.
     expect(markFulfillmentStuck).not.toHaveBeenCalled();
+    // But the flagged tail's round-robin re-poll key IS bumped (#164), so this order sorts
+    // to the BACK of the tail next run instead of pinning its front forever — the fix for
+    // the >POLL_BATCH_SIZE starvation #158's write-once key left. Counted `pending` (still
+    // in flight, not a fresh surface).
+    expect(markStuckRepolled).toHaveBeenCalledWith(TENANT, "order_1");
+    expect(markStuckRepolled).toHaveBeenCalledOnce();
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
@@ -813,6 +827,9 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
     const result = await fulfillmentService.pollOpenShipments();
 
     expect(markFulfillmentStuck).not.toHaveBeenCalled();
+    // A fresh (not-yet-flagged) order isn't in the flagged tail, so its rotation key is
+    // never bumped either — the "a not-shipped poll writes nothing" invariant holds.
+    expect(markStuckRepolled).not.toHaveBeenCalled();
     expect(result).toEqual({
       shipped: 0,
       failed: 0,

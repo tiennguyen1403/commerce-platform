@@ -1750,6 +1750,12 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
       where: { id: order.id },
     });
     expect(persisted.fulfillmentStuckAt).not.toBeNull();
+    // #164: the round-robin re-poll key is seeded to the SAME instant as the marker, so the
+    // order enters the flagged poll tail (non-null key) from its very next poll instead of
+    // momentarily sorting as fresh; markStuckRepolled bumps it from there.
+    expect(persisted.fulfillmentStuckPolledAt).toEqual(
+      persisted.fulfillmentStuckAt,
+    );
     // The raw hold status is snapshotted for the admin view (#161)...
     expect(persisted.fulfillmentProviderStatus).toBe("onhold");
     // ...but deliberately the inverse of markFulfillmentFailedAfterSubmission on the
@@ -1876,6 +1882,109 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     });
     expect(persisted.fulfillmentStuckAt).not.toBeNull();
     expect(persisted.fulfillmentProviderStatus).toBe("onhold");
+  });
+});
+
+/**
+ * `markStuckRepolled` — the poll cron's round-robin re-poll bump for the flagged-stuck tail
+ * (M4 #164). Stamps `fulfillmentStuckPolledAt = now()` on an ALREADY-flagged order so
+ * `findSubmittedForPolling` (which keys the tail on that column ascending) sorts it to the
+ * BACK of the tail, making re-polling rotate instead of the write-once `fulfillmentStuckAt`
+ * pinning the same oldest-flagged orders to the front forever (#158's residual). Guarded on
+ * `{status: PAID, fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: { not: null }}`: money-
+ * safe (a refunded / hand-fulfilled order is untouched) AND invariant-safe (only a flagged
+ * order's key ever moves, so "the key is non-null IFF flagged" — on which the fresh-orders-
+ * first ordering depends — stays airtight). A mock can't exercise `updateMany`'s guard
+ * count, so these run against the same Postgres the app uses.
+ */
+describe("orderRepository.markStuckRepolled (integration)", () => {
+  /** Seed a flagged-stuck SUBMITTED+PAID order — `fulfillmentStuckAt` and the re-poll key
+   *  both stamped in the past (default an hour ago), the state the poll re-polls each run. */
+  async function seedFlaggedStuck(
+    tenantId: string,
+    opts: { status?: OrderStatus; stuckAt?: Date } = {},
+  ) {
+    const stuckAt = opts.stuckAt ?? new Date(Date.now() - 60 * 60_000);
+    const order = await seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+    return prisma.order.update({
+      where: { id: order.id },
+      data: { fulfillmentStuckAt: stuckAt, fulfillmentStuckPolledAt: stuckAt },
+    });
+  }
+
+  it("advances fulfillmentStuckPolledAt on a flagged order, touching nothing else", async () => {
+    const tenant = await freshTenant();
+    const order = await seedFlaggedStuck(tenant.id);
+    const before = order.fulfillmentStuckPolledAt!;
+
+    await orderRepository.markStuckRepolled(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    // The key moved strictly forward (now() > the seeded past stamp) → this order now sorts
+    // to the BACK of the flagged tail, so the next run re-polls a DIFFERENT flagged order.
+    expect(persisted.fulfillmentStuckPolledAt!.getTime()).toBeGreaterThan(
+      before.getTime(),
+    );
+    // Nothing else moves — this write only reorders the batch; it drives no state change or
+    // alert, so the flag time, the lifecycle, and the order status all stand untouched.
+    expect(persisted.fulfillmentStuckAt).toEqual(order.fulfillmentStuckAt);
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("does not touch a not-yet-flagged (fresh) order — preserves the null-iff-flagged invariant", async () => {
+    const tenant = await freshTenant();
+    // A fresh SUBMITTED order (never flagged): `fulfillmentStuckAt` is null, so the
+    // `fulfillmentStuckAt: { not: null }` guard blocks the write — its key must stay null so
+    // it keeps sorting as fresh. The poll never calls this for a fresh order; the guard is
+    // defence in depth against ever violating the null-iff-flagged invariant.
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+
+    await orderRepository.markStuckRepolled(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckPolledAt).toBeNull();
+  });
+
+  it("does not touch a no-longer-PAID (refunded) flagged order — the money-safety guard", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after the order was flagged. The `status: PAID` guard leaves
+    // the key frozen (the order also drops from the poll via the status filter anyway).
+    const order = await seedFlaggedStuck(tenant.id, { status: "REFUNDED" });
+    const before = order.fulfillmentStuckPolledAt;
+
+    await orderRepository.markStuckRepolled(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckPolledAt).toEqual(before);
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedFlaggedStuck(owner.id);
+    const before = order.fulfillmentStuckPolledAt;
+
+    await orderRepository.markStuckRepolled(other.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckPolledAt).toEqual(before);
   });
 });
 
@@ -2323,25 +2432,32 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
     expect(mineInOrder).toEqual([a1.id, b1.id, a2.id]);
   });
 
-  it("deprioritises flagged-stuck orders to the tail — not-yet-flagged first, then oldest-flagged (#158)", async () => {
+  it("deprioritises flagged-stuck orders to the tail — not-yet-flagged first, then by re-poll key (#158/#164)", async () => {
     const t = await freshTenant();
-    // Two not-yet-flagged (fulfillmentStuckAt = null) orders, and two flagged-stuck
-    // ones whose `createdAt` is OLDER than both fresh orders — pre-#158 (oldest-first
-    // only) the flagged pair would poll first every run and, if the hold never
-    // resolves, starve the fresh orders. Flag order is the inverse of createdAt order
-    // (stuckA is oldest-created but flagged most recently) to prove the tail sorts by
-    // `fulfillmentStuckAt`, not `createdAt`.
+    // Two not-yet-flagged orders, and two flagged-stuck ones whose `createdAt` is OLDER than
+    // both fresh orders — pre-#158 (oldest-first only) the flagged pair would poll first
+    // every run and, if the hold never resolves, starve the fresh orders. The tail sorts by
+    // `fulfillmentStuckPolledAt` (#164's re-poll key), which `markFulfillmentStuck` seeds =
+    // `fulfillmentStuckAt` at flag time; here it's set the inverse of createdAt order (stuckA
+    // is oldest-created but flagged most recently) to prove the tail sorts by the re-poll
+    // key, not `createdAt`. A fresh order's key is null → `nulls: "first"` floats it ahead.
     const freshOld = await seedSubmitted(t.id, { createdAt: minsAgo(200) });
     const freshNew = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
     const stuckA = await seedSubmitted(t.id, { createdAt: minsAgo(500) });
     const stuckB = await seedSubmitted(t.id, { createdAt: minsAgo(400) });
     await prisma.order.update({
       where: { id: stuckA.id },
-      data: { fulfillmentStuckAt: minsAgo(30) },
+      data: {
+        fulfillmentStuckAt: minsAgo(30),
+        fulfillmentStuckPolledAt: minsAgo(30),
+      },
     });
     await prisma.order.update({
       where: { id: stuckB.id },
-      data: { fulfillmentStuckAt: minsAgo(90) },
+      data: {
+        fulfillmentStuckAt: minsAgo(90),
+        fulfillmentStuckPolledAt: minsAgo(90),
+      },
     });
 
     const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
@@ -2349,14 +2465,72 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
       .filter((id) =>
         [freshOld.id, freshNew.id, stuckA.id, stuckB.id].includes(id),
       );
-    // Not-yet-flagged first (oldest createdAt first), THEN flagged-stuck (oldest
-    // `fulfillmentStuckAt` first) — even though stuckA/stuckB were created first.
+    // Not-yet-flagged first (oldest createdAt first), THEN flagged-stuck (least-recently-
+    // repolled first — stuckB's 90m-ago key before stuckA's 30m-ago), even though
+    // stuckA/stuckB were created first.
     expect(mineInOrder).toEqual([
       freshOld.id,
       freshNew.id,
       stuckB.id,
       stuckA.id,
     ]);
+  });
+
+  it("rotates the flagged-stuck tail by re-poll key so no flagged order is starved past the batch limit (#164)", async () => {
+    const t = await freshTenant();
+    // One fresh order + three flagged-stuck orders. Pre-#164 the tail keyed on the WRITE-ONCE
+    // `fulfillmentStuckAt`, so the same orders sat at its front every run and a backlog past
+    // POLL_BATCH_SIZE permanently starved the newest-flagged. Now the tail keys on
+    // `fulfillmentStuckPolledAt`, which each re-poll bumps — so re-polling ROTATES. Seed the
+    // three flagged orders with DISTINCT re-poll keys in a DIFFERENT order than createdAt to
+    // prove the key, not creation age, drives the tail.
+    const fresh = await seedSubmitted(t.id, { createdAt: minsAgo(50) });
+    const stuckA = await seedSubmitted(t.id, { createdAt: minsAgo(500) });
+    const stuckB = await seedSubmitted(t.id, { createdAt: minsAgo(400) });
+    const stuckC = await seedSubmitted(t.id, { createdAt: minsAgo(300) });
+    const flag = (id: string, polledAt: Date) =>
+      prisma.order.update({
+        where: { id },
+        data: {
+          fulfillmentStuckAt: minsAgo(200),
+          fulfillmentStuckPolledAt: polledAt,
+        },
+      });
+    // Re-poll keys: B oldest (30m ago), C (20m), A newest (10m) → tail order B, C, A.
+    await flag(stuckA.id, minsAgo(10));
+    await flag(stuckB.id, minsAgo(30));
+    await flag(stuckC.id, minsAgo(20));
+
+    const mine = (open: { id: string }[]) =>
+      open
+        .map((o) => o.id)
+        .filter((id) =>
+          [fresh.id, stuckA.id, stuckB.id, stuckC.id].includes(id),
+        );
+
+    // Run 1: fresh first, then the flagged tail by ascending re-poll key (B, C, A).
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      fresh.id,
+      stuckB.id,
+      stuckC.id,
+      stuckA.id,
+    ]);
+
+    // The poll re-polls the two least-recently-polled flagged orders (B then C):
+    // markStuckRepolled stamps now(), sending them to the BACK of the tail. A is untouched.
+    await orderRepository.markStuckRepolled(t.id, stuckB.id);
+    await orderRepository.markStuckRepolled(t.id, stuckC.id);
+
+    // Run 2: A (still 10m-ago key) now sorts BEFORE B and C (just re-polled → now) — the
+    // once-last flagged order is now first. No flagged order is pinned to the front across
+    // runs, so a >batch-size backlog can't permanently starve the newest-flagged. (B before
+    // C: B was re-polled first; the `createdAt` tiebreak — B older than C — settles any
+    // same-millisecond tie identically.)
+    expect(
+      mine(await orderRepository.findSubmittedForPolling(100)).filter(
+        (id) => id !== fresh.id,
+      ),
+    ).toEqual([stuckA.id, stuckB.id, stuckC.id]);
   });
 
   it("excludes orders whose fulfillmentStatus isn't SUBMITTED", async () => {
