@@ -8,6 +8,7 @@ import {
   InsufficientStockError,
   OrderNumberTakenError,
 } from "@/server/order.errors";
+import type { ShippingAddress } from "@/server/fulfillment/provider";
 import {
   createTestTenant,
   deleteTenantDeep,
@@ -173,6 +174,19 @@ async function seedOrder(
   });
 }
 
+/** A valid US shipping address `orderInput` attaches by default (#135), so every
+ *  `createWithItems` call persists one and the round-trip can be asserted. `line2`
+ *  is intentionally blank to exercise the empty→null column normalization. */
+const TEST_SHIPPING: ShippingAddress = {
+  name: "Ada Lovelace",
+  line1: "1 Analytical Ave",
+  line2: "",
+  city: "San Francisco",
+  state: "CA",
+  postalCode: "94103",
+  country: "US",
+};
+
 /** Build a `CreateOrderInput` (the shape `createWithItems` reserves + writes). */
 function orderInput(
   tenantId: string,
@@ -182,6 +196,7 @@ function orderInput(
     orderNumber?: string;
     stripePaymentIntentId?: string;
     userId?: string | null;
+    shippingAddress?: ShippingAddress;
   } = {},
 ): CreateOrderInput {
   return {
@@ -190,6 +205,7 @@ function orderInput(
     orderNumber: overrides.orderNumber ?? uniqueId("order"),
     email: "shopper@example.com",
     userId: overrides.userId ?? null,
+    shippingAddress: overrides.shippingAddress ?? TEST_SHIPPING,
     totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
     currency: "usd",
     stripePaymentIntentId: overrides.stripePaymentIntentId ?? uniqueId("pi"),
@@ -536,6 +552,16 @@ describe("orderRepository.createWithItems (reservation, integration)", () => {
     });
     expect(persisted.status).toBe("PENDING");
     expect(persisted.items).toHaveLength(1);
+
+    // #135: the shipping address is persisted in the same create transaction; a
+    // blank line2 is normalized to null (the "not provided" column convention).
+    expect(persisted.shipName).toBe(TEST_SHIPPING.name);
+    expect(persisted.shipLine1).toBe(TEST_SHIPPING.line1);
+    expect(persisted.shipLine2).toBeNull();
+    expect(persisted.shipCity).toBe(TEST_SHIPPING.city);
+    expect(persisted.shipState).toBe(TEST_SHIPPING.state);
+    expect(persisted.shipPostalCode).toBe(TEST_SHIPPING.postalCode);
+    expect(persisted.shipCountry).toBe("US");
 
     // Inventory is held: `reserved` bumped, physical `stock` untouched.
     const after = await prisma.productVariant.findUniqueOrThrow({

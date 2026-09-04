@@ -9,18 +9,23 @@ import {
   InsufficientStockError,
 } from "@/server/services/order.service";
 import { reportError } from "@/server/observability/error-reporter";
-import { checkoutInputSchema } from "@/lib/validators/checkout";
+import {
+  checkoutInputSchema,
+  type CheckoutInput,
+} from "@/lib/validators/checkout";
 
 /**
  * Start-checkout Server Action. Public endpoint, so it re-validates its input and
  * — critically — never trusts a client-supplied cart: it reads the cart from the
- * cookie and re-prices it server-side. The shopper supplies only their email.
+ * cookie and re-prices it server-side. The shopper supplies their email and
+ * shipping address; both are re-validated here (the client form's check is UX
+ * only, never the authority) before the address is persisted onto the order.
  * Returns the PaymentIntent `clientSecret` (plus the authoritative amount) for
  * the browser to mount the Payment Element, or a friendly error message.
  */
-export async function startCheckoutAction(input: {
-  email: string;
-}): Promise<
+export async function startCheckoutAction(
+  input: CheckoutInput,
+): Promise<
   | { ok: true; clientSecret: string; totalCents: number; currency: string }
   | { ok: false; error: string }
 > {
@@ -28,7 +33,8 @@ export async function startCheckoutAction(input: {
   if (!parsed.success) {
     return {
       ok: false,
-      error: parsed.error.issues[0]?.message ?? "Enter a valid email address.",
+      error:
+        parsed.error.issues[0]?.message ?? "Check your details and try again.",
     };
   }
 
@@ -46,6 +52,7 @@ export async function startCheckoutAction(input: {
         tenantId,
         lines,
         parsed.data.email,
+        parsed.data.shippingAddress,
         storeCurrency,
         userId,
       );
