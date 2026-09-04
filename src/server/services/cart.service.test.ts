@@ -43,6 +43,7 @@ function variantRow(
     productId: "prod_1",
     sku: `SKU-${id}`,
     name: o.name ?? "Default variant",
+    providerVariantId: null,
     priceCents: o.priceCents ?? 1000,
     stock: o.stock ?? 10,
     reserved: o.reserved ?? 0,

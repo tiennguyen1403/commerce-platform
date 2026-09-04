@@ -181,6 +181,13 @@ model ProductVariant {
   productId  String
   sku        String
   name       String
+  // Maps our free-form `sku` to the fulfillment provider's opaque catalog
+  // variant id (e.g. Printful's integer `variant_id`). Provider-agnostic name
+  // (not `printfulVariantId`) so the provider stays swappable behind the
+  // `FulfillmentProvider` interface. Nullable: an unmapped variant simply isn't
+  // submittable — the submission service treats an unmapped line as a defined,
+  // admin-visible failure, never a silent provider 4xx (M4 #134).
+  providerVariantId String?
   // Money is stored as integer minor units (cents) to avoid float errors. The
   // currency is the store's (`Tenant.currency`), never per-variant — that's what
   // keeps a cart/order total single-currency and soundly summable.
@@ -217,6 +224,24 @@ enum OrderStatus {
   REFUNDED
 }
 
+/// Lifecycle of an order's fulfillment — our own closed state machine, distinct
+/// from the raw provider status string (`Order.fulfillmentProviderStatus`, admin
+/// display only). Shape mirrors `OutboxStatus`: NOT_SUBMITTED is the initial
+/// state, SUBMITTING/SUBMITTED are the live states, SHIPPED and FAILED are
+/// terminal. SUBMITTING doubles as the order-level idempotency guard for
+/// provider submission — a duplicate POD order is real money + a physical
+/// shipment, so a lost worker leaves the order stuck in SUBMITTING for a human
+/// to reconcile rather than silently retrying (M4 research, "Idempotent
+/// submission"). Set only by the fulfillment service + poll cron in later M4
+/// issues; this migration only lays the column.
+enum FulfillmentStatus {
+  NOT_SUBMITTED // PAID with no address yet, or not yet claimed by the outbox
+  SUBMITTING // claimed for submission — the order-level idempotency guard
+  SUBMITTED // provider accepted the order; no tracking yet
+  SHIPPED // provider reports shipped — drives Order.status → FULFILLED
+  FAILED // provider rejected it (soft failure) or submit attempts exhausted
+}
+
 model Order {
   id                    String      @id @default(cuid())
   tenantId              String
@@ -240,6 +265,42 @@ model Order {
   // copy (#40). The payment still stands PAID; only inventory fell short. One-way:
   // nothing clears it. Set by `markPaidByPaymentIntent`.
   oversold              Boolean     @default(false)
+  // Shipping address, flattened onto the order (not a separate Address model) to
+  // match the OrderItem snapshot philosophy — a point-in-time fact later catalog
+  // or account edits must never rewrite — and to avoid a join on every order read
+  // (admin detail, shopper history, the fulfillment-outbox re-read). All
+  // nullable: a guest/legacy order, or one placed before M4, simply has none.
+  // Written in the SAME transaction as order creation at checkout (M4 #134).
+  shipName              String?
+  shipLine1             String?
+  shipLine2             String?     // optional second line (apt/suite/unit)
+  shipCity              String?
+  shipState             String?     // state/province/region — requiredness varies by country
+  shipPostalCode        String?
+  shipCountry           String?     // ISO-3166 alpha-2, from the SHIPPING_COUNTRIES allowlist
+  // Fulfillment + tracking, written as a PAID order moves through the provider
+  // (POD) lifecycle; all nullable or defaulted so existing PAID/FULFILLED rows
+  // backfill safely (golden rule 6). Populated by the submission service and the
+  // poll-fulfillment cron in later M4 issues — this migration only lays them.
+  // Which provider handled the order ("printful" | "mock"); provider-agnostic so
+  // a swap is a data change, not a schema change. Null until first submitted.
+  fulfillmentProvider   String?
+  // The provider's own order id (FulfillmentResult.externalId), persisted on a
+  // successful submission so the poll cron can reconcile tracking against it.
+  fulfillmentExternalId String?
+  // Our own closed fulfillment state (see FulfillmentStatus). NOT NULL with a
+  // DEFAULT so existing rows backfill to NOT_SUBMITTED (migration-safe).
+  fulfillmentStatus     FulfillmentStatus @default(NOT_SUBMITTED)
+  // The raw, free-form status string from the provider (Printful: "draft",
+  // "pending", "inprocess", "fulfilled", …) — admin display only, never a
+  // control-flow input (that role belongs to fulfillmentStatus, our closed enum).
+  fulfillmentProviderStatus String?
+  // Shipment tracking, persisted by the poll cron once the provider reports a
+  // shipment (null until then): carrier + number identify the parcel; url is the
+  // provider-supplied tracking link surfaced in the account UI + shipping email.
+  trackingCarrier       String?
+  trackingNumber        String?
+  trackingUrl           String?
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
@@ -299,11 +360,14 @@ enum OutboxStatus {
   DEAD // permanently failed: retries exhausted or a permanent error — terminal
 }
 
-/// What kind of message this row renders to. One kind today (the order
-/// confirmation); the discriminator lets the drain dispatch by type and keeps
-/// the table a genuine outbox rather than a single-purpose queue.
+/// What kind of message this row renders to. The discriminator lets the drain
+/// dispatch by type — its `sendMessage` switch is exhaustive, so adding a value
+/// here without a matching case is a compile error — and keeps the table a
+/// genuine outbox rather than a single-purpose queue.
 enum OutboxMessageType {
-  ORDER_CONFIRMATION
+  ORDER_CONFIRMATION // a paid order's confirmation email (#30)
+  FULFILLMENT_SUBMISSION // submit a PAID order to the POD provider (M4 #134)
+  SHIPPING_CONFIRMATION // the shipped + tracking email once fulfillment ships (M4 #134)
 }
 
 /// A durable "please send this" record, written **in the same transaction** as
