@@ -8,6 +8,7 @@ import { fulfillmentService } from "@/server/services/fulfillment.service";
 import {
   orderRepository,
   type OrderForFulfillment,
+  type SubmittedOrderForPolling,
 } from "@/server/repositories/order.repository";
 import { OrderNotFoundError } from "@/server/order.errors";
 import {
@@ -38,6 +39,8 @@ vi.mock("@/server/repositories/order.repository", () => ({
     claimForSubmission: vi.fn(),
     markSubmitted: vi.fn(),
     markFulfillmentFailed: vi.fn(),
+    findSubmittedForPolling: vi.fn(),
+    markShipped: vi.fn(),
   },
 }));
 
@@ -46,6 +49,10 @@ const findForFulfillment = vi.mocked(orderRepository.findForFulfillment);
 const claimForSubmission = vi.mocked(orderRepository.claimForSubmission);
 const markSubmitted = vi.mocked(orderRepository.markSubmitted);
 const markFulfillmentFailed = vi.mocked(orderRepository.markFulfillmentFailed);
+const findSubmittedForPolling = vi.mocked(
+  orderRepository.findSubmittedForPolling,
+);
+const markShipped = vi.mocked(orderRepository.markShipped);
 
 const TENANT = "tenant_1";
 
@@ -108,19 +115,42 @@ beforeEach(() => {
   vi.resetAllMocks();
   provider = new MockProvider();
   // Spy but keep the real mock behaviour (spyOn calls through by default), so we
-  // assert the exact input AND get a real submitted/failed result back.
+  // assert the exact input AND get a real submitted/failed result back. The poll
+  // tests override `getTracking` per-case for a deterministic tracking snapshot.
   vi.spyOn(provider, "createOrder");
+  vi.spyOn(provider, "getTracking");
   getProvider.mockReturnValue(provider);
   // Happy-path repository defaults; individual tests override.
   findForFulfillment.mockResolvedValue(fulfillmentOrder());
   claimForSubmission.mockResolvedValue(true);
   markSubmitted.mockResolvedValue(true);
   markFulfillmentFailed.mockResolvedValue(undefined);
+  findSubmittedForPolling.mockResolvedValue([]);
+  markShipped.mockResolvedValue(true);
 });
 
 /** The spied `createOrder`, typed for `.mock`/`toHaveBeenCalled*` assertions. */
 function createOrderMock() {
   return vi.mocked(provider.createOrder);
+}
+
+/** The spied `getTracking`, typed for `.mockResolvedValue`/assertions. */
+function getTrackingMock() {
+  return vi.mocked(provider.getTracking);
+}
+
+const EXTERNAL_ID = "mock_order_1";
+
+/** A `SubmittedOrderForPolling` row as `findSubmittedForPolling` returns it. */
+function submitted(
+  o: Partial<SubmittedOrderForPolling> = {},
+): SubmittedOrderForPolling {
+  return {
+    id: "order_1",
+    tenantId: TENANT,
+    fulfillmentExternalId: EXTERNAL_ID,
+    ...o,
+  };
 }
 
 describe("fulfillmentService.submitOrder — submission + persistence", () => {
@@ -356,5 +386,126 @@ describe("fulfillmentService.submitOrder — non-FAILED outcomes", () => {
     expect(claimForSubmission).toHaveBeenCalledOnce();
     expect(markSubmitted).not.toHaveBeenCalled();
     expect(markFulfillmentFailed).not.toHaveBeenCalled();
+  });
+});
+
+describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
+  it("reconciles a shipped order: persists the tracking snapshot via markShipped", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    getTrackingMock().mockResolvedValue({
+      status: "shipped",
+      carrier: "UPS",
+      trackingNumber: "1Z999",
+      trackingUrl: "https://track.example.test/1Z999",
+    });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(getTrackingMock()).toHaveBeenCalledWith(EXTERNAL_ID);
+    // The raw status becomes fulfillmentProviderStatus; carrier/number/url are the
+    // reconciled shipment. Only the tenant-scoped markShipped writes.
+    expect(markShipped).toHaveBeenCalledWith(TENANT, "order_1", {
+      providerStatus: "shipped",
+      carrier: "UPS",
+      trackingNumber: "1Z999",
+      trackingUrl: "https://track.example.test/1Z999",
+    });
+    expect(result).toEqual({ shipped: 1, pending: 0, errored: 0 });
+  });
+
+  it("maps a shipment with no carrier/url to nulls (tracking number is the signal)", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    // Printful's `fulfilled` with only a tracking number, no carrier/url.
+    getTrackingMock().mockResolvedValue({
+      status: "fulfilled",
+      trackingNumber: "TN-1",
+    });
+
+    await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).toHaveBeenCalledWith(TENANT, "order_1", {
+      providerStatus: "fulfilled",
+      carrier: null,
+      trackingNumber: "TN-1",
+      trackingUrl: null,
+    });
+  });
+
+  it("leaves an unshipped order alone (no tracking number → no markShipped)", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    // The provider accepted the order but hasn't shipped it — no tracking number.
+    getTrackingMock().mockResolvedValue({ status: "inprocess" });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).not.toHaveBeenCalled();
+    expect(result).toEqual({ shipped: 0, pending: 1, errored: 0 });
+  });
+
+  it("counts a transient getTracking failure as errored, without reconciling", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    getTrackingMock().mockRejectedValue(new Error("printful 503"));
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).not.toHaveBeenCalled();
+    expect(result).toEqual({ shipped: 0, pending: 0, errored: 1 });
+  });
+
+  it("counts a refunded/fulfilled race (markShipped=false) as pending, not shipped", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    getTrackingMock().mockResolvedValue({
+      status: "shipped",
+      trackingNumber: "1Z999",
+    });
+    // The guarded reconcile matched nothing — the order left PAID+SUBMITTED
+    // (refunded or manually fulfilled) between the find and the write.
+    markShipped.mockResolvedValue(false);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).toHaveBeenCalledOnce();
+    expect(result).toEqual({ shipped: 0, pending: 1, errored: 0 });
+  });
+
+  it("skips an order with no fulfillmentExternalId (errored, never calls the provider)", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ fulfillmentExternalId: null }),
+    ]);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(getTrackingMock()).not.toHaveBeenCalled();
+    expect(markShipped).not.toHaveBeenCalled();
+    expect(result).toEqual({ shipped: 0, pending: 0, errored: 1 });
+  });
+
+  it("isolates a markShipped DB error per order and keeps polling the rest", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ id: "o1", fulfillmentExternalId: "ext1" }),
+      submitted({ id: "o2", fulfillmentExternalId: "ext2" }),
+    ]);
+    getTrackingMock().mockResolvedValue({
+      status: "shipped",
+      trackingNumber: "TN",
+    });
+    // The first order's reconcile write blows up; the second must still ship.
+    markShipped
+      .mockRejectedValueOnce(new Error("db down"))
+      .mockResolvedValue(true);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ shipped: 1, pending: 0, errored: 1 });
+  });
+
+  it("returns zeros and queries nothing when no provider is configured", async () => {
+    getProvider.mockReturnValue(null);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(findSubmittedForPolling).not.toHaveBeenCalled();
+    expect(result).toEqual({ shipped: 0, pending: 0, errored: 0 });
   });
 });

@@ -1,13 +1,18 @@
 import "server-only";
-import { getFulfillmentProvider } from "@/server/fulfillment";
+import {
+  getFulfillmentProvider,
+  type FulfillmentProvider,
+} from "@/server/fulfillment";
 import {
   orderRepository,
   type OrderForFulfillment,
+  type SubmittedOrderForPolling,
 } from "@/server/repositories/order.repository";
 import type {
   CreateFulfillmentInput,
   FulfillmentLineItem,
   ShippingAddress,
+  TrackingInfo,
 } from "@/server/fulfillment/provider";
 import { OrderNotFoundError } from "@/server/order.errors";
 import {
@@ -17,6 +22,41 @@ import {
   FulfillmentNotMappedError,
   FulfillmentRejectedError,
 } from "@/server/fulfillment.errors";
+import { logger } from "@/server/observability/logger";
+
+// --- Poll-fulfillment tuning (M4 #140) ---------------------------------------
+// Module-local knobs, mirroring order.service's sweep constants.
+
+/** Upper bound on open shipments pulled per poll run. The real stop condition is
+ *  the time budget below (each order makes one provider `getTracking` call, run
+ *  sequentially); this just caps the query so one run can't pull an unbounded set
+ *  into memory. Whatever isn't reached drains over later runs — the poll is
+ *  reconciliation-based, so a partial run is always safe. */
+const POLL_BATCH_SIZE = 100;
+
+/** Soft per-run wall-clock budget. The poll stops starting new orders once this
+ *  elapses, so a slow provider (or a big backlog) degrades into "continues next
+ *  run" rather than being force-killed at the route's `maxDuration` (60s) mid-poll.
+ *  Kept comfortably under `maxDuration` (mirrors the sweep/drain budgets). */
+const POLL_TIME_BUDGET_MS = 45_000;
+
+const pollLog = logger.child({ component: "fulfillment-poll" });
+
+/** Per-run tallies from the poll-fulfillment cron (M4 #140), surfaced by the
+ *  route for observability. */
+export type PollResult = {
+  /** Orders reconciled SUBMITTED → SHIPPED (Order PAID → FULFILLED) this run. */
+  shipped: number;
+  /** Polled, but not reconciled this run for a benign reason — the provider hasn't
+   *  shipped yet, or the order was concurrently refunded/fulfilled — left SUBMITTED. */
+  pending: number;
+  /** Poll hit a transient provider/DB fault (isolated so one can't abort the
+   *  batch); the order is left SUBMITTED and retried next run. */
+  errored: number;
+};
+
+/** Outcome of polling one open shipment (drives the `PollResult` tally). */
+type PollOutcome = "shipped" | "pending" | "errored";
 
 /**
  * Fulfillment orchestration — everything ABOVE the provider boundary (M4 #137),
@@ -74,7 +114,142 @@ export const fulfillmentService = {
       throw err;
     }
   },
+
+  /**
+   * Poll the provider for every open shipment and reconcile the shipped ones — the
+   * cron entry point (`/api/cron/poll-fulfillment`, M4 #140). Finds SUBMITTED (and
+   * still PAID) orders across all tenants (like the sweep/drain), asks the provider
+   * for each one's tracking, and for those the provider reports shipped flips the
+   * order PAID → FULFILLED with tracking persisted and the shipping email enqueued —
+   * all in one guarded, idempotent transaction (`orderRepository.markShipped`).
+   *
+   * Reconciliation-based and idempotent: a missed, duplicated, or racing run is a
+   * safe no-op — an unshipped order is simply re-checked next run, an
+   * already-reconciled one has left SUBMITTED so it is never re-polled, and the
+   * guarded flip enqueues the email exactly once. Batch- and time-bounded; whatever
+   * isn't reached this run is polled by the next. When no provider is configured
+   * (production without `PRINTFUL_API_KEY`) there is nothing to reconcile — warn and
+   * return zeros. Per-run counts are returned for the route to log.
+   */
+  async pollOpenShipments(): Promise<PollResult> {
+    const provider = getFulfillmentProvider();
+    if (!provider) {
+      // Nothing could have been submitted, so nothing can be reconciled — the
+      // FulfillmentNotConfigured posture (warn, don't error).
+      pollLog.warn(
+        "poll: no fulfillment provider configured — nothing to reconcile",
+      );
+      return { shipped: 0, pending: 0, errored: 0 };
+    }
+
+    const open = await orderRepository.findSubmittedForPolling(POLL_BATCH_SIZE);
+
+    const result: PollResult = { shipped: 0, pending: 0, errored: 0 };
+    const deadline = Date.now() + POLL_TIME_BUDGET_MS;
+    for (const order of open) {
+      // Stop starting new work once the budget is spent — better to leave the rest
+      // for the next run than be force-killed mid-poll at the route's maxDuration.
+      if (Date.now() >= deadline) {
+        const handled = result.shipped + result.pending + result.errored;
+        pollLog.info(
+          { ...result, remaining: open.length - handled },
+          "poll: time budget reached — remaining orders deferred to next run",
+        );
+        break;
+      }
+      try {
+        result[await pollOne(provider, order)] += 1;
+      } catch (err) {
+        // Unexpected (a DB error in markShipped not already handled inside pollOne).
+        // Leave the order SUBMITTED — still reconcilable — for the next run.
+        result.errored += 1;
+        pollLog.error(
+          { err, orderId: order.id, tenantId: order.tenantId },
+          "poll: unexpected error; leaving order for a later run",
+        );
+      }
+    }
+    return result;
+  },
 };
+
+/**
+ * Poll and reconcile ONE open shipment (M4 #140). Asks the provider for the order's
+ * tracking, and:
+ *  - a transient `getTracking` fault (the adapter throws a plain Error for a
+ *    404/401/5xx/timeout) → `"errored"`: leave the order SUBMITTED, retry next run;
+ *  - no tracking number yet → `"pending"`: the provider hasn't shipped it, so write
+ *    nothing (a not-shipped poll is a pure no-op) and re-check next run;
+ *  - a tracking number present → the shipped signal: persist tracking + flip
+ *    PAID → FULFILLED + enqueue the shipping email via the guarded, atomic
+ *    `markShipped`. `"shipped"` if it made the transition, `"pending"` if the order
+ *    left PAID+SUBMITTED first (a refund/manual-fulfil race — benign no-op).
+ *
+ * "Shipped" is signalled provider-agnostically by the presence of a tracking NUMBER,
+ * not the raw status string: the mock emits one only once shipped, and Printful
+ * populates `shipments[].tracking_number` when the order ships. The raw status is
+ * admin-display only — persisted as `fulfillmentProviderStatus` in the reconcile,
+ * never a control-flow input — so we never flip FULFILLED on a "shipped"/"fulfilled"
+ * status that carries no parcel to put in the email. A DB error from `markShipped`
+ * is left to propagate to the caller's per-order isolation (unexpected).
+ */
+async function pollOne(
+  provider: FulfillmentProvider,
+  order: SubmittedOrderForPolling,
+): Promise<PollOutcome> {
+  const { id, tenantId, fulfillmentExternalId } = order;
+
+  // A SUBMITTED order always carries the provider's real order id (`markSubmitted`
+  // is its only writer, on the success path). A null here is a data anomaly we
+  // can't reconcile — surface it and skip, never call getTracking with an empty id.
+  if (!fulfillmentExternalId) {
+    pollLog.error(
+      { orderId: id, tenantId },
+      "poll: SUBMITTED order has no fulfillmentExternalId — cannot reconcile",
+    );
+    return "errored";
+  }
+
+  let tracking: TrackingInfo;
+  try {
+    tracking = await provider.getTracking(fulfillmentExternalId);
+  } catch (err) {
+    // Transient provider fault — leave the order SUBMITTED; the next run retries.
+    pollLog.warn(
+      { err, orderId: id, tenantId, externalId: fulfillmentExternalId },
+      "poll: getTracking failed — leaving order for a later run",
+    );
+    return "errored";
+  }
+
+  // Not shipped yet — nothing to persist. Re-checked next run.
+  if (!tracking.trackingNumber) {
+    return "pending";
+  }
+
+  // Shipped: reconcile atomically + idempotently. A `false` return means the order
+  // left PAID+SUBMITTED before we got here (a refund or manual fulfil raced us), so
+  // we simply didn't ship it — a benign no-op, not a shipment.
+  const shipped = await orderRepository.markShipped(tenantId, id, {
+    providerStatus: tracking.status,
+    carrier: tracking.carrier ?? null,
+    trackingNumber: tracking.trackingNumber,
+    trackingUrl: tracking.trackingUrl ?? null,
+  });
+  if (!shipped) {
+    pollLog.info(
+      { orderId: id, tenantId },
+      "poll: order left PAID/SUBMITTED before reconcile (refunded or manually fulfilled) — skipping",
+    );
+    return "pending";
+  }
+
+  pollLog.info(
+    { orderId: id, tenantId, externalId: fulfillmentExternalId },
+    "poll: order shipped — reconciled to FULFILLED with tracking",
+  );
+  return "shipped";
+}
 
 /**
  * The submission itself, minus the FAILED bookkeeping its caller wraps around it.

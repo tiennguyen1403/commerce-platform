@@ -36,6 +36,7 @@ vi.mock("@/server/repositories/outbox.repository", () => ({
     markSent: vi.fn(),
     reschedule: vi.fn(),
     markDead: vi.fn(),
+    defer: vi.fn(),
   },
 }));
 vi.mock("@/server/repositories/order.repository", () => ({
@@ -68,6 +69,7 @@ const claim = vi.mocked(outboxRepository.claim);
 const markSent = vi.mocked(outboxRepository.markSent);
 const reschedule = vi.mocked(outboxRepository.reschedule);
 const markDead = vi.mocked(outboxRepository.markDead);
+const defer = vi.mocked(outboxRepository.defer);
 const findOrder = vi.mocked(orderRepository.findByIdForTenant);
 const sendOrderConfirmation = vi.mocked(emailService.sendOrderConfirmation);
 const submitOrder = vi.mocked(fulfillmentService.submitOrder);
@@ -78,6 +80,7 @@ const report = vi.mocked(reportError);
 const NOW = new Date("2026-01-15T12:00:00.000Z");
 const CLAIM_TIMEOUT_MS = 5 * 60_000;
 const BACKOFF_FIRST_MS = 60_000;
+const DEFER_MS = 60 * 60_000;
 
 function summary(o: Partial<OutboxMessageSummary> = {}): OutboxMessageSummary {
   return {
@@ -149,6 +152,7 @@ beforeEach(() => {
   markSent.mockResolvedValue(undefined);
   reschedule.mockResolvedValue(undefined);
   markDead.mockResolvedValue(undefined);
+  defer.mockResolvedValue(undefined);
   findOrder.mockResolvedValue(orderWithItems());
   sendOrderConfirmation.mockResolvedValue(undefined);
   submitOrder.mockResolvedValue(undefined);
@@ -408,6 +412,51 @@ describe("outboxService.drain — FULFILLMENT_SUBMISSION (M4 #139)", () => {
     expect(markDead).not.toHaveBeenCalled();
     expect(report).not.toHaveBeenCalled();
     expect(result).toMatchObject({ failed: 1, dead: 0 });
+  });
+});
+
+describe("outboxService.drain — SHIPPING_CONFIRMATION (M4 #140; send path is #141)", () => {
+  const shippingMsg = (o: Partial<OutboxMessageSummary> = {}) =>
+    summary({
+      type: "SHIPPING_CONFIRMATION",
+      idempotencyKey: "sc_order_1",
+      ...o,
+    });
+
+  it("defers the message instead of sending, failing, or dead-lettering it", async () => {
+    findDue.mockResolvedValue([shippingMsg({ attempts: 0 })]);
+
+    const result = await outboxService.drain();
+
+    // #140 enqueues these before the send path exists (#141): the drain must HOLD
+    // the row (PENDING, pushed out) rather than dead-letter it — dead-lettering
+    // would permanently drop a real shipping email and false-alarm on the happy path.
+    expect(defer).toHaveBeenCalledWith(
+      "msg_1",
+      new Date(NOW.getTime() + DEFER_MS),
+    );
+    expect(markDead).not.toHaveBeenCalled();
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+    // Neither the confirmation nor the fulfillment send path is touched.
+    expect(sendOrderConfirmation).not.toHaveBeenCalled();
+    expect(submitOrder).not.toHaveBeenCalled();
+    // A deferral is benign — counted as skipped, not sent/failed/dead.
+    expect(result).toMatchObject({ sent: 0, failed: 0, dead: 0, skipped: 1 });
+  });
+
+  it("never dead-letters a deferral, even at a high attempt count", async () => {
+    // A deferral counts no attempt (`defer` leaves `attempts` untouched), so a
+    // SHIPPING_CONFIRMATION row can never march toward the DEAD budget while its
+    // send path is still pending — it simply waits.
+    findDue.mockResolvedValue([shippingMsg({ attempts: 9 })]);
+
+    const result = await outboxService.drain();
+
+    expect(defer).toHaveBeenCalledOnce();
+    expect(markDead).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ dead: 0, skipped: 1 });
   });
 });
 

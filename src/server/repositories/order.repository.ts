@@ -32,6 +32,18 @@ export type StalePendingOrder = {
   stripePaymentIntentId: string | null;
 };
 
+/** The fields the poll-fulfillment cron (M4 #140) needs to reconcile one open
+ *  shipment: its id + tenant (for the tenant-scoped reconcile write) and the
+ *  provider's own order id to call `getTracking` against. `fulfillmentExternalId`
+ *  is nullable to mirror the column, but a SUBMITTED order always carries a real
+ *  one (`markSubmitted` is its only writer, on the success path) — the poll skips
+ *  the anomalous null rather than call the provider with an empty id. */
+export type SubmittedOrderForPolling = {
+  id: string;
+  tenantId: string;
+  fulfillmentExternalId: string | null;
+};
+
 /** Who a reuse read is on behalf of — the identity binding that closes #92. A
  *  discriminated union: an authenticated shopper passes `{ userId }` and is matched
  *  on that session-proven id alone; a guest passes `{ userId: null, email }` and is
@@ -243,6 +255,19 @@ export type OrderTransitionResult =
   | { transitioned: true }
   | { transitioned: false; currentStatus: OrderStatus | null };
 
+/** The reconciled shipment a poll persists onto an order (M4 #140): the carrier +
+ *  tracking the provider reported, plus its raw status string (→
+ *  `fulfillmentProviderStatus`, admin display only). `carrier`/`trackingUrl` are
+ *  nullable — a shipment may carry a tracking number but no carrier or link — but a
+ *  reconciliation only runs once a `trackingNumber` is present (the poll's
+ *  provider-agnostic "shipped" signal), so that field is non-null. */
+export type ShipmentReconciliation = {
+  providerStatus: string;
+  carrier: string | null;
+  trackingNumber: string;
+  trackingUrl: string | null;
+};
+
 export const orderRepository = {
   /**
    * Create a PENDING order and its line items, reserving inventory for each line
@@ -437,6 +462,33 @@ export const orderRepository = {
       orderBy: { createdAt: "asc" },
       take: limit,
       select: { id: true, tenantId: true, stripePaymentIntentId: true },
+    });
+  },
+
+  /**
+   * Open shipments awaiting reconciliation — the poll-fulfillment cron's work list
+   * (M4 #140): orders the provider has accepted (`fulfillmentStatus: SUBMITTED`)
+   * that are still PAID, up to `limit`, oldest first. Like `findStalePending` and
+   * the outbox drain, this is a **platform-wide** cron query and deliberately spans
+   * every tenant — the intentional exception to golden rule #1. There is no leakage:
+   * each row carries its own `tenantId`, and the reconcile write runs through the
+   * tenant-scoped `markShipped(order.tenantId, …)`.
+   *
+   * Both filters matter. `status: "PAID"` excludes an order that left the paid state
+   * after submission — a `refund.succeeded` or a manual FULFILLED both flip `status`
+   * only, leaving `fulfillmentStatus` at SUBMITTED — so the poll never wastes a
+   * provider call on an order `markShipped` would refuse anyway (its guard mirrors
+   * this). SUBMITTED is a transient, low-cardinality state (an order ships or fails
+   * out of it), so the unindexed scan stays bounded in practice; if that set ever
+   * grows, a `[fulfillmentStatus, status]` index is the natural follow-up. Selects
+   * only the fields the poll needs — never the whole row.
+   */
+  findSubmittedForPolling(limit: number): Promise<SubmittedOrderForPolling[]> {
+    return prisma.order.findMany({
+      where: { status: "PAID", fulfillmentStatus: "SUBMITTED" },
+      orderBy: { createdAt: "asc" },
+      take: limit,
+      select: { id: true, tenantId: true, fulfillmentExternalId: true },
     });
   },
 
@@ -930,6 +982,78 @@ export const orderRepository = {
         fulfillmentStatus: { in: ["NOT_SUBMITTED", "SUBMITTING"] },
       },
       data: { fulfillmentStatus: "FAILED" },
+    });
+  },
+
+  /**
+   * Reconcile a shipped order — the SUBMITTED → SHIPPED leg the poll-fulfillment
+   * cron drives (M4 #140), and the milestone's second one-way door after PAID. In
+   * ONE transaction it (a) flips the order via a guarded `updateMany`, persisting
+   * the carrier/number/url the provider reported plus its raw status string
+   * (`fulfillmentProviderStatus`, admin display only), and (b) — only if that flip
+   * moved a row — enqueues the `SHIPPING_CONFIRMATION` email in the SAME
+   * transaction, so a shipped order can never exist without its notification queued
+   * (the `markPaidByPaymentIntent` outbox pattern). The distinct `sc_` key coexists
+   * with the order's `oc_`/`fs_` messages while the unique constraint still forbids
+   * ever writing two.
+   *
+   * The `updateMany` guard is the idempotency point and does double duty. Guarding
+   * on `fulfillmentStatus: "SUBMITTED"` makes a duplicate or racing poll a no-op —
+   * the second finds the order already SHIPPED, matches nothing, and enqueues no
+   * second email (row locking under READ COMMITTED serializes the two). Guarding
+   * ALSO on `status: "PAID"` is the same defence `claimForSubmission` needs: a
+   * `refund.succeeded` (`markRefundedByPaymentIntent`) or a manual FULFILLED
+   * (`markFulfilled`) flips `status` only, leaving `fulfillmentStatus` at SUBMITTED
+   * — without this guard the blind `data.status = "FULFILLED"` would regress a
+   * REFUNDED order back to FULFILLED. Both write `status` under the one order-row
+   * lock, so of the refund/fulfil flip and this reconcile exactly one wins.
+   *
+   * Returns whether this call made the transition: `true` for the single poll that
+   * reconciled it (order flipped, email enqueued), `false` when nothing moved (a
+   * duplicate poll, or the order left PAID+SUBMITTED underneath us) — a safe no-op
+   * either way. Never persists a placeholder id: only real SUBMITTED orders (which
+   * carry a real `fulfillmentExternalId`) are ever polled here.
+   */
+  async markShipped(
+    tenantId: string,
+    orderId: string,
+    shipment: ShipmentReconciliation,
+  ): Promise<boolean> {
+    return prisma.$transaction(async (tx) => {
+      const { count } = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          tenantId,
+          status: "PAID",
+          fulfillmentStatus: "SUBMITTED",
+        },
+        data: {
+          status: "FULFILLED",
+          fulfillmentStatus: "SHIPPED",
+          fulfillmentProviderStatus: shipment.providerStatus,
+          trackingCarrier: shipment.carrier,
+          trackingNumber: shipment.trackingNumber,
+          trackingUrl: shipment.trackingUrl,
+        },
+      });
+      // Nothing moved: a duplicate/racing poll (already SHIPPED), or the order left
+      // PAID+SUBMITTED (refunded / manually fulfilled) between the find and here.
+      // Enqueue nothing — the email is queued only alongside the real transition.
+      if (count === 0) return false;
+
+      // Queue the shipping-confirmation email in this SAME transaction, so a shipped
+      // order always has exactly one notification enqueued. Runs only on the single
+      // transition above; the unique `sc_` key is belt-and-suspenders against a
+      // second write. The send path is M4-08 (#141) — this only records the intent.
+      await tx.outboxMessage.create({
+        data: {
+          tenantId,
+          orderId,
+          type: "SHIPPING_CONFIRMATION",
+          idempotencyKey: `sc_${orderId}`,
+        },
+      });
+      return true;
     });
   },
 
