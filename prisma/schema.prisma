@@ -301,6 +301,16 @@ model Order {
   trackingCarrier       String?
   trackingNumber        String?
   trackingUrl           String?
+  // When the poll-fulfillment cron first surfaced this order as a STUCK open
+  // shipment — SUBMITTED + un-shipped past the age threshold (a provider hold like
+  // Printful `onhold`/`inreview` that isn't resolving; M4 #155). Its job is
+  // idempotency: the operator alert fires only while this is null, so a stuck order
+  // is surfaced ONCE, not on every ~10-minute cron tick. Deliberately the inverse of
+  // #151's terminal-fail exit — setting it does NOT change `fulfillmentStatus`: the
+  // order stays SUBMITTED and keeps being polled, because an onhold order can still
+  // ship. Null for every normally-progressing order (SHIPPED long before the
+  // threshold). Nullable, no default → safe to add on non-empty tables (golden rule 6).
+  fulfillmentStuckAt    DateTime?
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 

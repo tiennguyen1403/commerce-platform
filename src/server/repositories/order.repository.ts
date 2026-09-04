@@ -37,11 +37,20 @@ export type StalePendingOrder = {
  *  provider's own order id to call `getTracking` against. `fulfillmentExternalId`
  *  is nullable to mirror the column, but a SUBMITTED order always carries a real
  *  one (`markSubmitted` is its only writer, on the success path) — the poll skips
- *  the anomalous null rather than call the provider with an empty id. */
+ *  the anomalous null rather than call the provider with an empty id.
+ *
+ *  `createdAt` + `fulfillmentStuckAt` feed the stuck-open-shipment check (M4 #155):
+ *  `createdAt` is the age anchor — already the query's oldest-first `orderBy` key and
+ *  immutable, so age reads straight off the batch order (see the threshold constant in
+ *  `fulfillment.service.ts` for why creation time, not submission time, is the anchor) —
+ *  and `fulfillmentStuckAt` (null until the poll first surfaces the order as stuck) lets
+ *  the poll skip re-alerting one it already flagged. */
 export type SubmittedOrderForPolling = {
   id: string;
   tenantId: string;
   fulfillmentExternalId: string | null;
+  createdAt: Date;
+  fulfillmentStuckAt: Date | null;
 };
 
 /** Who a reuse read is on behalf of — the identity binding that closes #92. A
@@ -491,7 +500,17 @@ export const orderRepository = {
       where: { status: "PAID", fulfillmentStatus: "SUBMITTED" },
       orderBy: { createdAt: "asc" },
       take: limit,
-      select: { id: true, tenantId: true, fulfillmentExternalId: true },
+      select: {
+        id: true,
+        tenantId: true,
+        fulfillmentExternalId: true,
+        // Age anchor + already-surfaced marker for the stuck-open-shipment check
+        // (#155). An order past the threshold that isn't yet flagged is re-polled
+        // like any other (a hold can still resolve to a shipment), so it stays in
+        // this same `{PAID, SUBMITTED}` work list — only the alert is one-shot.
+        createdAt: true,
+        fulfillmentStuckAt: true,
+      },
     });
   },
 
@@ -1111,6 +1130,46 @@ export const orderRepository = {
         fulfillmentStatus: "FAILED",
         fulfillmentProviderStatus: providerStatus,
       },
+    });
+    return count === 1;
+  },
+
+  /**
+   * Stamp a SUBMITTED order as a STUCK open shipment (M4 #155) so the poll cron can
+   * surface it to the operator exactly once. The deliberate INVERSE of
+   * `markFulfillmentFailedAfterSubmission`: it records `fulfillmentStuckAt` and
+   * touches NOTHING else — `fulfillmentStatus` stays SUBMITTED and `status` stays
+   * PAID — because an order the provider is holding (`onhold`/`inreview`) can still
+   * ship. #155 is about AGE, not a terminal provider status like #151's
+   * cancelled/failed, so the order must keep being polled; we only mark that we've
+   * already alerted on it.
+   *
+   * Guarded on `{status: PAID, fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: null}`.
+   * The PAID+SUBMITTED pair is the exact `findSubmittedForPolling` work-list predicate
+   * its two terminal siblings (`markShipped`, `markFulfillmentFailedAfterSubmission`)
+   * guard on, so a concurrently refunded / manually-fulfilled order (which flips only
+   * `status`) is left untouched here too. The `fulfillmentStuckAt: null` clause is the
+   * idempotency point: the single guarded `updateMany` is atomic (no surrounding
+   * transaction, like the #151 method), so of two racing polls exactly one stamps it,
+   * and every later cron tick matches nothing — the alert fires once, never again.
+   *
+   * Returns whether THIS call stamped it — `true` for the one poll that surfaced the
+   * order, `false` otherwise (already surfaced, or it left PAID/SUBMITTED underneath
+   * us) — so `pollOne` alerts only on the `true`, mirroring `markShipped`'s contract.
+   */
+  async markFulfillmentStuck(
+    tenantId: string,
+    orderId: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+        fulfillmentStuckAt: null,
+      },
+      data: { fulfillmentStuckAt: new Date() },
     });
     return count === 1;
   },

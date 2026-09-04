@@ -1701,6 +1701,158 @@ describe("orderRepository.markFulfillmentFailedAfterSubmission (integration)", (
   });
 });
 
+/**
+ * `markFulfillmentStuck` — the poll cron's "surface a stuck open shipment" write
+ * (M4 #155), the deliberate INVERSE of `markFulfillmentFailedAfterSubmission` right
+ * above: it stamps `fulfillmentStuckAt` and touches NOTHING else — `fulfillmentStatus`
+ * stays SUBMITTED and `status` stays PAID, because a provider hold (`onhold`/
+ * `inreview`) can still ship. Its guarantees live in the database: the `{status: PAID,
+ * fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: null}`-guarded `updateMany` is the
+ * idempotency point (a duplicate/racing poll is a no-op) AND the money-safety guard (a
+ * concurrently refunded/manually-fulfilled order is untouched). A mock can't exercise
+ * `updateMany` count semantics or row locking, so these run against the same Postgres
+ * the app uses.
+ */
+describe("orderRepository.markFulfillmentStuck (integration)", () => {
+  /** Seed a submitted-and-paid order carrying a real external id — the poll's
+   *  reconcilable state (as `markSubmitted` leaves it). */
+  function seedSubmitted(
+    tenantId: string,
+    opts: { status?: OrderStatus; fulfillmentStatus?: FulfillmentStatus } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+  }
+
+  it("stamps fulfillmentStuckAt, leaving fulfillmentStatus SUBMITTED and status PAID untouched", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+    expect(order.fulfillmentStuckAt).toBeNull();
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+    );
+    expect(flagged).toBe(true);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).not.toBeNull();
+    // Deliberately the inverse of markFulfillmentFailedAfterSubmission: NOTHING
+    // else moves — a provider hold can still ship, so the order must keep being
+    // polled rather than being terminalized.
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("is idempotent — a duplicate poll stamps once, then no-ops", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const first = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+    );
+    const firstStamp = (
+      await prisma.order.findUniqueOrThrow({ where: { id: order.id } })
+    ).fulfillmentStuckAt;
+    const second = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+    );
+
+    expect(first).toBe(true);
+    // Already stamped → the guarded updateMany matches nothing on the second call.
+    expect(second).toBe(false);
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).toEqual(firstStamp);
+  });
+
+  it("does not stamp a REFUNDED order (status guard) — no write", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after submission, leaving `fulfillmentStatus` at
+    // SUBMITTED. The status guard leaves it alone (it also drops from the poll via
+    // findSubmittedForPolling's own `status: PAID` filter).
+    const order = await seedSubmitted(tenant.id, { status: "REFUNDED" });
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+    );
+    expect(flagged).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("REFUNDED");
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentStuckAt).toBeNull();
+  });
+
+  it("does not stamp an order that isn't SUBMITTED (fulfillmentStatus guard)", async () => {
+    const tenant = await freshTenant();
+    // Already reconciled to a shipment — a late stuck-check must never touch it.
+    const order = await seedSubmitted(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "SHIPPED",
+    });
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+    );
+    expect(flagged).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("SHIPPED");
+    expect(persisted.fulfillmentStuckAt).toBeNull();
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id);
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      other.id,
+      order.id,
+    );
+    expect(flagged).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).toBeNull();
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+  });
+
+  it("stamps exactly once under a concurrent double-poll (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    // Two poll runs land at once: row locking on the guarded updateMany must let
+    // exactly one make the transition.
+    const [a, b] = await Promise.all([
+      orderRepository.markFulfillmentStuck(tenant.id, order.id),
+      orderRepository.markFulfillmentStuck(tenant.id, order.id),
+    ]);
+
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStuckAt,
+    ).not.toBeNull();
+  });
+});
+
 describe("orderRepository.listByTenant (integration)", () => {
   it("returns a tenant's orders newest-first with a total", async () => {
     const tenant = await freshTenant();
@@ -2002,8 +2154,13 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
       (r) => r.id === o.id,
     );
     expect(found).toBeDefined();
+    // Widened for the stuck-open-shipment check (#155): `createdAt` (the age
+    // anchor) + `fulfillmentStuckAt` (the already-surfaced marker) joined the
+    // select alongside the original three fields.
     expect(Object.keys(found!).sort()).toEqual([
+      "createdAt",
       "fulfillmentExternalId",
+      "fulfillmentStuckAt",
       "id",
       "tenantId",
     ]);

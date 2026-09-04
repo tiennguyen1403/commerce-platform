@@ -40,6 +40,26 @@ const POLL_BATCH_SIZE = 100;
  *  Kept comfortably under `maxDuration` (mirrors the sweep/drain budgets). */
 const POLL_TIME_BUDGET_MS = 45_000;
 
+/** How long an order may sit SUBMITTED before the poll surfaces it as a STUCK open
+ *  shipment for a human to chase (M4 #155). Age is measured from `Order.createdAt` —
+ *  the poll's oldest-first batch key (`findSubmittedForPolling`) and an immutable
+ *  anchor. It precedes actual submission only by the PENDING→PAID + outbox-drain lag
+ *  (minutes — a lingering PENDING order is cancelled by the abandoned-order sweep long
+ *  before then), negligible against a multi-day threshold; and because it's *earlier*
+ *  than submission the check can only ever fire slightly early, never miss a genuinely
+ *  stuck order. (`updatedAt` would also serve — a not-shipped poll writes nothing, so it
+ *  stays frozen at submission, and the only writers of the raw provider status are the
+ *  terminal `markShipped`/`markFulfillmentFailedAfterSubmission` that leave the work list
+ *  — but `createdAt` is already the ordering key and needs no reasoning about write
+ *  patterns.) Set well beyond a normal produce-and-ship window: Printful assigns a
+ *  tracking number at carrier handoff after production, up to ~a week, so 10 days leaves
+ *  a clear buffer and a normally-progressing order (SHIPPED and gone from the SUBMITTED
+ *  work list long before this) is never flagged — a provider hold (`onhold`/`inreview`)
+ *  that never resolves is what trips it. Alert-only: a flagged order is NOT removed from
+ *  polling (it may still ship); a human contacts the provider / refunds / re-orders.
+ *  Module-local like the other poll knobs above. */
+const STUCK_SUBMITTED_THRESHOLD_MS = 10 * 24 * 60 * 60_000; // 10 days
+
 const pollLog = logger.child({ component: "fulfillment-poll" });
 
 /** A tenant-scoped order reference the poll hands back for the route's immediate
@@ -57,6 +77,12 @@ export type PollResult = {
    *  work list instead of being re-polled forever and surface to the operator. The
    *  order stays PAID (a refund/re-order is a human decision). */
   failed: number;
+  /** Orders surfaced this run as a STUCK open shipment (M4 #155): SUBMITTED +
+   *  un-shipped past the age threshold — a provider hold (`onhold`/`inreview`) that
+   *  isn't resolving. Alerted ONCE (idempotent via `Order.fulfillmentStuckAt`) and,
+   *  unlike `failed`, left SUBMITTED — it may still ship, so it keeps being polled.
+   *  Counts only the first run that surfaces each order; later runs count it `pending`. */
+  stuck: number;
   /** Polled, but not reconciled this run for a benign reason — the provider hasn't
    *  shipped yet, or the order was concurrently refunded/fulfilled — left SUBMITTED. */
   pending: number;
@@ -69,8 +95,10 @@ export type PollResult = {
   shippedOrders: ShippedOrderRef[];
 };
 
-/** Outcome of polling one open shipment (drives the `PollResult` tally). */
-type PollOutcome = "shipped" | "failed" | "pending" | "errored";
+/** Outcome of polling one open shipment (drives the `PollResult` tally). `"stuck"`
+ *  is a specialisation of `"pending"` — the order is still in flight and stays
+ *  SUBMITTED, but this run was the one that first surfaced it as stuck (#155). */
+type PollOutcome = "shipped" | "failed" | "pending" | "errored" | "stuck";
 
 /**
  * Fulfillment orchestration — everything ABOVE the provider boundary (M4 #137),
@@ -158,6 +186,7 @@ export const fulfillmentService = {
       return {
         shipped: 0,
         failed: 0,
+        stuck: 0,
         pending: 0,
         errored: 0,
         shippedOrders: [],
@@ -169,6 +198,7 @@ export const fulfillmentService = {
     const result: PollResult = {
       shipped: 0,
       failed: 0,
+      stuck: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [],
@@ -179,7 +209,11 @@ export const fulfillmentService = {
       // for the next run than be force-killed mid-poll at the route's maxDuration.
       if (Date.now() >= deadline) {
         const handled =
-          result.shipped + result.failed + result.pending + result.errored;
+          result.shipped +
+          result.failed +
+          result.stuck +
+          result.pending +
+          result.errored;
         pollLog.info(
           { ...result, remaining: open.length - handled },
           "poll: time budget reached — remaining orders deferred to next run",
@@ -312,9 +346,13 @@ async function pollOne(
       );
       return "failed";
     }
-    // Genuinely in flight — nothing to persist (a not-shipped poll is a pure no-op).
-    // Re-checked next run.
-    return "pending";
+    // Genuinely in flight — nothing to reconcile (a not-shipped poll writes nothing
+    // to the order's lifecycle) and re-checked next run. But if it has been in flight
+    // too long — SUBMITTED since `createdAt`, past the stuck threshold — surface it
+    // ONCE so an operator can chase a provider hold (`onhold`/`inreview`) that isn't
+    // resolving. Unlike the terminal-fail exit above we leave `fulfillmentStatus`
+    // SUBMITTED (an onhold order can still ship) and keep polling it.
+    return await flagIfStuck(order, tracking.status);
   }
 
   // Shipped: reconcile atomically + idempotently. A `false` return means the order
@@ -339,6 +377,67 @@ async function pollOne(
     "poll: order shipped — reconciled to FULFILLED with tracking",
   );
   return "shipped";
+}
+
+/**
+ * The in-flight tail of `pollOne` (M4 #155): decide whether an order still SUBMITTED
+ * (no shipment, not a terminal failure) has been open too long and, if so, surface it
+ * ONCE. "Too long" is `Date.now() - createdAt` past `STUCK_SUBMITTED_THRESHOLD_MS` —
+ * a provider hold (`onhold`/`inreview`) that isn't resolving. Idempotency is durable,
+ * not per-process: `markFulfillmentStuck` stamps `Order.fulfillmentStuckAt` under a
+ * `fulfillmentStuckAt: null` guard, so only the first run across all cron ticks wins,
+ * and the pre-read `fulfillmentStuckAt` short-circuits the already-surfaced case
+ * without even attempting the write.
+ *
+ * Returns `"stuck"` only on the run that first surfaces the order (stamped + alerted),
+ * `"pending"` otherwise — under the threshold, already surfaced, or the guarded write
+ * lost a benign PAID/SUBMITTED race (refunded / manually fulfilled underneath us). The
+ * order is left SUBMITTED and keeps being polled in every case: #155 alerts, it does
+ * not stop reconciliation, because an onhold order can still ship.
+ */
+async function flagIfStuck(
+  order: SubmittedOrderForPolling,
+  providerStatus: string,
+): Promise<PollOutcome> {
+  const { id, tenantId, createdAt, fulfillmentStuckAt, fulfillmentExternalId } =
+    order;
+
+  // Still within the window, or already surfaced in an earlier run — nothing to do.
+  const age = Date.now() - createdAt.getTime();
+  if (age < STUCK_SUBMITTED_THRESHOLD_MS || fulfillmentStuckAt !== null) {
+    return "pending";
+  }
+
+  const flagged = await orderRepository.markFulfillmentStuck(tenantId, id);
+  if (!flagged) {
+    // Lost the guard: another run stamped it first, or the order left PAID/SUBMITTED
+    // (refunded / manually fulfilled) between the select and here — a benign no-op,
+    // counted as pending, no alert. Mirrors the terminal-fail / markShipped race path.
+    pollLog.info(
+      { orderId: id, tenantId },
+      "poll: order left PAID/SUBMITTED before stuck-flag (refunded, manually fulfilled, or flagged by a racing run) — skipping",
+    );
+    return "pending";
+  }
+
+  // Money captured, no product shipping yet, and the provider isn't resolving it: the
+  // fulfillment-side twin of the #151 terminal-fail and the oversell / refund-failed
+  // alerts. ERROR (not warn) for the same reason as those — it's the only severity
+  // signal (nothing routes through `reportError`), and a `warn` ages out of Vercel
+  // Hobby's 1-hour retention before an operator sees it. `fulfillmentStatus` is left
+  // SUBMITTED on purpose (the order may still ship); the raw provider status + age are
+  // carried for context so the operator knows which hold to chase.
+  pollLog.error(
+    {
+      orderId: id,
+      tenantId,
+      externalId: fulfillmentExternalId,
+      providerStatus,
+      ageHours: Math.floor(age / 3_600_000),
+    },
+    "poll: order stuck SUBMITTED past the age threshold (provider hold not resolving) — left SUBMITTED, needs manual review (contact provider / refund / re-order)",
+  );
+  return "stuck";
 }
 
 /**

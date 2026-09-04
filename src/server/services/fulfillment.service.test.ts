@@ -42,6 +42,7 @@ vi.mock("@/server/repositories/order.repository", () => ({
     findSubmittedForPolling: vi.fn(),
     markShipped: vi.fn(),
     markFulfillmentFailedAfterSubmission: vi.fn(),
+    markFulfillmentStuck: vi.fn(),
   },
 }));
 
@@ -57,6 +58,7 @@ const markShipped = vi.mocked(orderRepository.markShipped);
 const markFulfillmentFailedAfterSubmission = vi.mocked(
   orderRepository.markFulfillmentFailedAfterSubmission,
 );
+const markFulfillmentStuck = vi.mocked(orderRepository.markFulfillmentStuck);
 
 const TENANT = "tenant_1";
 
@@ -106,6 +108,7 @@ function fulfillmentOrder(
     trackingCarrier: null,
     trackingNumber: null,
     trackingUrl: null,
+    fulfillmentStuckAt: null,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     items: [item()],
@@ -132,6 +135,7 @@ beforeEach(() => {
   findSubmittedForPolling.mockResolvedValue([]);
   markShipped.mockResolvedValue(true);
   markFulfillmentFailedAfterSubmission.mockResolvedValue(true);
+  markFulfillmentStuck.mockResolvedValue(true);
 });
 
 /** The spied `createOrder`, typed for `.mock`/`toHaveBeenCalled*` assertions. */
@@ -146,7 +150,12 @@ function getTrackingMock() {
 
 const EXTERNAL_ID = "mock_order_1";
 
-/** A `SubmittedOrderForPolling` row as `findSubmittedForPolling` returns it. */
+/** A `SubmittedOrderForPolling` row as `findSubmittedForPolling` returns it.
+ *  `createdAt` defaults to now — well under the 7-day stuck threshold — so every
+ *  pre-existing pollOpenShipments case (which doesn't care about age) stays
+ *  "pending"/"shipped"/"failed" as before and is never spuriously flagged stuck;
+ *  the stuck-specific tests override it to `STUCK_AGO`. `fulfillmentStuckAt`
+ *  defaults to null — not yet surfaced — mirroring a freshly-SUBMITTED order. */
 function submitted(
   o: Partial<SubmittedOrderForPolling> = {},
 ): SubmittedOrderForPolling {
@@ -154,6 +163,8 @@ function submitted(
     id: "order_1",
     tenantId: TENANT,
     fulfillmentExternalId: EXTERNAL_ID,
+    createdAt: new Date(),
+    fulfillmentStuckAt: null,
     ...o,
   };
 }
@@ -451,6 +462,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 1,
       failed: 0,
+      stuck: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
@@ -486,6 +498,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
+      stuck: 0,
       pending: 1,
       errored: 0,
       shippedOrders: [],
@@ -516,6 +529,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 0,
       failed: 1,
+      stuck: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [],
@@ -539,6 +553,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
+      stuck: 0,
       pending: 1,
       errored: 0,
       shippedOrders: [],
@@ -562,6 +577,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 1,
       failed: 0,
+      stuck: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
@@ -578,6 +594,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
+      stuck: 0,
       pending: 0,
       errored: 1,
       shippedOrders: [],
@@ -600,6 +617,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
+      stuck: 0,
       pending: 1,
       errored: 0,
       shippedOrders: [],
@@ -618,6 +636,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
+      stuck: 0,
       pending: 0,
       errored: 1,
       shippedOrders: [],
@@ -645,6 +664,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 1,
       failed: 0,
+      stuck: 0,
       pending: 0,
       errored: 1,
       shippedOrders: [{ tenantId: TENANT, orderId: "o2" }],
@@ -660,9 +680,136 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
+      stuck: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [],
+    });
+  });
+});
+
+describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", () => {
+  // Comfortably past STUCK_SUBMITTED_THRESHOLD_MS (10 days), anchored on `createdAt`
+  // — the age anchor `flagIfStuck` reads. A wide margin keeps the case robust to a
+  // threshold tweak (an operator-tunable knob).
+  const STUCK_AGO = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+
+  it("surfaces a stuck open shipment once (SUBMITTED past the threshold), leaving fulfillmentStatus untouched", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ createdAt: STUCK_AGO, fulfillmentStuckAt: null }),
+    ]);
+    // A provider hold: no tracking number, no terminal failure — genuinely in
+    // flight, but too long in flight.
+    getTrackingMock().mockResolvedValue({ status: "onhold" });
+    markFulfillmentStuck.mockResolvedValue(true);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markFulfillmentStuck).toHaveBeenCalledWith(TENANT, "order_1");
+    expect(markFulfillmentStuck).toHaveBeenCalledOnce();
+    // #155 is the deliberate inverse of the #151 terminal-fail exit: the order is
+    // surfaced but NOT terminalized — fulfillmentStatus stays SUBMITTED — so neither
+    // terminal-exit writer ever runs.
+    expect(markShipped).not.toHaveBeenCalled();
+    expect(markFulfillmentFailedAfterSubmission).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 1,
+      pending: 0,
+      errored: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("does not re-flag an order already surfaced as stuck", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ createdAt: STUCK_AGO, fulfillmentStuckAt: new Date() }),
+    ]);
+    getTrackingMock().mockResolvedValue({ status: "onhold" });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    // Short-circuited by the non-null marker — the guarded write is never even
+    // attempted a second time.
+    expect(markFulfillmentStuck).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 1,
+      errored: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("does not flag a recent in-flight order (within the window)", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ createdAt: new Date(), fulfillmentStuckAt: null }),
+    ]);
+    getTrackingMock().mockResolvedValue({ status: "onhold" });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markFulfillmentStuck).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 1,
+      errored: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("counts a lost stuck-flag race as pending, not stuck", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ createdAt: STUCK_AGO, fulfillmentStuckAt: null }),
+    ]);
+    getTrackingMock().mockResolvedValue({ status: "onhold" });
+    // The guarded write matched nothing — another run stamped it first, or the
+    // order left PAID/SUBMITTED underneath us (refunded/manually fulfilled). A
+    // benign no-op, mirroring the markShipped/terminal-fail race paths above.
+    markFulfillmentStuck.mockResolvedValue(false);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markFulfillmentStuck).toHaveBeenCalledOnce();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 1,
+      errored: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("a shipment still wins over the stuck check", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ createdAt: STUCK_AGO, fulfillmentStuckAt: null }),
+    ]);
+    // Old enough to be stuck, but the provider reports a real shipment this poll —
+    // the tracking-number branch runs (and wins) before the stuck check is reached.
+    getTrackingMock().mockResolvedValue({
+      status: "shipped",
+      carrier: "C",
+      trackingNumber: "T",
+      trackingUrl: "u",
+    });
+    markShipped.mockResolvedValue(true);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).toHaveBeenCalledOnce();
+    expect(markFulfillmentStuck).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 1,
+      failed: 0,
+      stuck: 0,
+      pending: 0,
+      errored: 0,
+      shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
     });
   });
 });
