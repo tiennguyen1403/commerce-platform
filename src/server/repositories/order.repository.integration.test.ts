@@ -1704,9 +1704,11 @@ describe("orderRepository.markFulfillmentFailedAfterSubmission (integration)", (
 /**
  * `markFulfillmentStuck` — the poll cron's "surface a stuck open shipment" write
  * (M4 #155), the deliberate INVERSE of `markFulfillmentFailedAfterSubmission` right
- * above: it stamps `fulfillmentStuckAt` and touches NOTHING else — `fulfillmentStatus`
- * stays SUBMITTED and `status` stays PAID, because a provider hold (`onhold`/
- * `inreview`) can still ship. Its guarantees live in the database: the `{status: PAID,
+ * above: it stamps `fulfillmentStuckAt` and snapshots the raw provider status into
+ * `fulfillmentProviderStatus` (admin display, #161) but does NOT terminalize —
+ * `fulfillmentStatus` stays SUBMITTED and `status` stays PAID, because a provider hold
+ * (`onhold`/`inreview`) can still ship. Its guarantees live in the database: the
+ * `{status: PAID,
  * fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: null}`-guarded `updateMany` is the
  * idempotency point (a duplicate/racing poll is a no-op) AND the money-safety guard (a
  * concurrently refunded/manually-fulfilled order is untouched). A mock can't exercise
@@ -1727,14 +1729,16 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     });
   }
 
-  it("stamps fulfillmentStuckAt, leaving fulfillmentStatus SUBMITTED and status PAID untouched", async () => {
+  it("stamps fulfillmentStuckAt and snapshots the provider status, leaving fulfillmentStatus SUBMITTED and status PAID untouched", async () => {
     const tenant = await freshTenant();
     const order = await seedSubmitted(tenant.id);
     expect(order.fulfillmentStuckAt).toBeNull();
+    expect(order.fulfillmentProviderStatus).toBeNull();
 
     const flagged = await orderRepository.markFulfillmentStuck(
       tenant.id,
       order.id,
+      "onhold",
     );
     expect(flagged).toBe(true);
 
@@ -1742,27 +1746,34 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
       where: { id: order.id },
     });
     expect(persisted.fulfillmentStuckAt).not.toBeNull();
-    // Deliberately the inverse of markFulfillmentFailedAfterSubmission: NOTHING
-    // else moves — a provider hold can still ship, so the order must keep being
-    // polled rather than being terminalized.
+    // The raw hold status is snapshotted for the admin view (#161)...
+    expect(persisted.fulfillmentProviderStatus).toBe("onhold");
+    // ...but deliberately the inverse of markFulfillmentFailedAfterSubmission on the
+    // lifecycle: NOTHING else moves — a provider hold can still ship, so the order
+    // must keep being polled rather than being terminalized.
     expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
     expect(persisted.status).toBe("PAID");
   });
 
-  it("is idempotent — a duplicate poll stamps once, then no-ops", async () => {
+  it("is idempotent — a duplicate poll stamps once, then no-ops (snapshot not overwritten)", async () => {
     const tenant = await freshTenant();
     const order = await seedSubmitted(tenant.id);
 
     const first = await orderRepository.markFulfillmentStuck(
       tenant.id,
       order.id,
+      "onhold",
     );
     const firstStamp = (
       await prisma.order.findUniqueOrThrow({ where: { id: order.id } })
     ).fulfillmentStuckAt;
+    // A later poll reads a shifted hold status ("onhold" → "inreview"), but the
+    // `fulfillmentStuckAt: null` guard makes the whole write a no-op — the snapshot is
+    // one-shot at flag time, not refreshed each run (the #161 design decision).
     const second = await orderRepository.markFulfillmentStuck(
       tenant.id,
       order.id,
+      "inreview",
     );
 
     expect(first).toBe(true);
@@ -1772,6 +1783,8 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
       where: { id: order.id },
     });
     expect(persisted.fulfillmentStuckAt).toEqual(firstStamp);
+    // The shifted "inreview" was NOT written — the flag-time "onhold" snapshot stands.
+    expect(persisted.fulfillmentProviderStatus).toBe("onhold");
   });
 
   it("does not stamp a REFUNDED order (status guard) — no write", async () => {
@@ -1784,6 +1797,7 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     const flagged = await orderRepository.markFulfillmentStuck(
       tenant.id,
       order.id,
+      "onhold",
     );
     expect(flagged).toBe(false);
 
@@ -1793,6 +1807,8 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     expect(persisted.status).toBe("REFUNDED");
     expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
     expect(persisted.fulfillmentStuckAt).toBeNull();
+    // The guard blocks the whole write — no snapshot leaks onto a refunded order.
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
   });
 
   it("does not stamp an order that isn't SUBMITTED (fulfillmentStatus guard)", async () => {
@@ -1806,6 +1822,7 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     const flagged = await orderRepository.markFulfillmentStuck(
       tenant.id,
       order.id,
+      "onhold",
     );
     expect(flagged).toBe(false);
 
@@ -1814,6 +1831,8 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     });
     expect(persisted.fulfillmentStatus).toBe("SHIPPED");
     expect(persisted.fulfillmentStuckAt).toBeNull();
+    // Guard blocks the write, so no stale hold status clobbers a shipped order.
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
   });
 
   it("does not cross the tenant boundary — a foreign order is invisible", async () => {
@@ -1824,6 +1843,7 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     const flagged = await orderRepository.markFulfillmentStuck(
       other.id,
       order.id,
+      "onhold",
     );
     expect(flagged).toBe(false);
 
@@ -1832,6 +1852,7 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     });
     expect(persisted.fulfillmentStuckAt).toBeNull();
     expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
   });
 
   it("stamps exactly once under a concurrent double-poll (Promise.all)", async () => {
@@ -1841,15 +1862,16 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
     // Two poll runs land at once: row locking on the guarded updateMany must let
     // exactly one make the transition.
     const [a, b] = await Promise.all([
-      orderRepository.markFulfillmentStuck(tenant.id, order.id),
-      orderRepository.markFulfillmentStuck(tenant.id, order.id),
+      orderRepository.markFulfillmentStuck(tenant.id, order.id, "onhold"),
+      orderRepository.markFulfillmentStuck(tenant.id, order.id, "onhold"),
     ]);
 
     expect([a, b].filter(Boolean)).toHaveLength(1);
-    expect(
-      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
-        .fulfillmentStuckAt,
-    ).not.toBeNull();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).not.toBeNull();
+    expect(persisted.fulfillmentProviderStatus).toBe("onhold");
   });
 });
 

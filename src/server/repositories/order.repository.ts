@@ -1159,13 +1159,23 @@ export const orderRepository = {
 
   /**
    * Stamp a SUBMITTED order as a STUCK open shipment (M4 #155) so the poll cron can
-   * surface it to the operator exactly once. The deliberate INVERSE of
-   * `markFulfillmentFailedAfterSubmission`: it records `fulfillmentStuckAt` and
-   * touches NOTHING else — `fulfillmentStatus` stays SUBMITTED and `status` stays
-   * PAID — because an order the provider is holding (`onhold`/`inreview`) can still
-   * ship. #155 is about AGE, not a terminal provider status like #151's
-   * cancelled/failed, so the order must keep being polled; we only mark that we've
-   * already alerted on it.
+   * surface it to the operator exactly once, and snapshot the raw provider status
+   * (`onhold`/`inreview`) into `fulfillmentProviderStatus` so the admin order view
+   * shows WHICH hold to chase without log-diving (M4 #161). Still the deliberate
+   * INVERSE of `markFulfillmentFailedAfterSubmission`: `fulfillmentStatus` stays
+   * SUBMITTED and `status` stays PAID — an order the provider is holding can still
+   * ship, so it must keep being polled; we only mark that we've alerted on it. #155
+   * is about AGE, not a terminal provider status like #151's cancelled/failed.
+   *
+   * The provider status is a one-shot SNAPSHOT taken on the single flagging run, not
+   * refreshed each poll: the write rides the same `fulfillmentStuckAt: null`-guarded
+   * `updateMany` as the marker, so it fires exactly once and never again — preserving
+   * both the "surface once" idempotency and the invariant that an in-flight (not-yet-
+   * shipped) poll writes nothing on later runs. That mirrors the two terminal writers
+   * (`markShipped`, `markFulfillmentFailedAfterSubmission`), which likewise persist the
+   * status as a snapshot at their transition, and it stays admin-display only, never a
+   * control-flow input. Trade-off: a later `onhold`→`inreview` shift isn't reflected —
+   * acceptable, since the operator, once alerted, gets live status from the provider.
    *
    * Guarded on `{status: PAID, fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: null}`.
    * The PAID+SUBMITTED pair is the exact `findSubmittedForPolling` work-list predicate
@@ -1183,6 +1193,7 @@ export const orderRepository = {
   async markFulfillmentStuck(
     tenantId: string,
     orderId: string,
+    providerStatus: string,
   ): Promise<boolean> {
     const { count } = await prisma.order.updateMany({
       where: {
@@ -1192,7 +1203,10 @@ export const orderRepository = {
         fulfillmentStatus: "SUBMITTED",
         fulfillmentStuckAt: null,
       },
-      data: { fulfillmentStuckAt: new Date() },
+      data: {
+        fulfillmentStuckAt: new Date(),
+        fulfillmentProviderStatus: providerStatus,
+      },
     });
     return count === 1;
   },

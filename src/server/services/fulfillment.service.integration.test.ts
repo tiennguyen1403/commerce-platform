@@ -203,6 +203,15 @@ describe("pollOpenShipments — stuck open shipment (#155)", () => {
     expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
     expect(persisted.status).toBe("PAID");
     expect(persisted.trackingNumber).toBeNull();
+    // The status the flagging poll observed is snapshotted for the admin view (#161),
+    // proving getTracking → flagIfStuck → markFulfillmentStuck threads it through
+    // without branching on it (fulfillmentStatus stays SUBMITTED). The mock reports
+    // "submitted" on the first poll — this order is past the stuck threshold from
+    // creation, so its very first poll is the flagging run, capturing that value.
+    // Poll 2 below shows it is NOT refreshed when the live status moves to onhold.
+    // (A real onhold/inreview hold value + the no-overwrite guarantee are proven
+    // directly in order.repository.integration.test.ts's markFulfillmentStuck suite.)
+    expect(persisted.fulfillmentProviderStatus).toBe("submitted");
 
     // Poll 2: already surfaced — idempotent. The stamp does not move (so the operator
     // isn't re-alerted on every cron tick), and the order is still SUBMITTED + PAID.
@@ -213,6 +222,9 @@ describe("pollOpenShipments — stuck open shipment (#155)", () => {
     expect(persisted.fulfillmentStuckAt).toEqual(stampedAt);
     expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
     expect(persisted.status).toBe("PAID");
+    // The mock now reports "onhold" (polls ≥ 2), but the one-shot snapshot is frozen at
+    // its flag-time value — the poll does not rewrite it each run (the #161 decision).
+    expect(persisted.fulfillmentProviderStatus).toBe("submitted");
   });
 
   it("never flags a normally-progressing (recent) order as stuck", async () => {
