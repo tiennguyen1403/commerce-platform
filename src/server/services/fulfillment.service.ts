@@ -52,6 +52,11 @@ export type ShippedOrderRef = { tenantId: string; orderId: string };
 export type PollResult = {
   /** Orders reconciled SUBMITTED → SHIPPED (Order PAID → FULFILLED) this run. */
   shipped: number;
+  /** Orders the provider reported terminally failed (cancelled/failed AFTER
+   *  submission): reconciled SUBMITTED → FAILED (M4 #151), so they leave the poll's
+   *  work list instead of being re-polled forever and surface to the operator. The
+   *  order stays PAID (a refund/re-order is a human decision). */
+  failed: number;
   /** Polled, but not reconciled this run for a benign reason — the provider hasn't
    *  shipped yet, or the order was concurrently refunded/fulfilled — left SUBMITTED. */
   pending: number;
@@ -65,7 +70,7 @@ export type PollResult = {
 };
 
 /** Outcome of polling one open shipment (drives the `PollResult` tally). */
-type PollOutcome = "shipped" | "pending" | "errored";
+type PollOutcome = "shipped" | "failed" | "pending" | "errored";
 
 /**
  * Fulfillment orchestration — everything ABOVE the provider boundary (M4 #137),
@@ -150,13 +155,20 @@ export const fulfillmentService = {
       pollLog.warn(
         "poll: no fulfillment provider configured — nothing to reconcile",
       );
-      return { shipped: 0, pending: 0, errored: 0, shippedOrders: [] };
+      return {
+        shipped: 0,
+        failed: 0,
+        pending: 0,
+        errored: 0,
+        shippedOrders: [],
+      };
     }
 
     const open = await orderRepository.findSubmittedForPolling(POLL_BATCH_SIZE);
 
     const result: PollResult = {
       shipped: 0,
+      failed: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [],
@@ -166,7 +178,8 @@ export const fulfillmentService = {
       // Stop starting new work once the budget is spent — better to leave the rest
       // for the next run than be force-killed mid-poll at the route's maxDuration.
       if (Date.now() >= deadline) {
-        const handled = result.shipped + result.pending + result.errored;
+        const handled =
+          result.shipped + result.failed + result.pending + result.errored;
         pollLog.info(
           { ...result, remaining: open.length - handled },
           "poll: time budget reached — remaining orders deferred to next run",
@@ -199,24 +212,31 @@ export const fulfillmentService = {
 };
 
 /**
- * Poll and reconcile ONE open shipment (M4 #140). Asks the provider for the order's
- * tracking, and:
+ * Poll and reconcile ONE open shipment (M4 #140, terminal-fail exit #151). Asks the
+ * provider for the order's tracking, and:
  *  - a transient `getTracking` fault (the adapter throws a plain Error for a
  *    404/401/5xx/timeout) → `"errored"`: leave the order SUBMITTED, retry next run;
- *  - no tracking number yet → `"pending"`: the provider hasn't shipped it, so write
- *    nothing (a not-shipped poll is a pure no-op) and re-check next run;
  *  - a tracking number present → the shipped signal: persist tracking + flip
  *    PAID → FULFILLED + enqueue the shipping email via the guarded, atomic
  *    `markShipped`. `"shipped"` if it made the transition, `"pending"` if the order
- *    left PAID+SUBMITTED first (a refund/manual-fulfil race — benign no-op).
+ *    left PAID+SUBMITTED first (a refund/manual-fulfil race — benign no-op);
+ *  - no tracking number BUT the provider flags a terminal failure → `"failed"`:
+ *    reconcile SUBMITTED → FAILED via `markFulfillmentFailedAfterSubmission` so the
+ *    order (which will never ship) leaves the work list and surfaces to the operator;
+ *    `"pending"` if that guarded write matched nothing (the same benign race);
+ *  - no tracking number and not flagged → `"pending"`: still in flight, write nothing
+ *    (a not-shipped poll is a pure no-op) and re-check next run.
  *
  * "Shipped" is signalled provider-agnostically by the presence of a tracking NUMBER,
  * not the raw status string: the mock emits one only once shipped, and Printful
  * populates `shipments[].tracking_number` when the order ships. The raw status is
- * admin-display only — persisted as `fulfillmentProviderStatus` in the reconcile,
- * never a control-flow input — so we never flip FULFILLED on a "shipped"/"fulfilled"
- * status that carries no parcel to put in the email. A DB error from `markShipped`
- * is left to propagate to the caller's per-order isolation (unexpected).
+ * admin-display only — persisted as `fulfillmentProviderStatus`, never itself a
+ * control-flow input — so we never flip FULFILLED on a "shipped"/"fulfilled" status
+ * that carries no parcel to put in the email. The one non-tracking control signal is
+ * `TrackingInfo.terminalFailure`, and it too is provider-agnostic: each adapter
+ * derives it from its own raw vocabulary (the poll-side analogue of a create-time
+ * soft rejection), so the service still never branches on a raw status string. A DB
+ * error from either guarded write propagates to the caller's per-order isolation.
  */
 async function pollOne(
   provider: FulfillmentProvider,
@@ -247,8 +267,53 @@ async function pollOne(
     return "errored";
   }
 
-  // Not shipped yet — nothing to persist. Re-checked next run.
+  // No shipment yet (a tracking NUMBER always wins — checked below — so a shipped
+  // order is never diverted here). Before treating it as still in flight, check for a
+  // provider TERMINAL failure: the provider cancelled/failed the order AFTER we
+  // submitted it, so it will never ship (M4 #151). Left as-is it would sit
+  // SUBMITTED + PAID forever and be re-polled every run — starving newer orders
+  // (oldest-first batching) and burning provider rate limit — so reconcile it to a
+  // terminal FAILED, which drops it from the work list and surfaces it to the
+  // operator. `terminalFailure` is the provider-computed, provider-agnostic signal
+  // (the poll-side analogue of a create-time soft rejection); the raw status string
+  // stays admin-display only, never itself a control-flow input.
   if (!tracking.trackingNumber) {
+    if (tracking.terminalFailure) {
+      const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+        tenantId,
+        id,
+        tracking.status,
+      );
+      // A `false` return mirrors markShipped: the order left PAID+SUBMITTED first (a
+      // refund or manual fulfil raced us), so this call didn't fail it — a benign
+      // no-op counted as pending, not a terminal failure we caused this run.
+      if (!failed) {
+        pollLog.info(
+          { orderId: id, tenantId },
+          "poll: order left PAID/SUBMITTED before terminal-fail reconcile (refunded or manually fulfilled) — skipping",
+        );
+        return "pending";
+      }
+      // A provider cancellation of a PAID order is money captured with no product
+      // coming — the fulfillment-side twin of the oversell / refund-failed alerts on
+      // the Stripe webhook. Surface it loudly at ERROR (not warn): those money-at-risk,
+      // operator-must-act events are logged at `error` there for exactly this reason —
+      // it's the only severity signal (nothing routes through `reportError`), and a
+      // `warn` line ages out of Vercel Hobby's 1-hour retention before an operator
+      // sees it. Include the raw provider status for context.
+      pollLog.error(
+        {
+          orderId: id,
+          tenantId,
+          externalId: fulfillmentExternalId,
+          providerStatus: tracking.status,
+        },
+        "poll: provider reports order terminally failed — moved to FAILED, needs manual refund/re-order",
+      );
+      return "failed";
+    }
+    // Genuinely in flight — nothing to persist (a not-shipped poll is a pure no-op).
+    // Re-checked next run.
     return "pending";
   }
 

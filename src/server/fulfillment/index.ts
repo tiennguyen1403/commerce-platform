@@ -18,7 +18,11 @@ export type {
   ShippingAddress,
   TrackingInfo,
 } from "./provider";
-export { MockProvider, MOCK_FAILING_VARIANT_ID } from "./mock";
+export {
+  MockProvider,
+  MOCK_FAILING_VARIANT_ID,
+  MOCK_TERMINAL_FAIL_MARKER,
+} from "./mock";
 export { PrintfulProvider } from "./printful";
 
 // Lazily-constructed singletons (the `getStripe` pattern). The mock keeps

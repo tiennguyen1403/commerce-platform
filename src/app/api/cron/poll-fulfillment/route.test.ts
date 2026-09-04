@@ -63,6 +63,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
     verify.mockReturnValue(true);
     poll.mockResolvedValue({
       shipped: 2,
+      failed: 4,
       pending: 3,
       errored: 1,
       shippedOrders: [],
@@ -77,6 +78,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
       ok: true,
       task: "poll-fulfillment",
       shipped: 2,
+      failed: 4,
       pending: 3,
       errored: 1,
     });
@@ -91,6 +93,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
     verify.mockReturnValue(true);
     poll.mockResolvedValue({
       shipped: 2,
+      failed: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [
@@ -119,6 +122,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
       verify.mockReturnValue(true);
       poll.mockResolvedValue({
         shipped: 2,
+        failed: 0,
         pending: 0,
         errored: 0,
         shippedOrders: [
