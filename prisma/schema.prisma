@@ -343,6 +343,10 @@ model Order {
   // non-empty tables (golden rule 6); 0 means both "never errored" and "recovered", so
   // no nullable tri-state is needed. Written only by the poll cron
   // (`fulfillment.service.ts` via `recordFulfillmentPollError`/`resetFulfillmentPollErrors`).
+  // Also an ordering key (M4 #170): `findSubmittedForPolling` sub-orders the not-yet-flagged
+  // poll group by this count ascending, so a perpetually-erroring order (which bypasses the
+  // #155 stuck-flag and would otherwise sit at the front of the oldest-first batch) sinks
+  // behind fresh (count-0) orders and can't starve them — the erroring-mode analogue of #158.
   fulfillmentErrorCount Int         @default(0)
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
@@ -380,9 +384,10 @@ model Order {
   // (a selective first term) and — the stronger reason — for non-redundancy with the
   // `[status, createdAt]` index above: a `status`-leading composite would overlap it,
   // whereas for this two-equality predicate the index seek localises equally whichever
-  // term leads. The residual `fulfillmentStuckPolledAt NULLS FIRST, createdAt` ordering
-  // (#158 deprioritises flagged-stuck rows to the tail; #164 rotates that tail by re-poll
-  // time) runs as a cheap sort over the small
+  // term leads. The residual `fulfillmentStuckPolledAt NULLS FIRST, fulfillmentErrorCount,
+  // createdAt` ordering (#158 deprioritises flagged-stuck rows to the tail; #164 rotates that
+  // tail by re-poll time; #170 sub-orders the not-yet-flagged rows by error streak so a
+  // perpetually-erroring order sinks behind fresh ones) runs as a cheap sort over the small
   // filtered set — Prisma can't express NULLS FIRST in an index (only the runtime
   // `orderBy` can), and the filtered set is small, so covering the sort isn't worth it.
   @@index([fulfillmentStatus, status])
