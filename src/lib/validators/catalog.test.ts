@@ -65,6 +65,27 @@ describe("variantInputSchema", () => {
       variantInputSchema.safeParse(validVariant({ stock: 0 })).success,
     ).toBe(true);
   });
+
+  it("treats providerVariantId as optional, trimmed, and length-bounded", () => {
+    // Absent → valid: an unmapped variant is a defined, admin-visible state.
+    expect(variantInputSchema.safeParse(validVariant()).success).toBe(true);
+    // Blank must not error either (the form blanks an unmapped field).
+    expect(
+      variantInputSchema.safeParse(validVariant({ providerVariantId: "" }))
+        .success,
+    ).toBe(true);
+    // A value is trimmed on the way through.
+    const parsed = variantInputSchema.parse(
+      validVariant({ providerVariantId: "  4012  " }),
+    );
+    expect(parsed.providerVariantId).toBe("4012");
+    // Over the 64-char ceiling is rejected.
+    expect(
+      variantInputSchema.safeParse(
+        validVariant({ providerVariantId: "x".repeat(65) }),
+      ).success,
+    ).toBe(false);
+  });
 });
 
 describe("productInputSchema", () => {
@@ -136,6 +157,18 @@ describe("productInputSchema", () => {
       }),
     );
     expect(distinct.success).toBe(true);
+  });
+
+  it("re-parses its own parsed output (the Server Action double-parse contract)", () => {
+    // The client form parses raw input, then the Server Action re-parses that
+    // already-parsed payload. The schema must accept its own output — including
+    // a mapped providerVariantId — or the second parse would reject a value the
+    // first produced. A `.transform(... ?? null)` would break exactly this.
+    const once = productInputSchema.parse(
+      validProduct({ variants: [validVariant({ providerVariantId: "4012" })] }),
+    );
+    expect(productInputSchema.safeParse(once).success).toBe(true);
+    expect(once.variants[0].providerVariantId).toBe("4012");
   });
 
   it("treats description as optional but bounded", () => {

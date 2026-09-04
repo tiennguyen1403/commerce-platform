@@ -212,6 +212,13 @@ export const productRepository = {
             create: input.variants.map((v) => ({
               sku: v.sku,
               name: v.name,
+              // Empty/blank/absent → null (unmapped). `||`, not `??`: the schema
+              // only *trims* providerVariantId (blank is valid), so an empty
+              // string can reach the repo through the public Server Action even
+              // though the form pre-blanks to undefined. Collapsing "" here keeps
+              // a single "unmapped" representation the M4 submission path relies
+              // on — never a stored "" it could misread as a (bad) mapping.
+              providerVariantId: v.providerVariantId || null,
               priceCents: v.priceCents,
               stock: v.stock,
             })),
@@ -303,6 +310,10 @@ export const productRepository = {
               data: {
                 sku: v.sku,
                 name: v.name,
+                // Set or clear the mapping on the kept variant. `|| null`
+                // collapses a schema-valid "" too, so blanking the field truly
+                // un-maps it (null) rather than storing an empty string.
+                providerVariantId: v.providerVariantId || null,
                 priceCents: v.priceCents,
                 stock: v.stock,
               },
@@ -316,6 +327,9 @@ export const productRepository = {
                 productId: id,
                 sku: v.sku,
                 name: v.name,
+                // `|| null` (not `??`): collapse a schema-permitted "" to the
+                // single unmapped representation — see createWithVariants.
+                providerVariantId: v.providerVariantId || null,
                 priceCents: v.priceCents,
                 stock: v.stock,
               })),

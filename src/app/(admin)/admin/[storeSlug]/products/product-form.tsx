@@ -24,7 +24,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Field, FieldError, FieldLabel } from "@/components/ui/field";
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldLabel,
+} from "@/components/ui/field";
 import {
   Select,
   SelectContent,
@@ -41,6 +46,9 @@ type VariantRow = {
   id?: string;
   sku: string;
   name: string;
+  // The fulfillment provider's catalog variant id this SKU maps to. Optional
+  // free-form string ("" when unmapped); trimmed to undefined on submit.
+  providerVariantId: string;
   price: string;
   stock: string;
   // True when this variant already appears in an order. Such variants can't be
@@ -52,6 +60,7 @@ export type ProductFormInitialVariant = {
   id?: string;
   sku: string;
   name: string;
+  providerVariantId: string;
   price: string;
   stock: string;
   hasOrders?: boolean;
@@ -76,7 +85,7 @@ type ProductFormProps = {
 };
 
 type VariantFieldErrors = Partial<
-  Record<"sku" | "name" | "price" | "stock", string>
+  Record<"sku" | "name" | "providerVariantId" | "price" | "stock", string>
 >;
 
 const MONEY_PATTERN = /^\d+(\.\d{1,2})?$/;
@@ -97,7 +106,14 @@ function parseWhole(value: string): number | null {
 }
 
 function emptyVariant(key: string): VariantRow {
-  return { key, sku: "", name: "", price: "", stock: "0" };
+  return {
+    key,
+    sku: "",
+    name: "",
+    providerVariantId: "",
+    price: "",
+    stock: "0",
+  };
 }
 
 export function ProductForm({
@@ -180,6 +196,8 @@ export function ProductForm({
         id: row.id,
         sku: row.sku,
         name: row.name,
+        // Blank → undefined (the schema's optional shape); the repo stores null.
+        providerVariantId: row.providerVariantId.trim() || undefined,
         priceCents: cents ?? 0,
         stock: stock ?? 0,
       };
@@ -476,6 +494,36 @@ export function ProductForm({
                       errors={
                         rowError.stock
                           ? [{ message: rowError.stock }]
+                          : undefined
+                      }
+                    />
+                  </Field>
+
+                  <Field className="sm:col-span-2">
+                    <FieldLabel htmlFor={`${row.key}-provider-variant-id`}>
+                      Provider variant ID
+                    </FieldLabel>
+                    <Input
+                      id={`${row.key}-provider-variant-id`}
+                      value={row.providerVariantId}
+                      onChange={(e) =>
+                        updateVariant(row.key, {
+                          providerVariantId: e.target.value,
+                        })
+                      }
+                      aria-invalid={Boolean(rowError.providerVariantId)}
+                      maxLength={64}
+                      placeholder="e.g. 4012"
+                      autoComplete="off"
+                    />
+                    <FieldDescription>
+                      Optional. Maps this SKU to the fulfillment provider&apos;s
+                      catalog variant. Leave blank to keep it unmapped.
+                    </FieldDescription>
+                    <FieldError
+                      errors={
+                        rowError.providerVariantId
+                          ? [{ message: rowError.providerVariantId }]
                           : undefined
                       }
                     />

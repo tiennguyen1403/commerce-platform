@@ -64,6 +64,19 @@ export const variantInputSchema = z.object({
     .int({ error: "Enter a whole number." })
     .min(0, { error: "Stock can't be negative." })
     .max(MAX_STOCK, { error: "Stock is too high." }),
+  // Optional mapping to the fulfillment provider's opaque catalog variant id
+  // (e.g. Printful's integer `variant_id`); the submission service resolves our
+  // free-form `sku` → `providerVariantId` via the repository (M4). Kept
+  // provider-agnostic — free-form text, trimmed and length-capped like `sku`.
+  // Blank is valid: an unmapped variant is a defined, admin-visible state (it
+  // fails submission loudly in M4-06, never a silent provider 4xx), not an
+  // error here. Output stays `string | undefined` (never `null`) so the schema
+  // is idempotent — the Server Action re-parses the client's parsed payload.
+  providerVariantId: z
+    .string()
+    .trim()
+    .max(64, { error: "Provider variant ID is too long." })
+    .optional(),
 });
 
 export type VariantInput = z.infer<typeof variantInputSchema>;
