@@ -1,14 +1,19 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, TriangleAlert } from "lucide-react";
+import { ArrowLeft, ExternalLink, TriangleAlert } from "lucide-react";
 import { requireAdminContext } from "@/server/auth/admin-context";
 import { orderService } from "@/server/services/order.service";
 import { ROLES, hasAtLeast } from "@/config/roles";
 import { formatDate, formatMoney } from "@/lib/utils";
 import {
+  FULFILLMENT_STATUS_BADGE,
+  FULFILLMENT_STATUS_LABELS,
   ORDER_STATUS_BADGE,
   ORDER_STATUS_LABELS,
+  formatShippingAddressLines,
+  fulfillmentAttention,
+  trackingHref,
 } from "@/lib/validators/orders";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -41,6 +46,17 @@ export default async function OrderDetailPage({
   // Refund is ADMIN+ (cancel/fulfil are STAFF+); the buttons re-check server-side.
   const canRefund = hasAtLeast(role, ROLES.ADMIN);
   const status = order.status;
+
+  // Fulfillment view (M4 #142): the internal state, any provider/tracking detail,
+  // the shipping address, and a "needs attention" callout for a failed / stuck
+  // order. All read off the order the service already returned — no extra query.
+  const fulfillmentStatus = order.fulfillmentStatus;
+  const attention = fulfillmentAttention(
+    fulfillmentStatus,
+    order.fulfillmentStuckAt,
+  );
+  const addressLines = formatShippingAddressLines(order);
+  const trackingUrl = trackingHref(order.trackingUrl);
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-10">
@@ -131,6 +147,111 @@ export default async function OrderDetailPage({
             </TableRow>
           </TableBody>
         </Table>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Fulfillment</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-5">
+          {attention ? (
+            <div className="border-destructive/30 bg-destructive/10 flex gap-3 rounded-lg border p-4 text-sm">
+              <TriangleAlert
+                className="text-destructive mt-0.5 size-5 shrink-0"
+                aria-hidden
+              />
+              <div className="flex flex-col gap-1">
+                <p className="text-foreground font-medium">{attention.title}</p>
+                <p className="text-muted-foreground">{attention.description}</p>
+              </div>
+            </div>
+          ) : null}
+
+          <dl className="grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
+            <div className="flex flex-col gap-1">
+              <dt className="text-muted-foreground">Fulfillment status</dt>
+              <dd>
+                <Badge variant={FULFILLMENT_STATUS_BADGE[fulfillmentStatus]}>
+                  {FULFILLMENT_STATUS_LABELS[fulfillmentStatus]}
+                </Badge>
+              </dd>
+            </div>
+            {order.fulfillmentProvider ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Provider</dt>
+                <dd className="capitalize">{order.fulfillmentProvider}</dd>
+              </div>
+            ) : null}
+            {order.fulfillmentProviderStatus ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Provider status</dt>
+                <dd className="font-mono text-xs break-all">
+                  {order.fulfillmentProviderStatus}
+                </dd>
+              </div>
+            ) : null}
+            {order.fulfillmentExternalId ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Provider order ID</dt>
+                <dd className="text-muted-foreground font-mono text-xs break-all">
+                  {order.fulfillmentExternalId}
+                </dd>
+              </div>
+            ) : null}
+            {order.trackingCarrier ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Carrier</dt>
+                <dd>{order.trackingCarrier}</dd>
+              </div>
+            ) : null}
+            {order.trackingNumber ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Tracking number</dt>
+                <dd className="break-all">
+                  {trackingUrl ? (
+                    <a
+                      href={trackingUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-primary inline-flex items-center gap-1 font-medium hover:underline"
+                    >
+                      {order.trackingNumber}
+                      <ExternalLink className="size-3.5" aria-hidden />
+                    </a>
+                  ) : (
+                    order.trackingNumber
+                  )}
+                </dd>
+              </div>
+            ) : null}
+            {order.fulfillmentStuckAt && fulfillmentStatus === "SUBMITTED" ? (
+              // Only while still open — `fulfillmentStuckAt` is write-once and lingers
+              // after a stuck shipment ships, so gate it (like the banner) on SUBMITTED
+              // to avoid a stale "Flagged stuck" row on an order that already shipped.
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Flagged stuck</dt>
+                <dd>{formatDate(order.fulfillmentStuckAt, true)}</dd>
+              </div>
+            ) : null}
+          </dl>
+
+          <div className="flex flex-col gap-1 text-sm">
+            <p className="text-muted-foreground">Shipping address</p>
+            {addressLines.length > 0 ? (
+              <address className="text-foreground leading-relaxed not-italic">
+                {addressLines.map((line, i) => (
+                  <span key={i} className="block">
+                    {line}
+                  </span>
+                ))}
+              </address>
+            ) : (
+              <p className="text-muted-foreground">
+                No shipping address on this order.
+              </p>
+            )}
+          </div>
+        </CardContent>
       </Card>
 
       <Card>
