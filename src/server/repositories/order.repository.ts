@@ -367,6 +367,32 @@ export const orderRepository = {
   },
 
   /**
+   * An order, scoped to the tenant, with its line items each joined to the
+   * fulfillment mapping on their variant (`sku` + `providerVariantId`) — the shape
+   * the submission service (M4 #137) reads to build a provider
+   * `CreateFulfillmentInput`. Tenant in the WHERE (golden rule #1) so one store can
+   * never submit another's order. Only the two mapping fields are selected off the
+   * variant (not the whole row) — the price/stock are snapshotted on the
+   * `OrderItem` already; fulfillment needs just the sku→provider link. Return type
+   * left to inference like the other `include` reads here (a `ReturnType`-derived
+   * annotation would make `orderRepository` reference a type derived from itself, a
+   * circular reference); its shape is captured by the `OrderForFulfillment` type
+   * exported below.
+   */
+  findForFulfillment(tenantId: string, id: string) {
+    return prisma.order.findFirst({
+      where: { tenantId, id },
+      include: {
+        items: {
+          include: {
+            variant: { select: { sku: true, providerVariantId: true } },
+          },
+        },
+      },
+    });
+  },
+
+  /**
    * PENDING orders created before `olderThan`, oldest first, up to `limit` — the
    * abandoned-checkout sweep's work list (#25). Like the outbox drain's `findDue`,
    * this is a **platform-wide** cron query and deliberately spans all tenants — the
@@ -816,4 +842,11 @@ export const orderRepository = {
  *  returns (never null). The one order type the webhook and email layer share. */
 export type OrderWithItems = NonNullable<
   Awaited<ReturnType<typeof orderRepository.findByPaymentIntentForTenant>>
+>;
+
+/** An order joined with its items and, per item, the variant's fulfillment
+ *  mapping (`sku` + `providerVariantId`) — the shape `findForFulfillment` returns
+ *  (never null). The one order type the fulfillment service reads (M4 #137). */
+export type OrderForFulfillment = NonNullable<
+  Awaited<ReturnType<typeof orderRepository.findForFulfillment>>
 >;

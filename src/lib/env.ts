@@ -42,6 +42,15 @@ const schema = z.object({
   // the POST — logs still emit — and a bad URL only fails that one fire-and-forget
   // fetch, which must never keep the app from booting.
   ERROR_WEBHOOK_URL: optionalEnvString,
+  // Printful (print-on-demand) API token — OPTIONAL, validated at use, not boot,
+  // exactly like RESEND_API_KEY above. Fulfillment submission is a best-effort
+  // background job (via the outbox), so a missing/blank key must never take down
+  // checkout/storefront boot: it only makes the provider selector fall back to the
+  // deterministic mock in dev/test, or — in production with no key — surface a
+  // `FulfillmentNotConfiguredError` at submit time (the exact analogue of
+  // `EmailNotConfiguredError`). Never a `NEXT_PUBLIC_*`; read only inside
+  // `src/server/fulfillment/**` (the provider selector, `index.ts`).
+  PRINTFUL_API_KEY: optionalEnvString,
   NODE_ENV: z
     .enum(["development", "test", "production"])
     .default("development"),

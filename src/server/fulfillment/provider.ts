@@ -1,6 +1,17 @@
 export interface FulfillmentLineItem {
   sku: string;
   quantity: number;
+  /**
+   * The provider's opaque catalog variant id (e.g. Printful's integer
+   * `variant_id`), resolved from our free-form `sku` by the submission service
+   * via `ProductVariant.providerVariantId`. Optional on the interface so a
+   * hypothetical provider keyed directly off `sku` needn't require it, and so the
+   * seam stays swappable per this file's doc comment; the mock and Printful
+   * adapters use it as the line's variant reference. A small, deliberate additive
+   * amendment (M4 #137) — the sku→provider mapping gap is real, so the service
+   * closes it here rather than blurring the adapter into a data-access layer.
+   */
+  providerVariantId?: string;
 }
 
 export interface ShippingAddress {
