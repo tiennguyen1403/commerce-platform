@@ -101,6 +101,31 @@ function shippingAddressColumns(address: ShippingAddress) {
   };
 }
 
+/**
+ * Does this order carry a complete shipping address? Checks the same required
+ * columns the fulfillment service narrows to a `ShippingAddress`
+ * (name/line1/city/postalCode/country; line2/state are optional) — kept beside
+ * `shippingAddressColumns` so the two views of the `ship*` columns can't drift.
+ * Gates the `FULFILLMENT_SUBMISSION` enqueue in `markPaidByPaymentIntent` (M4
+ * #139): a guest/legacy order with no address has nowhere to ship, so it never
+ * attempts submission (a `FulfillmentAddressMissingError` would only fail it).
+ */
+function hasShippingAddressColumns(order: {
+  shipName: string | null;
+  shipLine1: string | null;
+  shipCity: string | null;
+  shipPostalCode: string | null;
+  shipCountry: string | null;
+}): boolean {
+  return (
+    !!order.shipName &&
+    !!order.shipLine1 &&
+    !!order.shipCity &&
+    !!order.shipPostalCode &&
+    !!order.shipCountry
+  );
+}
+
 /** Translate the `[tenantId, orderNumber]` unique-constraint failure into a
  *  typed error the service can retry on; rethrow anything else untouched. */
 function mapWriteError(err: unknown): never {
@@ -542,6 +567,27 @@ export const orderRepository = {
           },
         });
 
+        // Fulfillment submission (M4 #139): queue the provider submission in this
+        // SAME PENDING → PAID transaction, so a paid order that CAN be fulfilled
+        // always has its submission durably enqueued — the outbox drain submits it
+        // (behind a second, order-level SUBMITTING guard) exactly as it sends the
+        // confirmation above. Enqueued only when the order carries a complete
+        // shipping address: a guest/legacy order without one has nowhere to ship,
+        // so it never attempts submission. Runs only on the single transition (the
+        // duplicate delivery already returned above), and the distinct `fs_`
+        // idempotencyKey (vs the confirmation's `oc_`) lets both coexist for one
+        // order while the unique constraint still forbids ever writing two.
+        if (hasShippingAddressColumns(order)) {
+          await tx.outboxMessage.create({
+            data: {
+              tenantId,
+              orderId: order.id,
+              type: "FULFILLMENT_SUBMISSION",
+              idempotencyKey: `fs_${order.id}`,
+            },
+          });
+        }
+
         // We own the transition — allocate inventory in the same transaction. A
         // line whose stock can't cover its quantity is collected as a shortfall
         // (oversell) rather than forced negative. Reservation makes this rare —
@@ -790,6 +836,101 @@ export const orderRepository = {
       select: { status: true },
     });
     return { transitioned: false, currentStatus: existing?.status ?? null };
+  },
+
+  /**
+   * Layer-2 idempotency claim for provider submission: atomically move the order's
+   * `fulfillmentStatus` NOT_SUBMITTED → SUBMITTING, tenant-scoped. Returns `true`
+   * for the single caller that made the move — it, and only it, may call
+   * `provider.createOrder` — and `false` for everyone else: a concurrent claimer,
+   * or an order already SUBMITTING / SUBMITTED / SHIPPED / FAILED. The guarded
+   * `updateMany` is atomic (the `markFulfilled` one-shot idiom, row-locked under
+   * READ COMMITTED), so of two racing submissions exactly one wins.
+   *
+   * This is the SECOND idempotency layer, on top of the outbox message's own
+   * claim: a duplicate POD order is real money + a physical shipment, and Printful
+   * has no idempotency key, so a submission can never be safely re-attempted once
+   * begun. A lost worker (its `createOrder` succeeded but the SUBMITTED write never
+   * landed) leaves the order stuck in SUBMITTING; this claim then returns `false`
+   * forever, so it is never re-submitted — surfaced for manual reconciliation
+   * instead of silently retrying (M4 research, "Idempotent submission").
+   *
+   * Also guarded on `status: "PAID"` — the only submittable order state. The
+   * fulfillment message is enqueued at PENDING → PAID but drained later (the daily
+   * outbox cron, or the webhook's immediate dispatch), and in that gap the order
+   * may have moved on: a `refund.succeeded` (`markRefundedByPaymentIntent` flips
+   * only `status`, not `fulfillmentStatus`) or a manual FULFILLED attestation
+   * (`markFulfilled`) both leave `fulfillmentStatus` at NOT_SUBMITTED. Without this
+   * guard a refunded order — money already returned — or a hand-fulfilled one would
+   * still be shipped to the provider. Both write `status` under the same order row
+   * lock, so of the refund/fulfil flip and this claim exactly one wins: a claim
+   * that finds the order no longer PAID matches nothing and returns `false`.
+   */
+  async claimForSubmission(
+    tenantId: string,
+    orderId: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "NOT_SUBMITTED",
+      },
+      data: { fulfillmentStatus: "SUBMITTING" },
+    });
+    return count === 1;
+  },
+
+  /**
+   * Persist a successful submission: the claim-winner (still SUBMITTING) moves
+   * SUBMITTING → SUBMITTED and records the provider's own order id
+   * (`FulfillmentResult.externalId`) + which provider handled it, so the poll cron
+   * can reconcile tracking against them. Guarded on SUBMITTING (like `markSent`'s
+   * SENDING guard) so nothing can clobber a FAILED/SHIPPED order. Returns whether
+   * the write landed; `false` would mean the order left SUBMITTING underneath us —
+   * a should-never-happen (the caller that won the claim holds it exclusively for
+   * the one submission), so the caller does not branch on it.
+   */
+  async markSubmitted(
+    tenantId: string,
+    orderId: string,
+    externalId: string,
+    provider: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: { id: orderId, tenantId, fulfillmentStatus: "SUBMITTING" },
+      data: {
+        fulfillmentStatus: "SUBMITTED",
+        fulfillmentExternalId: externalId,
+        fulfillmentProvider: provider,
+      },
+    });
+    return count === 1;
+  },
+
+  /**
+   * Move the order to the terminal FAILED fulfillment state — a provider
+   * soft-rejection, or a permanent unmapped / unconfigured / missing-address
+   * failure. Guarded to the two pre-terminal states (NOT_SUBMITTED before the
+   * claim, SUBMITTING after it) so a FAILED write can never regress an
+   * already-SUBMITTED/SHIPPED order. Deliberately persists NO `externalId`: a soft
+   * rejection's provider id is a synthesized placeholder (Printful) that must never
+   * reach `getTracking`, and FAILED orders are not polled. Best-effort and
+   * idempotent — a re-drain after a lost worker re-runs it as a no-op.
+   */
+  async markFulfillmentFailed(
+    tenantId: string,
+    orderId: string,
+  ): Promise<void> {
+    await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        fulfillmentStatus: { in: ["NOT_SUBMITTED", "SUBMITTING"] },
+      },
+      data: { fulfillmentStatus: "FAILED" },
+    });
   },
 
   /**
