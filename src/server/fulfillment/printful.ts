@@ -166,6 +166,21 @@ export class PrintfulProvider implements FulfillmentProvider {
         // symbol and grouping ("$1,234.56"), which Printful would reject.
         retail_price: toRetailPrice(item.priceCents),
       })),
+      // Declare the currency those per-item `retail_price` values are in (M4 #157).
+      // Without it Printful frames every `retail_price` in its single store's default
+      // currency, so a tenant transacting in a different currency (per-tenant
+      // `Tenant.currency`, snapshot on `Order.currency`) gets a numerically-correct
+      // but WRONG-currency packing slip. `retail_costs.currency` is the only v1 lever
+      // for this — there is no per-order top-level `currency` field — and it sets the
+      // slip's display label only (Printful still bills the store owner in the store's
+      // own currency via the read-only `costs`). Verified currency-ONLY against the v1
+      // OpenAPI spec: `retail_costs` declares NO required fields, so sending currency
+      // alone is legal and, unlike a partial subtotal/discount/shipping/tax, can't
+      // misstate the slip totals — the aggregate breakdown stays deferred (#148). The
+      // "retail costs are used only if every item has a `retail_price`" gate is already
+      // met (#148 sends one per line). Uppercased at this HTTP edge only — the currency
+      // twin of `toRetailPrice`'s cents→decimal crossing (golden rule #3).
+      retail_costs: { currency: toRetailCurrency(input.currency) },
     };
 
     // `confirm=1` submits + charges immediately (Stripe already captured payment).
@@ -282,6 +297,19 @@ function toVariantId(providerVariantId: string | undefined): number {
  */
 function toRetailPrice(priceCents: number): string {
   return (priceCents / 100).toFixed(2);
+}
+
+/**
+ * Map the order's currency (`Order.currency` — lowercase ISO 4217, Stripe's
+ * convention) to Printful's `retail_costs.currency`: an uppercase 3-letter code,
+ * e.g. `"usd" → "USD"` (M4 #157). The currency twin of `toRetailPrice` — the single
+ * place the order's currency crosses the outbound HTTP boundary. No allowlist check:
+ * `Order.currency` is already constrained to the supported set upstream (the store-
+ * currency setter), so the adapter stays a thin client and only reshapes the case
+ * Printful expects, never re-validates.
+ */
+function toRetailCurrency(currency: string): string {
+  return currency.toUpperCase();
 }
 
 /**

@@ -197,6 +197,9 @@ describe("fulfillmentService.submitOrder — submission + persistence", () => {
         postalCode: "94103",
         country: "US",
       },
+      // The order's currency rides on the input so the adapter can frame the slip
+      // in it (M4 #157) — order-level, from the fixture's `currency: "usd"`.
+      currency: "usd",
     });
     // Success persists the provider's external id + name and moves to SUBMITTED.
     expect(markSubmitted).toHaveBeenCalledWith(
@@ -251,6 +254,19 @@ describe("fulfillmentService.submitOrder — submission + persistence", () => {
         providerVariantId: "4011",
       },
     ]);
+  });
+
+  it("threads the order's currency onto the input (multi-currency slip framing)", async () => {
+    // A tenant transacting in a currency other than USD: the order's own currency
+    // rides on the input so the adapter can frame the packing slip in it, not the
+    // provider account's default (M4 #157). Carried verbatim (lowercase domain code)
+    // — the adapter is the only place it becomes Printful's uppercase form.
+    findForFulfillment.mockResolvedValue(fulfillmentOrder({ currency: "eur" }));
+
+    await fulfillmentService.submitOrder(TENANT, "order_1");
+
+    const [input] = createOrderMock().mock.calls[0];
+    expect(input.currency).toBe("eur");
   });
 
   it("omits optional line2/state when the order has none", async () => {

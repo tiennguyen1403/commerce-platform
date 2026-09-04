@@ -10,7 +10,8 @@ import type {
  * `PrintfulProvider` once `PRINTFUL_API_KEY` is set — and the structured logger is
  * spied so the soft-rejection path's warn is observable and silent. The contract
  * under test: correct request shaping (URL/`confirm=1`, Bearer auth, recipient +
- * integer `variant_id`, decimal-string `retail_price`), a 400 resolved to `"failed"` (never a
+ * integer `variant_id`, decimal-string `retail_price`, uppercased
+ * `retail_costs.currency`), a 400 resolved to `"failed"` (never a
  * throw), an immediate `failed` order status mapped to `"failed"`, everything else
  * non-2xx thrown (transient), and the tracking mapping off `shipments[0]`.
  */
@@ -49,6 +50,7 @@ function input(
       },
     ],
     shippingAddress: ADDRESS,
+    currency: "usd",
     ...o,
   };
 }
@@ -111,6 +113,9 @@ describe("PrintfulProvider", () => {
         // `variant_id` is an integer; `retail_price` is our per-unit price as a
         // plain decimal string for the packing slip (#148).
         items: [{ variant_id: 4011, quantity: 2, retail_price: "19.99" }],
+        // The order's currency (uppercased) frames those retail prices on the slip,
+        // so a non-store-currency tenant isn't mis-framed in the store default (#157).
+        retail_costs: { currency: "USD" },
       });
       expect(sent.recipient).not.toHaveProperty("address2");
       expect(sent.items[0]).toHaveProperty("retail_price", "19.99");
@@ -149,6 +154,24 @@ describe("PrintfulProvider", () => {
       expect(
         sent.items.map((i: { retail_price: string }) => i.retail_price),
       ).toEqual(["15.00", "9.99"]);
+    });
+
+    it("sends retail_costs.currency uppercased from the order currency (#157)", async () => {
+      // A tenant transacting in EUR: the slip must frame our retail prices as EUR,
+      // not the Printful store's default currency. The adapter uppercases the order's
+      // lowercase domain code ("eur") to Printful's expected form at the HTTP edge —
+      // currency-only, so it can't misstate the (deferred) subtotal/shipping/tax.
+      fetchMock.mockResolvedValue(
+        jsonResponse(200, { result: { id: 1, status: "pending" } }),
+      );
+
+      await new PrintfulProvider().createOrder(input({ currency: "eur" }));
+
+      const sent = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+      expect(sent.retail_costs).toEqual({ currency: "EUR" });
+      // Only the currency label — no subtotal/shipping/tax (the #148 breakdown stays
+      // deferred; a partial one would misstate the slip totals).
+      expect(sent.retail_costs).not.toHaveProperty("subtotal");
     });
 
     it("resolves to 'failed' (not a throw) on a 400 soft rejection", async () => {

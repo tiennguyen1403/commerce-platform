@@ -62,16 +62,22 @@ curl -sS -X POST 'https://api.printful.com/orders?confirm=0' \
       "country_code": "US",
       "zip": "94103"
     },
-    "items": [{ "variant_id": 4011, "quantity": 1 }]
+    "items": [{ "variant_id": 4011, "quantity": 1, "retail_price": "19.99" }],
+    "retail_costs": { "currency": "USD" }
   }' | tee /tmp/printful-draft.json
 ```
 
 A success comes back as `{ "code": 200, "result": { "id": <number>, "status": "draft", … } }`.
 That confirms Bearer auth, the recipient mapping (`address1`/`state_code`/`country_code`/`zip`
-— exactly what `toRecipient` in the adapter produces), the integer `variant_id`, and the
-`{ code, result }` envelope the adapter parses. A validation problem comes back as an HTTP
-**400** with `{ "result": "<message>", "error": { "reason", "message" } }` — the shape the
-adapter resolves to `status: "failed"`.
+— exactly what `toRecipient` in the adapter produces), the integer `variant_id`, the per-item
+`retail_price` (#148) and the currency-only `retail_costs` (#157) — the exact payload the
+adapter sends — and the `{ code, result }` envelope the adapter parses. Accepting the
+**currency-only `retail_costs`** here is the one thing the v1 OpenAPI spec can't confirm for
+us (it marks no `retail_costs` field required, but ships no worked example of a currency-only
+object), so this draft is where you verify it before going live — swap `"USD"` for a
+non-store-currency code (e.g. `"EUR"`) to also confirm a differing currency is accepted. A
+validation problem comes back as an HTTP **400** with `{ "result": "<message>", "error": {
+"reason", "message" } }` — the shape the adapter resolves to `status: "failed"`.
 
 Then read it back (mirrors `getTracking`), using the returned id:
 
@@ -101,14 +107,23 @@ curl -sS -X DELETE "https://api.printful.com/orders/$ORDER_ID" \
 
 ## What the adapter does not do (by design)
 
-- **No order-level `retail_costs`.** Each line now carries our retail price as Printful's
-  optional per-item `retail_price` (a decimal string, e.g. `"19.99"`, formatted from the
-  order item's integer `priceCents` — M4 **#148**), so the packing slip shows our prices
-  instead of Printful's base price. The aggregate `retail_costs` object (`currency` /
-  `subtotal` / `shipping` / `tax`), which Printful uses only when _every_ item has a
-  `retail_price`, is deliberately not sent: the fulfillment input carries no shipping/tax
-  breakdown, so a partial `retail_costs` would misstate the slip totals. Revisit if we want
-  fully itemized customer-facing costs on the slip.
+- **`retail_costs`: the currency label only, not the aggregate cost breakdown.** Each line
+  carries our retail price as Printful's optional per-item `retail_price` (a decimal string,
+  e.g. `"19.99"`, formatted from the order item's integer `priceCents` — M4 **#148**), so the
+  packing slip shows our prices instead of Printful's base price. The order also sends
+  `retail_costs: { currency }` — the order's own currency, uppercased (e.g. `"EUR"`) — so
+  those prices are framed in the **tenant's** currency instead of the single platform Printful
+  store's default (M4 **#157**; the platform is multi-tenant with a per-tenant
+  `Tenant.currency`, but one platform-level `PRINTFUL_API_KEY` account). It is the _only_
+  currency lever the v1 API exposes — there is no per-order top-level `currency` field — and
+  it sets the slip's **display label** only; Printful still bills the store owner in the
+  store's own currency (the read-only `costs`). The other `retail_costs` fields (`subtotal` /
+  `discount` / `shipping` / `tax`) are still deliberately not sent: the fulfillment input
+  carries no shipping/tax breakdown, so a partial one would misstate the slip totals — and
+  currency-only is safe precisely because it carries no total to misstate (the schema marks
+  no `retail_costs` field required, and the "used only if _every_ item has a `retail_price`"
+  gate is already met). Revisit — send the full breakdown — only if we want fully itemized
+  customer-facing costs on the slip.
 - **One shipment surfaced.** `TrackingInfo` carries a single tracking set, so a partial
   (multi-shipment) order surfaces the first shipment only.
 - **Tracking is polled, not webhook-driven** (see `research.md` / `GOAL.md`).
