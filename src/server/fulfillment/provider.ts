@@ -2,6 +2,16 @@ export interface FulfillmentLineItem {
   sku: string;
   quantity: number;
   /**
+   * The snapshot **per-unit** price in integer cents (`OrderItem.priceCents`,
+   * captured at checkout — never a float, golden rule #3). Threaded through the
+   * seam so an adapter can print OUR retail price on the customer-facing packing
+   * slip (Printful's optional per-item `retail_price`) instead of the provider's
+   * own base price (M4 #148). It stays cents on this interface — the adapter is
+   * the only place it becomes a decimal string, and only at the outbound HTTP
+   * boundary. Per-unit, not the line total: `quantity` is carried separately.
+   */
+  priceCents: number;
+  /**
    * The provider's opaque catalog variant id (e.g. Printful's integer
    * `variant_id`), resolved from our free-form `sku` by the submission service
    * via `ProductVariant.providerVariantId`. Optional on the interface so a
