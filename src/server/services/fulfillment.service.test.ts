@@ -4,7 +4,10 @@ import {
   MockProvider,
   MOCK_FAILING_VARIANT_ID,
 } from "@/server/fulfillment/mock";
-import { fulfillmentService } from "@/server/services/fulfillment.service";
+import {
+  fulfillmentService,
+  ERROR_POLL_ALERT_THRESHOLD,
+} from "@/server/services/fulfillment.service";
 import {
   orderRepository,
   type OrderForFulfillment,
@@ -43,6 +46,8 @@ vi.mock("@/server/repositories/order.repository", () => ({
     markShipped: vi.fn(),
     markFulfillmentFailedAfterSubmission: vi.fn(),
     markFulfillmentStuck: vi.fn(),
+    recordFulfillmentPollError: vi.fn(),
+    resetFulfillmentPollErrors: vi.fn(),
   },
 }));
 
@@ -59,6 +64,12 @@ const markFulfillmentFailedAfterSubmission = vi.mocked(
   orderRepository.markFulfillmentFailedAfterSubmission,
 );
 const markFulfillmentStuck = vi.mocked(orderRepository.markFulfillmentStuck);
+const recordFulfillmentPollError = vi.mocked(
+  orderRepository.recordFulfillmentPollError,
+);
+const resetFulfillmentPollErrors = vi.mocked(
+  orderRepository.resetFulfillmentPollErrors,
+);
 
 const TENANT = "tenant_1";
 
@@ -109,6 +120,7 @@ function fulfillmentOrder(
     trackingNumber: null,
     trackingUrl: null,
     fulfillmentStuckAt: null,
+    fulfillmentErrorCount: 0,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     items: [item()],
@@ -136,6 +148,11 @@ beforeEach(() => {
   markShipped.mockResolvedValue(true);
   markFulfillmentFailedAfterSubmission.mockResolvedValue(true);
   markFulfillmentStuck.mockResolvedValue(true);
+  // A low, sub-threshold streak by default: a transient getTracking fault stays
+  // "errored" and never alerts, so every pre-existing poll case is unaffected. The
+  // #163-specific tests override the returned count to drive the surface-once path.
+  recordFulfillmentPollError.mockResolvedValue(1);
+  resetFulfillmentPollErrors.mockResolvedValue(undefined);
 });
 
 /** The spied `createOrder`, typed for `.mock`/`toHaveBeenCalled*` assertions. */
@@ -155,7 +172,10 @@ const EXTERNAL_ID = "mock_order_1";
  *  pre-existing pollOpenShipments case (which doesn't care about age) stays
  *  "pending"/"shipped"/"failed" as before and is never spuriously flagged stuck;
  *  the stuck-specific tests override it to `STUCK_AGO`. `fulfillmentStuckAt`
- *  defaults to null — not yet surfaced — mirroring a freshly-SUBMITTED order. */
+ *  defaults to null — not yet surfaced — mirroring a freshly-SUBMITTED order.
+ *  `fulfillmentErrorCount` defaults to 0 — no error streak — so a clean poll never
+ *  triggers a reset; the #163 tests override it (and the mocked count) to drive the
+ *  erroring path. */
 function submitted(
   o: Partial<SubmittedOrderForPolling> = {},
 ): SubmittedOrderForPolling {
@@ -165,6 +185,7 @@ function submitted(
     fulfillmentExternalId: EXTERNAL_ID,
     createdAt: new Date(),
     fulfillmentStuckAt: null,
+    fulfillmentErrorCount: 0,
     ...o,
   };
 }
@@ -481,6 +502,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
     });
   });
@@ -517,6 +539,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 1,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -548,6 +571,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -572,6 +596,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 1,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -596,23 +621,28 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
     });
   });
 
-  it("counts a transient getTracking failure as errored, without reconciling", async () => {
+  it("counts a transient getTracking failure as errored, recording the error streak", async () => {
     findSubmittedForPolling.mockResolvedValue([submitted()]);
     getTrackingMock().mockRejectedValue(new Error("printful 503"));
 
     const result = await fulfillmentService.pollOpenShipments();
 
     expect(markShipped).not.toHaveBeenCalled();
+    // Every errored poll records the streak (the durable #163 signal); the default
+    // sub-threshold count (1) keeps it "errored", not "erroring", so no alert this run.
+    expect(recordFulfillmentPollError).toHaveBeenCalledWith(TENANT, "order_1");
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
       stuck: 0,
       pending: 0,
       errored: 1,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -636,6 +666,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 1,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -649,12 +680,16 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
 
     expect(getTrackingMock()).not.toHaveBeenCalled();
     expect(markShipped).not.toHaveBeenCalled();
+    // The null-externalId anomaly is a distinct, already-loud (per-run ERROR) failure —
+    // NOT a getTracking error streak — so it deliberately does not touch the #163 counter.
+    expect(recordFulfillmentPollError).not.toHaveBeenCalled();
     expect(result).toEqual({
       shipped: 0,
       failed: 0,
       stuck: 0,
       pending: 0,
       errored: 1,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -683,6 +718,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 0,
       errored: 1,
+      erroring: 0,
       shippedOrders: [{ tenantId: TENANT, orderId: "o2" }],
     });
   });
@@ -699,6 +735,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       stuck: 0,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -740,6 +777,7 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
       stuck: 1,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -761,6 +799,7 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
       stuck: 0,
       pending: 1,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -780,6 +819,7 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
       stuck: 0,
       pending: 1,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -803,6 +843,7 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
       stuck: 0,
       pending: 1,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     });
   });
@@ -831,7 +872,214 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
       stuck: 0,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
+    });
+  });
+});
+
+describe("fulfillmentService.pollOpenShipments — erroring open shipment (#163)", () => {
+  it("surfaces an erroring open shipment once, on the poll whose streak hits the threshold — left SUBMITTED", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    // getTracking keeps throwing (a persistent 4xx/5xx, a bad/stale external id): the
+    // order can't be reconciled, but this poll is the one whose recorded streak reaches
+    // the alert threshold.
+    getTrackingMock().mockRejectedValue(new Error("printful 500"));
+    recordFulfillmentPollError.mockResolvedValue(ERROR_POLL_ALERT_THRESHOLD);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(recordFulfillmentPollError).toHaveBeenCalledWith(TENANT, "order_1");
+    // #163 mirrors #155: surface, but do NOT terminalize — a getTracking error means the
+    // status is unreadable, not that the order won't ship, so neither terminal writer nor
+    // a reset runs, and the order stays SUBMITTED to keep being polled.
+    expect(markShipped).not.toHaveBeenCalled();
+    expect(markFulfillmentFailedAfterSubmission).not.toHaveBeenCalled();
+    expect(markFulfillmentStuck).not.toHaveBeenCalled();
+    expect(resetFulfillmentPollErrors).not.toHaveBeenCalled();
+    // Counted `erroring` (the surfacing run), not `errored` — as `stuck` splits from `pending`.
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 0,
+      errored: 0,
+      erroring: 1,
+      shippedOrders: [],
+    });
+  });
+
+  it("does not surface below the threshold (a few errors are just 'errored')", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    getTrackingMock().mockRejectedValue(new Error("printful 500"));
+    recordFulfillmentPollError.mockResolvedValue(
+      ERROR_POLL_ALERT_THRESHOLD - 1,
+    );
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 0,
+      errored: 1,
+      erroring: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("does not re-surface once past the threshold — the alert fires exactly once", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    getTrackingMock().mockRejectedValue(new Error("printful 500"));
+    // A later tick: the streak is already past the threshold. The `=== threshold` match
+    // (never `>=`) means this run does NOT re-alert — it counts as a plain `errored`.
+    recordFulfillmentPollError.mockResolvedValue(
+      ERROR_POLL_ALERT_THRESHOLD + 1,
+    );
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 0,
+      errored: 1,
+      erroring: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("counts a lost record-error race (null return) as errored, not erroring", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    getTrackingMock().mockRejectedValue(new Error("printful 500"));
+    // The guarded increment matched nothing — the order left PAID/SUBMITTED (refunded /
+    // manually fulfilled) between the select and the write. A benign no-op: no alert, and
+    // the getTracking fault this run is still counted `errored`. Mirrors the stuck-flag /
+    // markShipped race paths.
+    recordFulfillmentPollError.mockResolvedValue(null);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(recordFulfillmentPollError).toHaveBeenCalledOnce();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 0,
+      errored: 1,
+      erroring: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("resets a non-zero error streak on a clean poll (transient blips recover silently)", async () => {
+    // The order errored a few times (streak = 3) but this poll reads tracking cleanly —
+    // still in flight (no tracking number, not terminal), created recently so not stuck.
+    // The streak must be zeroed so those transient blips can never accumulate to the
+    // alert threshold (the #163 "recover silently" invariant, AC3).
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ fulfillmentErrorCount: 3 }),
+    ]);
+    getTrackingMock().mockResolvedValue({ status: "inprocess" });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(resetFulfillmentPollErrors).toHaveBeenCalledWith(TENANT, "order_1");
+    expect(recordFulfillmentPollError).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 1,
+      errored: 0,
+      erroring: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("does not write a reset on a clean poll when the streak is already zero (no-op poll stays write-free)", async () => {
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ fulfillmentErrorCount: 0 }),
+    ]);
+    getTrackingMock().mockResolvedValue({ status: "inprocess" });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    // A never-errored, in-flight order writes NOTHING — the "a not-shipped poll writes
+    // nothing" invariant the reset must not break.
+    expect(resetFulfillmentPollErrors).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 0,
+      pending: 1,
+      errored: 0,
+      erroring: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("does not reset the streak when the order ships (it leaves the work list)", async () => {
+    // A prior streak on an order that ships this run: the ship path leaves the SUBMITTED
+    // work list, so the residual count is inert and no reset write is spent on it — the
+    // reset is scoped to the stays-SUBMITTED clean-poll branch.
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({ fulfillmentErrorCount: 5 }),
+    ]);
+    getTrackingMock().mockResolvedValue({
+      status: "shipped",
+      trackingNumber: "1Z999",
+    });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).toHaveBeenCalledOnce();
+    expect(resetFulfillmentPollErrors).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 1,
+      failed: 0,
+      stuck: 0,
+      pending: 0,
+      errored: 0,
+      erroring: 0,
+      shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
+    });
+  });
+
+  it("resets the error streak AND flags stuck when a long-held order polls cleanly (the two surfaces are independent)", async () => {
+    // Comfortably past the stuck age threshold (10 days), and carrying a non-zero error
+    // streak from earlier flaky polls. A clean onhold poll this run both zeroes the error
+    // streak (#163) and surfaces the age-based hold (#155) — proving the erroring reset
+    // doesn't interfere with the stuck flag; they key off different state.
+    const stuckAgo = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+    findSubmittedForPolling.mockResolvedValue([
+      submitted({
+        createdAt: stuckAgo,
+        fulfillmentStuckAt: null,
+        fulfillmentErrorCount: 4,
+      }),
+    ]);
+    getTrackingMock().mockResolvedValue({ status: "onhold" });
+    markFulfillmentStuck.mockResolvedValue(true);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(resetFulfillmentPollErrors).toHaveBeenCalledWith(TENANT, "order_1");
+    expect(markFulfillmentStuck).toHaveBeenCalledWith(
+      TENANT,
+      "order_1",
+      "onhold",
+    );
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      stuck: 1,
+      pending: 0,
+      errored: 0,
+      erroring: 0,
+      shippedOrders: [],
     });
   });
 });

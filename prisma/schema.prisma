@@ -311,6 +311,22 @@ model Order {
   // ship. Null for every normally-progressing order (SHIPPED long before the
   // threshold). Nullable, no default → safe to add on non-empty tables (golden rule 6).
   fulfillmentStuckAt    DateTime?
+  // Consecutive failed `getTracking` polls for this SUBMITTED order (M4 #163). The
+  // poll increments it each run `getTracking` throws (a persistent 4xx/5xx, a
+  // bad/stale external id, a provider data problem) and resets it to 0 on any poll
+  // that reads tracking cleanly, so it measures the length of the CURRENT error
+  // streak, not lifetime errors. When the increment brings it to exactly the alert
+  // threshold the poll surfaces the order ONCE to an operator (money captured,
+  // tracking unreadable, no reconciliation possible) — the erroring-streak sibling of
+  // #155's age-based stuck-hold alert and #151's terminal-fail exit. Like #155 the
+  // order is left SUBMITTED and keeps being polled: a getTracking error proves only
+  // that we can't READ the status, not that the order won't ship (a long provider
+  // outage still recovers), so terminalizing it (→ FAILED) would prematurely give up
+  // on an order that may already have shipped. `@default(0)` NOT NULL → safe on
+  // non-empty tables (golden rule 6); 0 means both "never errored" and "recovered", so
+  // no nullable tri-state is needed. Written only by the poll cron
+  // (`fulfillment.service.ts` via `recordFulfillmentPollError`/`resetFulfillmentPollErrors`).
+  fulfillmentErrorCount Int         @default(0)
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 

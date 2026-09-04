@@ -46,13 +46,20 @@ export type StalePendingOrder = {
  *  order as stuck) lets the poll skip re-alerting one it already flagged. Since #158
  *  `fulfillmentStuckAt` is also the batch's PRIMARY sort key (flagged rows sort to the
  *  tail so a never-resolving hold can't starve fresh orders — see `findSubmittedForPolling`),
- *  with `createdAt` the secondary (oldest-first within each group). */
+ *  with `createdAt` the secondary (oldest-first within each group).
+ *
+ *  `fulfillmentErrorCount` feeds the erroring-open-shipment check (M4 #163): the poll
+ *  reads it so it can tell "this order has never errored / just recovered" (0) from an
+ *  ongoing streak, and reset it to 0 only when it was non-zero — keeping a clean poll of a
+ *  never-errored order write-free. The alert idempotency itself lives in the DB, on the
+ *  post-increment count returned by `recordFulfillmentPollError`, not on this pre-read. */
 export type SubmittedOrderForPolling = {
   id: string;
   tenantId: string;
   fulfillmentExternalId: string | null;
   createdAt: Date;
   fulfillmentStuckAt: Date | null;
+  fulfillmentErrorCount: number;
 };
 
 /** Who a reuse read is on behalf of — the identity binding that closes #92. A
@@ -533,6 +540,10 @@ export const orderRepository = {
         // stays in this same `{PAID, SUBMITTED}` work list, just sorted to the tail.
         createdAt: true,
         fulfillmentStuckAt: true,
+        // Current consecutive-getTracking-error streak, for the erroring-open-shipment
+        // check (#163): the poll resets it to 0 only when it's non-zero, so a clean poll
+        // of a never-errored order stays write-free.
+        fulfillmentErrorCount: true,
       },
     });
   },
@@ -1209,6 +1220,87 @@ export const orderRepository = {
       },
     });
     return count === 1;
+  },
+
+  /**
+   * Record one failed `getTracking` poll for a SUBMITTED order and return the new
+   * consecutive-error count (M4 #163) — the erroring-open-shipment sibling of
+   * `markFulfillmentStuck`. Atomically increments `fulfillmentErrorCount` under the
+   * same `{status: PAID, fulfillmentStatus: SUBMITTED}` work-list guard its poll
+   * siblings use, then reads the incremented value back **in the same transaction** so
+   * the caller can surface the order exactly once — on the single poll that brings the
+   * streak to the alert threshold (`count === THRESHOLD`, never `>=`, so later ticks
+   * past it don't re-alert). Deliberately leaves `fulfillmentStatus` at SUBMITTED (the
+   * #155 posture, not #151's terminal exit): a getTracking error proves only that we
+   * can't READ the order's status, not that it won't ship, so the order keeps being
+   * polled and a `resetFulfillmentPollErrors` on the next clean poll zeroes the streak.
+   *
+   * The increment + read-back share one interactive transaction so the returned count
+   * is authoritative under concurrency: the guarded `updateMany` row-locks the order
+   * until commit, so two racing polls serialize (5→6 then 6→7) and each reads a
+   * distinct value — exactly one can ever observe the threshold. `updateMany` can't
+   * return the updated row, hence the paired read; both are keyed by `{id, tenantId}`,
+   * and the tiny two-statement transaction stays well within Prisma's default timeout.
+   *
+   * Returns the new count for the poll that incremented it, or `null` when the guard
+   * matched nothing — the order left PAID+SUBMITTED (refunded / manually fulfilled)
+   * between `findSubmittedForPolling` and here, a benign race the poll treats exactly
+   * like the `markShipped` / `markFulfillmentStuck` `false` return (no alert). Only the
+   * poll cron calls this; it never touches a terminal or non-PAID order.
+   */
+  async recordFulfillmentPollError(
+    tenantId: string,
+    orderId: string,
+  ): Promise<number | null> {
+    return prisma.$transaction(async (tx) => {
+      const { count } = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          tenantId,
+          status: "PAID",
+          fulfillmentStatus: "SUBMITTED",
+        },
+        data: { fulfillmentErrorCount: { increment: 1 } },
+      });
+      // Guard matched nothing — the order left PAID+SUBMITTED underneath us (refunded /
+      // manually fulfilled). A benign no-op: the caller skips the alert, mirroring the
+      // `markShipped` / `markFulfillmentStuck` race paths.
+      if (count === 0) return null;
+      // Read our own just-committed-in-transaction increment back (updateMany returns
+      // only a row count). The guarded update matched, so the row exists in this tenant.
+      const row = await tx.order.findFirstOrThrow({
+        where: { id: orderId, tenantId },
+        select: { fulfillmentErrorCount: true },
+      });
+      return row.fulfillmentErrorCount;
+    });
+  },
+
+  /**
+   * Zero a SUBMITTED order's consecutive-getTracking-error streak (M4 #163) — called on
+   * any poll that reads tracking cleanly, so a few transient errors followed by a
+   * success can never accumulate to the alert threshold (the "transient blips recover
+   * silently" invariant). Guarded on the same `{status: PAID, fulfillmentStatus:
+   * SUBMITTED}` work-list predicate as its siblings, so it never touches an order that
+   * has left the poll's work list, and tenant-scoped (golden rule #1). Best-effort and
+   * idempotent — a re-run just re-zeroes an already-zero counter. The caller only
+   * invokes it when the pre-read `fulfillmentErrorCount` was non-zero, so a clean poll of
+   * a never-errored order stays write-free (the poll's "a not-shipped poll writes
+   * nothing" invariant); this method is nonetheless safe to call unconditionally.
+   */
+  async resetFulfillmentPollErrors(
+    tenantId: string,
+    orderId: string,
+  ): Promise<void> {
+    await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+      },
+      data: { fulfillmentErrorCount: 0 },
+    });
   },
 
   /**
