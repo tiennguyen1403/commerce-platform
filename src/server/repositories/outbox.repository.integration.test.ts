@@ -297,6 +297,42 @@ describe("outboxRepository settle guards (integration)", () => {
     expect(after.claimedAt).toBeNull();
     expect(after.lastError).toBe("Error: exhausted");
   });
+
+  it("defer holds the row PENDING WITHOUT counting an attempt (never toward DEAD)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id);
+    // A SHIPPING_CONFIRMATION row deferred while its send path (#141) is pending:
+    // a high attempt count must NOT survive as a march toward DEAD — defer leaves
+    // `attempts` untouched, unlike reschedule.
+    const msg = await seedOutbox(tenant.id, order.id, {
+      status: "SENDING",
+      claimedAt: new Date(),
+      attempts: 9,
+    });
+
+    const next = future(60 * 60_000);
+    await outboxRepository.defer(msg.id, next);
+
+    const after = await byId(msg.id);
+    expect(after.status).toBe("PENDING");
+    expect(after.attempts).toBe(9); // unchanged — a deferral is not a failed attempt
+    expect(after.claimedAt).toBeNull();
+    expect(after.lastError).toBeNull();
+    expect(after.nextAttemptAt.getTime()).toBe(next.getTime());
+  });
+
+  it("defer no-ops a non-SENDING row (SENDING-guarded, like the other settles)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id);
+    const pending = await seedOutbox(tenant.id, order.id, {
+      status: "PENDING",
+    });
+
+    await outboxRepository.defer(pending.id, future());
+
+    // Untouched — only a claimed (SENDING) row is deferred.
+    expect((await byId(pending.id)).status).toBe("PENDING");
+  });
 });
 
 describe("OutboxMessage idempotencyKey constraint (integration)", () => {

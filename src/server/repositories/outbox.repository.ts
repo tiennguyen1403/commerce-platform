@@ -149,4 +149,23 @@ export const outboxRepository = {
       },
     });
   },
+
+  /** Hold a claimed message PENDING for a later run WITHOUT counting an attempt —
+   *  used when its `type` has no send path yet (`SHIPPING_CONFIRMATION` until the
+   *  M4-08 send lands). Unlike `reschedule`, it does not increment `attempts` (a
+   *  deferral is not a failed delivery, so it must never march the row toward the
+   *  DEAD budget) and clears `lastError`. Releases the claim and pushes
+   *  `nextAttemptAt` out so the row isn't re-claimed immediately. Guarded on
+   *  `SENDING` like the other settle writes. */
+  async defer(id: string, nextAttemptAt: Date): Promise<void> {
+    await prisma.outboxMessage.updateMany({
+      where: { id, status: "SENDING" },
+      data: {
+        status: "PENDING",
+        nextAttemptAt,
+        claimedAt: null,
+        lastError: null,
+      },
+    });
+  },
 };
