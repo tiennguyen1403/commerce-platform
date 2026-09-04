@@ -1,7 +1,13 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
-import { fulfillmentService } from "@/server/services/fulfillment.service";
+import {
+  fulfillmentService,
+  ERROR_POLL_ALERT_THRESHOLD,
+} from "@/server/services/fulfillment.service";
 import { MOCK_TERMINAL_FAIL_MARKER } from "@/server/fulfillment";
-import { MOCK_ONHOLD_MARKER } from "@/server/fulfillment/mock";
+import {
+  MOCK_ONHOLD_MARKER,
+  MOCK_ERROR_MARKER,
+} from "@/server/fulfillment/mock";
 import {
   createTestTenant,
   deleteTenantDeep,
@@ -50,7 +56,7 @@ afterAll(async () => {
 async function seedSubmittedOrder(
   tenantId: string,
   externalId: string,
-  opts: { createdAt?: Date } = {},
+  opts: { createdAt?: Date; fulfillmentErrorCount?: number } = {},
 ) {
   return prisma.order.create({
     data: {
@@ -65,6 +71,11 @@ async function seedSubmittedOrder(
       fulfillmentExternalId: externalId,
       fulfillmentStatus: "SUBMITTED",
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
+      // Seed an existing error streak (M4 #163) so a single poll can drive the count to
+      // the alert threshold without looping the mock hundreds of times.
+      ...(opts.fulfillmentErrorCount !== undefined
+        ? { fulfillmentErrorCount: opts.fulfillmentErrorCount }
+        : {}),
     },
   });
 }
@@ -239,5 +250,89 @@ describe("pollOpenShipments — stuck open shipment (#155)", () => {
       (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
         .fulfillmentStuckAt,
     ).toBeNull();
+  });
+});
+
+describe("pollOpenShipments — erroring open shipment (#163)", () => {
+  it("climbs the error streak and surfaces it once at the threshold, never terminalizing", async () => {
+    const tenant = await freshTenant();
+    // The error marker makes the mock's getTracking THROW on every poll. Seed the streak
+    // one below the threshold so a single real poll drives it to exactly the threshold —
+    // the surfacing run — without looping the mock hundreds of times.
+    const externalId = uniqueId(`mock-${MOCK_ERROR_MARKER}`);
+    const order = await seedSubmittedOrder(tenant.id, externalId, {
+      fulfillmentErrorCount: ERROR_POLL_ALERT_THRESHOLD - 1,
+    });
+
+    // Poll 1: getTracking throws → the streak is incremented to exactly the threshold (the
+    // surfacing run). The order is deliberately NOT terminalized (the #155 posture, not
+    // #151's): still SUBMITTED + PAID, no tracking, and no email enqueued.
+    await fulfillmentService.pollOpenShipments();
+    let persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(ERROR_POLL_ALERT_THRESHOLD);
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+    expect(persisted.trackingNumber).toBeNull();
+    expect(
+      await prisma.outboxMessage.count({ where: { orderId: order.id } }),
+    ).toBe(0);
+
+    // Poll 2: still erroring, now past the threshold — the streak keeps climbing (proving
+    // the order stays in the work list and is re-polled, unlike a terminal exit), and it
+    // is still left SUBMITTED + PAID. The "alert exactly once" idempotency is on the log
+    // line (count === threshold), asserted in the unit tests.
+    await fulfillmentService.pollOpenShipments();
+    persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(
+      ERROR_POLL_ALERT_THRESHOLD + 1,
+    );
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("accumulates the streak from zero on a persistently-erroring order", async () => {
+    const tenant = await freshTenant();
+    const externalId = uniqueId(`mock-${MOCK_ERROR_MARKER}`);
+    // Default streak of 0 — a fresh order that starts erroring.
+    const order = await seedSubmittedOrder(tenant.id, externalId);
+
+    await fulfillmentService.pollOpenShipments();
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentErrorCount,
+    ).toBe(1);
+
+    await fulfillmentService.pollOpenShipments();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(2);
+    // Never shipped, never terminalized while erroring — left SUBMITTED for the next poll.
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("resets a non-zero streak on the next clean poll (transient blips recover silently)", async () => {
+    const tenant = await freshTenant();
+    // A plain external id: the mock reports a clean "submitted" (in flight, no tracking)
+    // on the first poll. The order carries a streak of 5 from earlier flaky polls — a
+    // clean read must zero it so those transient errors never reach the alert threshold.
+    const externalId = uniqueId("mock");
+    const order = await seedSubmittedOrder(tenant.id, externalId, {
+      fulfillmentErrorCount: 5,
+    });
+
+    await fulfillmentService.pollOpenShipments();
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(0);
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
   });
 });

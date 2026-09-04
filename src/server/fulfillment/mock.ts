@@ -40,6 +40,20 @@ export const MOCK_TERMINAL_FAIL_MARKER = "TERMINAL_FAIL";
 export const MOCK_ONHOLD_MARKER = "ONHOLD";
 
 /**
+ * An `externalId` CONTAINING this marker makes the mock's `getTracking` THROW on every
+ * poll — a persistent provider fault (a 4xx/5xx that never clears, a bad/stale external
+ * id, a provider-side data problem) the poll can never read past. It's the deterministic
+ * handle on the poll cron's ERRORING-open-shipment path (M4 #163): give a SUBMITTED order
+ * a `fulfillmentExternalId` carrying this and every poll's `getTracking` rejects, so the
+ * order is left SUBMITTED and its consecutive-error streak (`Order.fulfillmentErrorCount`)
+ * climbs until the poll surfaces it as erroring-too-long — the thrown-error analogue of the
+ * clean-but-never-resolving `MOCK_ONHOLD_MARKER`. Unlike the other markers it throws from
+ * the FIRST poll (a persistent fault has no "accepted then progressed" phase), so it is
+ * checked before the poll-count progression below.
+ */
+export const MOCK_ERROR_MARKER = "GETTRACKING_ERROR";
+
+/**
  * A deterministic, in-memory `FulfillmentProvider` — the CI/test default and dev
  * fallback (no `PRINTFUL_API_KEY` needed), and the reason everything above the
  * provider boundary is buildable before the real Printful adapter exists
@@ -54,7 +68,9 @@ export const MOCK_ONHOLD_MARKER = "ONHOLD";
  * → a provider TERMINAL failure (`"canceled"`, `terminalFailure: true`, no tracking),
  * the deterministic handle on the poll's terminal-exit path (#151); one carrying
  * `MOCK_ONHOLD_MARKER` parks in a non-terminal `"onhold"` on every poll (never ships,
- * never fails), the handle on the stuck-open-shipment path (#155).
+ * never fails), the handle on the stuck-open-shipment path (#155); one carrying
+ * `MOCK_ERROR_MARKER` makes `getTracking` THROW on every poll, the handle on the
+ * erroring-open-shipment path (#163).
  * The progression is per-instance state, so treat one `MockProvider` as one
  * process's provider (the selector memoizes a singleton for exactly this reason).
  */
@@ -82,6 +98,14 @@ export class MockProvider implements FulfillmentProvider {
   async getTracking(externalId: string): Promise<TrackingInfo> {
     const polls = (this.pollsByExternalId.get(externalId) ?? 0) + 1;
     this.pollsByExternalId.set(externalId, polls);
+    // Persistent getTracking failure (#163): a marked external id throws on EVERY poll —
+    // a bad/stale external id or a provider data problem the poll can never read past — so
+    // the order's consecutive-error streak climbs until it is surfaced as erroring-too-long.
+    // Checked before the progression below because a persistent fault has no "accepted then
+    // progressed" phase: it fails from the very first poll.
+    if (externalId.includes(MOCK_ERROR_MARKER)) {
+      throw new Error(`mock getTracking: persistent failure for ${externalId}`);
+    }
     // First poll: the provider accepted the order but hasn't shipped it yet.
     if (polls < 2) {
       return { status: "submitted" };

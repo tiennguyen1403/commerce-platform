@@ -161,6 +161,7 @@ async function seedOrder(
     userId?: string | null;
     fulfillmentStatus?: FulfillmentStatus;
     fulfillmentExternalId?: string;
+    fulfillmentErrorCount?: number;
   } = {},
 ) {
   const lines = opts.lines ?? [];
@@ -181,6 +182,9 @@ async function seedOrder(
         : {}),
       ...(opts.fulfillmentExternalId
         ? { fulfillmentExternalId: opts.fulfillmentExternalId }
+        : {}),
+      ...(opts.fulfillmentErrorCount !== undefined
+        ? { fulfillmentErrorCount: opts.fulfillmentErrorCount }
         : {}),
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
       items: {
@@ -1875,6 +1879,212 @@ describe("orderRepository.markFulfillmentStuck (integration)", () => {
   });
 });
 
+/**
+ * `recordFulfillmentPollError` — the poll cron's "record one failed getTracking poll"
+ * write (M4 #163), the erroring-open-shipment sibling of `markFulfillmentStuck`. Its
+ * guarantees live in the database: the `{status: PAID, fulfillmentStatus: SUBMITTED}`
+ * work-list guard is the money-safety filter (a refunded / hand-fulfilled order is never
+ * touched), and the atomic increment + same-transaction read-back is what makes the
+ * returned count authoritative under a racing double-poll — the property the service's
+ * `=== threshold` alert idempotency rests on. A mock can't exercise `updateMany` count
+ * semantics or row locking, so these run against the same Postgres the app uses.
+ */
+describe("orderRepository.recordFulfillmentPollError (integration)", () => {
+  /** Seed a PAID + SUBMITTED order with a real external id and an optional starting
+   *  error streak — the poll's reconcilable state (as `markSubmitted` leaves it). */
+  function seedSubmitted(
+    tenantId: string,
+    opts: {
+      status?: OrderStatus;
+      fulfillmentStatus?: FulfillmentStatus;
+      fulfillmentErrorCount?: number;
+    } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+      fulfillmentErrorCount: opts.fulfillmentErrorCount,
+    });
+  }
+
+  it("increments the error streak and returns the new count, leaving the lifecycle untouched", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { fulfillmentErrorCount: 4 });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBe(5);
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(5);
+    // Alert-only (the #155 posture, not #151's terminal exit): neither the fulfillment
+    // lifecycle nor the order status moves — the order keeps being polled.
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("returns 1 on the first error (up from the default 0)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+    expect(order.fulfillmentErrorCount).toBe(0);
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBe(1);
+  });
+
+  it("returns null and writes nothing for a non-PAID order (status guard)", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after submission; the guard leaves the streak alone (the
+    // order also drops from the poll via findSubmittedForPolling's own status filter).
+    const order = await seedSubmitted(tenant.id, {
+      status: "REFUNDED",
+      fulfillmentErrorCount: 2,
+    });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBeNull();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(2);
+  });
+
+  it("returns null for an order that isn't SUBMITTED (fulfillmentStatus guard)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "SHIPPED",
+      fulfillmentErrorCount: 3,
+    });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBeNull();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(3);
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id, { fulfillmentErrorCount: 1 });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      other.id,
+      order.id,
+    );
+
+    expect(count).toBeNull();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(1);
+  });
+
+  it("serializes a concurrent double-poll — distinct, gap-free counts (no lost update)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { fulfillmentErrorCount: 10 });
+
+    // Two poll runs land at once. Row locking on the guarded increment must serialize
+    // them so each reads back a DISTINCT value (11 then 12), never a lost update (both
+    // 11) — this is exactly what lets the service's `=== threshold` alert fire at most once.
+    const [a, b] = await Promise.all([
+      orderRepository.recordFulfillmentPollError(tenant.id, order.id),
+      orderRepository.recordFulfillmentPollError(tenant.id, order.id),
+    ]);
+
+    expect([a, b].sort((x, y) => (x ?? 0) - (y ?? 0))).toEqual([11, 12]);
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(12);
+  });
+});
+
+/**
+ * `resetFulfillmentPollErrors` — the poll cron's "a clean poll broke the error streak"
+ * write (M4 #163). Same `{status: PAID, fulfillmentStatus: SUBMITTED}` work-list guard as
+ * its siblings so it never touches an order that has left the poll, and tenant-scoped.
+ */
+describe("orderRepository.resetFulfillmentPollErrors (integration)", () => {
+  function seedSubmitted(
+    tenantId: string,
+    opts: {
+      status?: OrderStatus;
+      fulfillmentStatus?: FulfillmentStatus;
+      fulfillmentErrorCount?: number;
+    } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+      fulfillmentErrorCount: opts.fulfillmentErrorCount,
+    });
+  }
+
+  it("zeroes a non-zero streak on a SUBMITTED order, leaving the lifecycle untouched", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { fulfillmentErrorCount: 7 });
+
+    await orderRepository.resetFulfillmentPollErrors(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(0);
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("does not touch an order that has left the work list (status guard)", async () => {
+    const tenant = await freshTenant();
+    // A refunded order carrying a residual streak — the guard leaves it exactly as it was.
+    const order = await seedSubmitted(tenant.id, {
+      status: "REFUNDED",
+      fulfillmentErrorCount: 5,
+    });
+
+    await orderRepository.resetFulfillmentPollErrors(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(5);
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id, { fulfillmentErrorCount: 3 });
+
+    await orderRepository.resetFulfillmentPollErrors(other.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(3);
+  });
+});
+
 describe("orderRepository.listByTenant (integration)", () => {
   it("returns a tenant's orders newest-first with a total", async () => {
     const tenant = await freshTenant();
@@ -2214,9 +2424,11 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
     expect(found).toBeDefined();
     // Widened for the stuck-open-shipment check (#155): `createdAt` (the age
     // anchor) + `fulfillmentStuckAt` (the already-surfaced marker) joined the
-    // select alongside the original three fields.
+    // select alongside the original three fields; and for the erroring-open-shipment
+    // check (#163): `fulfillmentErrorCount` (the pre-read that gates the reset).
     expect(Object.keys(found!).sort()).toEqual([
       "createdAt",
+      "fulfillmentErrorCount",
       "fulfillmentExternalId",
       "fulfillmentStuckAt",
       "id",

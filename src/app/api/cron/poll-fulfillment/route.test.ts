@@ -67,6 +67,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
       stuck: 5,
       pending: 3,
       errored: 1,
+      erroring: 6,
       shippedOrders: [],
     });
 
@@ -83,6 +84,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
       stuck: 5,
       pending: 3,
       errored: 1,
+      erroring: 6,
     });
     // The internal shipped-order refs are consumed by the route, never leaked.
     expect(body).not.toHaveProperty("shippedOrders");
@@ -99,6 +101,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
       stuck: 0,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [
         { tenantId: "t1", orderId: "o1" },
         { tenantId: "t2", orderId: "o2" },
@@ -129,6 +132,7 @@ describe("GET /api/cron/poll-fulfillment", () => {
         stuck: 0,
         pending: 0,
         errored: 0,
+        erroring: 0,
         shippedOrders: [
           { tenantId: "t1", orderId: "o1" },
           { tenantId: "t2", orderId: "o2" },

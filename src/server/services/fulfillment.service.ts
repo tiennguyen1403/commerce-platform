@@ -66,6 +66,39 @@ const POLL_TIME_BUDGET_MS = 45_000;
 const STUCK_SUBMITTED_THRESHOLD_MS =
   env.FULFILLMENT_STUCK_THRESHOLD_DAYS * 24 * 60 * 60_000;
 
+/** How many CONSECUTIVE failed `getTracking` polls surface an order as an "erroring
+ *  too long" open shipment for an operator (M4 #163) — the erroring-streak sibling of
+ *  the age-based stuck-hold threshold above. Counted, not timed: `pollOne` increments
+ *  `Order.fulfillmentErrorCount` each run `getTracking` throws and resets it to 0 on any
+ *  clean poll, so this is the length of the current error streak — the alert fires ONCE,
+ *  on the poll whose post-increment count equals this value exactly (`=== `, never `>=`,
+ *  so later ticks don't re-alert; a clean poll resets the streak so a genuinely new
+ *  incident can surface again). "Attempt threshold" is one of the two the issue sanctions;
+ *  count is chosen over "age since submission" because age can't tell a 10-day error
+ *  streak from an order submitted 10 days ago that only just started erroring (which would
+ *  mis-fire), whereas the reset-on-success streak measures the errors themselves — so a
+ *  few transient blips followed by a success never reach it.
+ *
+ *  144 ≈ 24h at the every-10-minute poll cadence (`.github/workflows/cron.yml`,
+ *  `*​/10 * * * *`). Deliberately generous: a persistent, order-specific getTracking
+ *  failure is almost always a bad/stale external id or a provider-side data problem worth
+ *  an operator's eyes, but a provider-wide outage errors EVERY open order at once, so a
+ *  full day of continuous failure — well past any normal transient blip or multi-hour
+ *  hiccup — keeps the alert from firing en masse on a routine outage (the same
+ *  low-false-alarm philosophy as #155's generous 10-day hold buffer). Alert-only: like
+ *  #155 the order is left SUBMITTED and keeps polling — a getTracking error means we can't
+ *  READ the status, not that the order won't ship (a long outage still recovers), so it is
+ *  never terminalized (that's #151's job, for a provider-confirmed cancel/fail). A module
+ *  constant, not env-tunable (unlike #162's stuck-days knob): provisional until real
+ *  Printful error data exists — an env knob, and decoupling the count from the poll cadence,
+ *  are natural follow-ups. Note it is cadence-coupled by construction: a change to the cron
+ *  interval reweights the wall-clock this represents, so revisit it alongside any such change.
+ *
+ *  Exported (unlike the other poll knobs) so the poll tests can assert the surface-once
+ *  boundary against the single source of truth — the alert is an EXACT `=== threshold`
+ *  match, so a magic literal in the test would silently drift from this value. */
+export const ERROR_POLL_ALERT_THRESHOLD = 144;
+
 const pollLog = logger.child({ component: "fulfillment-poll" });
 
 /** A tenant-scoped order reference the poll hands back for the route's immediate
@@ -93,8 +126,21 @@ export type PollResult = {
    *  shipped yet, or the order was concurrently refunded/fulfilled — left SUBMITTED. */
   pending: number;
   /** Poll hit a transient provider/DB fault (isolated so one can't abort the
-   *  batch); the order is left SUBMITTED and retried next run. */
+   *  batch); the order is left SUBMITTED and retried next run. Every such run also
+   *  increments the order's consecutive-error streak (`Order.fulfillmentErrorCount`).
+   *  Counts every erroring run EXCEPT the single one that surfaces the order — that one
+   *  is counted `erroring` below (as `stuck` splits off `pending`). */
   errored: number;
+  /** Orders surfaced this run as ERRORING open shipments (M4 #163): `getTracking` has
+   *  thrown on every poll past `ERROR_POLL_ALERT_THRESHOLD` consecutive runs — tracking
+   *  unreadable (a bad/stale external id or a persistent provider fault), money captured,
+   *  no reconciliation possible. Alerted ONCE (idempotent via the post-increment count
+   *  from `recordFulfillmentPollError`) and, like `stuck`, left SUBMITTED — a getTracking
+   *  error means we can't READ the status, not that the order won't ship, so it keeps
+   *  being polled and a later clean poll resets the streak. A specialisation of `errored`
+   *  exactly as `stuck` specialises `pending`: counts only the surfacing run; every other
+   *  erroring run counts `errored`. */
+  erroring: number;
   /** The orders reconciled to SHIPPED this run — the route dispatches each one's
    *  shipping email immediately (the outbox drain being the durable path).
    *  Consumed by the route; deliberately NOT echoed in its JSON response body. */
@@ -103,8 +149,11 @@ export type PollResult = {
 
 /** Outcome of polling one open shipment (drives the `PollResult` tally). `"stuck"`
  *  is a specialisation of `"pending"` — the order is still in flight and stays
- *  SUBMITTED, but this run was the one that first surfaced it as stuck (#155). */
-type PollOutcome = "shipped" | "failed" | "pending" | "errored" | "stuck";
+ *  SUBMITTED, but this run was the one that first surfaced it as stuck (#155).
+ *  `"erroring"` is the analogous specialisation of `"errored"` — `getTracking` threw
+ *  and this run was the one that surfaced the order as erroring-too-long (#163). */
+type PollOutcome =
+  "shipped" | "failed" | "pending" | "errored" | "stuck" | "erroring";
 
 /**
  * Fulfillment orchestration — everything ABOVE the provider boundary (M4 #137),
@@ -195,6 +244,7 @@ export const fulfillmentService = {
         stuck: 0,
         pending: 0,
         errored: 0,
+        erroring: 0,
         shippedOrders: [],
       };
     }
@@ -207,6 +257,7 @@ export const fulfillmentService = {
       stuck: 0,
       pending: 0,
       errored: 0,
+      erroring: 0,
       shippedOrders: [],
     };
     const deadline = Date.now() + POLL_TIME_BUDGET_MS;
@@ -219,7 +270,8 @@ export const fulfillmentService = {
           result.failed +
           result.stuck +
           result.pending +
-          result.errored;
+          result.errored +
+          result.erroring;
         pollLog.info(
           { ...result, remaining: open.length - handled },
           "poll: time budget reached — remaining orders deferred to next run",
@@ -255,7 +307,10 @@ export const fulfillmentService = {
  * Poll and reconcile ONE open shipment (M4 #140, terminal-fail exit #151). Asks the
  * provider for the order's tracking, and:
  *  - a transient `getTracking` fault (the adapter throws a plain Error for a
- *    404/401/5xx/timeout) → `"errored"`: leave the order SUBMITTED, retry next run;
+ *    404/401/5xx/timeout) → `"errored"`: leave the order SUBMITTED, retry next run, and
+ *    bump the consecutive-error streak; the run that first drives it to the threshold also
+ *    surfaces the order ONCE as erroring-too-long (#163, via `recordPollError`). A clean
+ *    poll on any later branch resets the streak, so transient blips never alert;
  *  - a tracking number present → the shipped signal: persist tracking + flip
  *    PAID → FULFILLED + enqueue the shipping email via the guarded, atomic
  *    `markShipped`. `"shipped"` if it made the transition, `"pending"` if the order
@@ -299,12 +354,15 @@ async function pollOne(
   try {
     tracking = await provider.getTracking(fulfillmentExternalId);
   } catch (err) {
-    // Transient provider fault — leave the order SUBMITTED; the next run retries.
+    // Transient provider fault — leave the order SUBMITTED; the next run retries. This
+    // WARN is per-run (a single blip is expected and self-heals); the durable signal is
+    // the consecutive-error streak `recordPollError` maintains, which surfaces the order
+    // ONCE at the threshold if the failures never stop (M4 #163).
     pollLog.warn(
       { err, orderId: id, tenantId, externalId: fulfillmentExternalId },
       "poll: getTracking failed — leaving order for a later run",
     );
-    return "errored";
+    return await recordPollError(order);
   }
 
   // No shipment yet (a tracking NUMBER always wins — checked below — so a shipped
@@ -352,6 +410,15 @@ async function pollOne(
       );
       return "failed";
     }
+    // This poll read tracking cleanly, so it breaks any getTracking error streak: zero
+    // the counter (M4 #163) — but only if it was non-zero, so a clean poll of a
+    // never-errored order still writes nothing (the "a not-shipped poll writes nothing"
+    // invariant holds for the common case). This is what makes transient blips recover
+    // silently: a few errors then a success can never accumulate to the alert threshold.
+    if (order.fulfillmentErrorCount > 0) {
+      await orderRepository.resetFulfillmentPollErrors(tenantId, id);
+    }
+
     // Genuinely in flight — nothing to reconcile (a not-shipped poll writes nothing
     // to the order's lifecycle) and re-checked next run. But if it has been in flight
     // too long — SUBMITTED since `createdAt`, past the stuck threshold — surface it
@@ -450,6 +517,59 @@ async function flagIfStuck(
     "poll: order stuck SUBMITTED past the age threshold (provider hold not resolving) — left SUBMITTED, needs manual review (contact provider / refund / re-order)",
   );
   return "stuck";
+}
+
+/**
+ * The error tail of `pollOne` (M4 #163): record one failed `getTracking` poll and, if the
+ * failures have gone on too long, surface the order ONCE. Returns `"errored"` on every run
+ * except the single one that crosses the threshold, which returns `"erroring"` (the surfacing
+ * run) — the poll did hit a getTracking fault either way, so `errored + erroring` totals the
+ * faults. The erroring-streak sibling of `flagIfStuck`: same alert-once shape, same "left
+ * SUBMITTED, keep polling" posture, but driven by a consecutive-failure count
+ * rather than age, because a getTracking error means the status is UNREADABLE (a bad/stale
+ * external id, a provider data problem, or a long outage), not that the order won't ship.
+ *
+ * `recordFulfillmentPollError` atomically increments `Order.fulfillmentErrorCount` and
+ * returns the new value; idempotency is durable and DB-authoritative, not per-process:
+ * the alert fires only when that value EQUALS the threshold (`===`, never `>=`), so the
+ * single poll that crosses it alerts and every later tick — count now past the threshold —
+ * does not. A clean poll elsewhere in `pollOne` resets the streak to 0, so a genuinely new
+ * error incident later can surface again (unlike the write-once `flagIfStuck`, whose age
+ * condition is monotonic). A `null` return is the benign race its siblings share — the
+ * order left PAID/SUBMITTED (refunded / manually fulfilled) between the select and here —
+ * so there is nothing to surface.
+ */
+async function recordPollError(
+  order: SubmittedOrderForPolling,
+): Promise<PollOutcome> {
+  const { id, tenantId, fulfillmentExternalId } = order;
+
+  const errorCount = await orderRepository.recordFulfillmentPollError(
+    tenantId,
+    id,
+  );
+  // Lost the work-list guard: the order left PAID/SUBMITTED underneath us. A benign
+  // no-op — the getTracking error still happened (we count it `errored`), but there is
+  // no live order to surface. Mirrors `flagIfStuck` / `markShipped`'s race handling.
+  if (errorCount === null) {
+    return "errored";
+  }
+
+  // Money captured, tracking unreadable for too long, and no reconciliation possible:
+  // the money-at-risk ERROR convention shared with the #151 terminal-fail and #155
+  // stuck-hold alerts (nothing routes through `reportError`, so `error` is the only
+  // severity signal, and a `warn` ages out of Vercel Hobby's 1-hour retention before an
+  // operator sees it). Fires exactly once — on the poll whose count equals the threshold.
+  if (errorCount === ERROR_POLL_ALERT_THRESHOLD) {
+    pollLog.error(
+      { orderId: id, tenantId, externalId: fulfillmentExternalId, errorCount },
+      "poll: getTracking has failed on every poll past the threshold — tracking unreadable (bad/stale external id or a persistent provider fault), left SUBMITTED, needs manual review",
+    );
+    // The one run that surfaces this order — counted `erroring`, not `errored`, so the
+    // route/operator sees "surfaced this run" distinctly (as `stuck` splits off `pending`).
+    return "erroring";
+  }
+  return "errored";
 }
 
 /**
