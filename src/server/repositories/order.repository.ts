@@ -55,7 +55,10 @@ export type StalePendingOrder = {
  *  reads it so it can tell "this order has never errored / just recovered" (0) from an
  *  ongoing streak, and reset it to 0 only when it was non-zero — keeping a clean poll of a
  *  never-errored order write-free. The alert idempotency itself lives in the DB, on the
- *  post-increment count returned by `recordFulfillmentPollError`, not on this pre-read. */
+ *  post-increment count returned by `recordFulfillmentPollError`, not on this pre-read. It
+ *  also orders the batch (M4 #170): `findSubmittedForPolling` sub-orders the not-yet-flagged
+ *  group by this count ascending, sinking a perpetually-erroring order behind fresh ones so
+ *  it can't starve them (the ordering happens in the DB — the poll never sorts on it here). */
 export type SubmittedOrderForPolling = {
   id: string;
   tenantId: string;
@@ -507,43 +510,62 @@ export const orderRepository = {
    * that never resolves — see the ordering below — could let the set grow). Selects
    * only the fields the poll needs — never the whole row.
    *
-   * Ordering deprioritises a flagged-stuck order (M4 #158) AND rotates the flagged tail
-   * fairly (M4 #164). A #155-flagged hold stays SUBMITTED (it may still ship, so #155
-   * alerts but keeps polling it); left oldest-first it would sit at the FRONT of every
-   * batch forever — one wasted `getTracking` per run and, once enough accumulate, crowding
-   * fresh orders out of the batch limit / time budget, so their shipments never reconcile
-   * (the liveness problem #151's terminal exit was built to avoid). The sort key is
-   * `fulfillmentStuckPolledAt`, which is non-null IFF the order is flagged-stuck, so
-   * `nulls: "first"` floats every not-yet-flagged order ahead of every flagged one — fresh
-   * orders always poll first — while flagged rows fill the tail. A flagged order is never
-   * dropped from the work list (the predicate is unchanged — the #155 invariant:
-   * deprioritise, don't drop), so it keeps polling and reconciles if its hold ships.
+   * Ordering runs in three tiers so a never-resolving open shipment can never starve fresh
+   * orders (the liveness problem #151's terminal exit was built to avoid), whatever its
+   * failure mode: (1) fresh — not flagged-stuck, not erroring — first; (2) then orders whose
+   * `getTracking` throws every poll (M4 #163/#170); (3) then flagged-stuck holds last (M4
+   * #158), that tail rotating fairly (M4 #164). Every tier stays in the work list — the
+   * predicate is unchanged (the #155 invariant: deprioritise, don't drop) — so a
+   * deprioritised order keeps polling and reconciles the moment its hold ships or its
+   * getTracking recovers.
    *
-   * Within the tail the key rotates (#164): #158 keyed the tail on the WRITE-ONCE
-   * `fulfillmentStuckAt`, so the tail order was stable across runs and a backlog past
-   * `POLL_BATCH_SIZE` permanently starved the newest-flagged (a hold that later ships would
-   * never reconcile). `fulfillmentStuckPolledAt` is instead bumped `now()` on every re-poll
-   * of a flagged order (`markStuckRepolled`), so the tail sorts least-recently-repolled
-   * first: each run re-polls a different slice, every flagged order is reached within
-   * ~⌈flaggedCount / freeSlots⌉ runs, and one that eventually ships reconciles regardless of
-   * flagged-set size. (`createdAt` remains the final tiebreak — oldest-first within a group.
-   * One exception to the bound: a flagged order whose getTracking THROWS every run is not
-   * rotated — its key is only bumped on a clean re-poll — so it stays pinned at the tail
-   * front, itself always polled but holding a fixed slot; bounded and #163-alerted, see
-   * `recordPollError`.)
+   * The PRIMARY key `fulfillmentStuckPolledAt` is non-null IFF the order is flagged-stuck, so
+   * `nulls: "first"` floats every not-yet-flagged order (tiers 1–2) ahead of every flagged one
+   * (tier 3) — fresh orders always poll before a hold. Within the flagged tail the key ROTATES
+   * (#164): #158 keyed the tail on the WRITE-ONCE `fulfillmentStuckAt`, so the tail order was
+   * stable across runs and a backlog past `POLL_BATCH_SIZE` permanently starved the
+   * newest-flagged; `fulfillmentStuckPolledAt` is instead bumped `now()` on every re-poll of a
+   * flagged order (`markStuckRepolled`), so the tail sorts least-recently-repolled first —
+   * each run re-polls a different slice and every flagged order is reached within
+   * ~⌈flaggedCount / freeSlots⌉ runs.
+   *
+   * The SECONDARY key `fulfillmentErrorCount ASC` splits tiers 1 and 2 (M4 #170). An order
+   * whose `getTracking` THROWS every run returns via `recordPollError` BEFORE `flagIfStuck`,
+   * so it is never flagged-stuck and its `fulfillmentStuckPolledAt` stays null — leaving it,
+   * pre-#170, in the tier-1 null-key group and (being old, having errored a while) at the
+   * FRONT of the oldest-first batch every run, re-creating #158's starvation for erroring
+   * orders. Sub-ordering the null-key group by the error streak sinks a perpetually-erroring
+   * order (count > 0) behind every fresh order (count 0), so fresh orders always poll first; a
+   * clean poll resets the streak to 0 (#163), floating a recovered order straight back to the
+   * front so it reconciles at once. `createdAt` is the final tiebreak — oldest-first within a
+   * tier. (Bounded, self-healing residuals, all one shape: because fresh always polls first and
+   * each group drains in sort order, any order with >`POLL_BATCH_SIZE` rows sorting ahead of it
+   * for many runs waits until that backlog drains, so it won't detect a recovery until then. That
+   * now includes an erroring order behind a large FRESH backlog — #170 sinks it behind fresh,
+   * where pre-#170 it sat at the front — plus the erroring tier's stable-key ordering, its sitting
+   * ahead of the flagged tail, and a flagged-AND-erroring order's frozen re-poll key. A #164-style
+   * re-poll rotation for the erroring tier is the natural follow-up if real data warrants it — full
+   * note on `recordPollError`.)
    */
   findSubmittedForPolling(limit: number): Promise<SubmittedOrderForPolling[]> {
     return prisma.order.findMany({
       where: { status: "PAID", fulfillmentStatus: "SUBMITTED" },
       orderBy: [
-        // Not-yet-flagged (null) first, then flagged-stuck last — #158 deprioritises a
-        // never-resolving hold so it can't starve fresh orders. Keyed on
-        // `fulfillmentStuckPolledAt` (not the write-once `fulfillmentStuckAt`) since #164:
-        // it is non-null IFF flagged (so `nulls: "first"` still floats fresh orders ahead,
-        // unchanged) AND is bumped on every re-poll of a flagged order, so the flagged tail
-        // sorts least-recently-repolled first and ROTATES — a >POLL_BATCH_SIZE flagged
-        // backlog can no longer permanently starve the newest-flagged (see the doc comment).
+        // Three-tier deprioritisation so no never-resolving open shipment starves fresh
+        // orders (see the doc comment). PRIMARY: not-yet-flagged (null) first, flagged-stuck
+        // last — #158/#164. Keyed on `fulfillmentStuckPolledAt` (not the write-once
+        // `fulfillmentStuckAt`) since #164: it is non-null IFF flagged (so `nulls: "first"`
+        // floats fresh orders ahead) AND is bumped on every re-poll of a flagged order
+        // (`markStuckRepolled`), so the flagged tail rotates least-recently-repolled first —
+        // a >POLL_BATCH_SIZE flagged backlog can't permanently starve the newest-flagged.
         { fulfillmentStuckPolledAt: { sort: "asc", nulls: "first" } },
+        // SECONDARY (#170): within the not-yet-flagged group, sink an order that errors on
+        // every poll (count > 0) behind every fresh one (count 0). Such an order returns via
+        // `recordPollError` BEFORE `flagIfStuck`, so it never joins the flagged tail; without
+        // this it sat at the FRONT of the oldest-first batch every run, re-creating #158's
+        // starvation for erroring orders. A clean poll resets the streak (#163) → back to fresh.
+        { fulfillmentErrorCount: "asc" },
+        // TIEBREAK: oldest-first within a tier.
         { createdAt: "asc" },
       ],
       take: limit,

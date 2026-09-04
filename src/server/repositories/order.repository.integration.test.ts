@@ -2403,16 +2403,24 @@ describe("orderRepository.findStalePending (integration)", () => {
 describe("orderRepository.findSubmittedForPolling (integration)", () => {
   const minsAgo = (n: number) => new Date(Date.now() - n * 60_000);
 
-  /** Seed a SUBMITTED+PAID order (the reconcilable state), across tenants. */
+  /** Seed a SUBMITTED+PAID order (the reconcilable state), across tenants. An optional
+   *  `fulfillmentErrorCount` seeds a getTracking-error streak for the #170 ordering tests. */
   function seedSubmitted(
     tenantId: string,
-    opts: { createdAt?: Date; externalId?: string } = {},
+    opts: {
+      createdAt?: Date;
+      externalId?: string;
+      fulfillmentErrorCount?: number;
+    } = {},
   ) {
     return seedOrder(tenantId, {
       status: "PAID",
       fulfillmentStatus: "SUBMITTED",
       fulfillmentExternalId: opts.externalId ?? uniqueId("ext"),
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
+      ...(opts.fulfillmentErrorCount !== undefined
+        ? { fulfillmentErrorCount: opts.fulfillmentErrorCount }
+        : {}),
     });
   }
 
@@ -2531,6 +2539,105 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
         (id) => id !== fresh.id,
       ),
     ).toEqual([stuckA.id, stuckB.id, stuckC.id]);
+  });
+
+  it("deprioritises an erroring order behind fresh ones, ordered by error streak, even when it is older (#170/#163)", async () => {
+    const t = await freshTenant();
+    // An order whose getTracking throws every poll returns via `recordPollError` BEFORE
+    // `flagIfStuck`, so it is never flagged-stuck: its `fulfillmentStuckPolledAt` stays null
+    // and it shares the not-yet-flagged group with the fresh orders. Pre-#170, oldest-first
+    // ordering pinned such an order (old, having errored a while) to the FRONT of the batch
+    // every run, starving fresh orders. #170 sub-orders the null-key group by
+    // `fulfillmentErrorCount`, so fresh (count 0) polls before erroring (count > 0) — proven
+    // here by making the erroring orders the OLDEST-created (they'd win under createdAt alone).
+    const freshOld = await seedSubmitted(t.id, { createdAt: minsAgo(200) });
+    const freshNew = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
+    const errLow = await seedSubmitted(t.id, {
+      createdAt: minsAgo(500),
+      fulfillmentErrorCount: 3,
+    });
+    const errHigh = await seedSubmitted(t.id, {
+      createdAt: minsAgo(400),
+      fulfillmentErrorCount: 80,
+    });
+
+    const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
+      .map((o) => o.id)
+      .filter((id) =>
+        [freshOld.id, freshNew.id, errLow.id, errHigh.id].includes(id),
+      );
+    // Fresh first (count 0, oldest createdAt first), THEN erroring by ascending streak
+    // (errLow's 3 before errHigh's 80) — even though BOTH erroring orders were created before
+    // both fresh ones, so createdAt alone would have polled the erroring pair first.
+    expect(mineInOrder).toEqual([
+      freshOld.id,
+      freshNew.id,
+      errLow.id,
+      errHigh.id,
+    ]);
+  });
+
+  it("orders the batch fresh, then erroring, then flagged-stuck (#170 three-tier order)", async () => {
+    const t = await freshTenant();
+    // The full deprioritisation order: a fresh order, an erroring one (null stuck key,
+    // count > 0), and a flagged-stuck one (non-null `fulfillmentStuckPolledAt`). `nulls:
+    // "first"` floats the two null-key orders (fresh + erroring) ahead of the flagged one;
+    // within that null-key group #170's error-count sub-order puts fresh before erroring. Each
+    // later tier is created OLDER than the one before, so createdAt-ascending alone would sort
+    // them in the exact REVERSE order — proving the tier keys, not creation age, drive it.
+    const fresh = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
+    const erroring = await seedSubmitted(t.id, {
+      createdAt: minsAgo(300),
+      fulfillmentErrorCount: 20,
+    });
+    const stuck = await seedSubmitted(t.id, { createdAt: minsAgo(500) });
+    await prisma.order.update({
+      where: { id: stuck.id },
+      data: {
+        fulfillmentStuckAt: minsAgo(60),
+        fulfillmentStuckPolledAt: minsAgo(60),
+      },
+    });
+
+    const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
+      .map((o) => o.id)
+      .filter((id) => [fresh.id, erroring.id, stuck.id].includes(id));
+    expect(mineInOrder).toEqual([fresh.id, erroring.id, stuck.id]);
+  });
+
+  it("floats a recovered order (streak reset to 0) back ahead of a still-erroring one (#170 AC2)", async () => {
+    const t = await freshTenant();
+    // AC2: a deprioritised erroring order reconciles once its getTracking recovers. A clean
+    // poll resets `fulfillmentErrorCount` to 0 (#163), which — being the #170 sub-order key —
+    // floats the order straight back to the front of the not-yet-flagged group, so it polls
+    // (and can ship) at once rather than staying stuck behind other erroring orders.
+    const recovered = await seedSubmitted(t.id, {
+      createdAt: minsAgo(100),
+      fulfillmentErrorCount: 50,
+    });
+    const stillErroring = await seedSubmitted(t.id, {
+      createdAt: minsAgo(400),
+      fulfillmentErrorCount: 10,
+    });
+    const mine = (open: { id: string }[]) =>
+      open
+        .map((o) => o.id)
+        .filter((id) => [recovered.id, stillErroring.id].includes(id));
+
+    // Before recovery: lower streak first (stillErroring's 10 before recovered's 50).
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      stillErroring.id,
+      recovered.id,
+    ]);
+
+    // A clean poll zeroes the streak (what `resetFulfillmentPollErrors` does on recovery).
+    await orderRepository.resetFulfillmentPollErrors(t.id, recovered.id);
+
+    // Now recovered (count 0 = fresh) sorts ahead of the still-erroring order (count 10).
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      recovered.id,
+      stillErroring.id,
+    ]);
   });
 
   it("excludes orders whose fulfillmentStatus isn't SUBMITTED", async () => {

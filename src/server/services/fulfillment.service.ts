@@ -559,18 +559,30 @@ async function flagIfStuck(
  * order left PAID/SUBMITTED (refunded / manually fulfilled) between the select and here —
  * so there is nothing to surface.
  *
- * Deliberately does NOT bump the flagged tail's round-robin re-poll key (#164): a getTracking
- * error routes here, bypassing `flagIfStuck`, so an order that is BOTH flagged-stuck AND
- * erroring keeps its `fulfillmentStuckPolledAt` frozen and stays pinned at the tail FRONT
- * rather than rotating. This is a bounded, acceptable residual, not a starvation vector: (a)
- * an order erroring from the start is never flagged at all — flagging needs a clean read past
- * the age threshold, which an always-throwing getTracking never delivers — so it stays in the
- * high-priority not-yet-flagged (null-key) group, never the tail; (b) an order flagged first
- * and only later erroring keeps being polled (front of the tail — itself never starved),
- * reconciles at once if its hold ships, and is surfaced within ~24h by the erroring alert
- * above. Its only cost is holding one fixed tail slot, marginally lowering rotation throughput
- * for the other flagged orders — bounded by the count of such already-#163-alerted orders, and
- * strictly better than the pre-#164 fully-frozen tail.
+ * On ordering (M4 #170): a getTracking error routes here, BEFORE `flagIfStuck`, so a
+ * perpetually-erroring order is never flagged-stuck — its `fulfillmentStuckPolledAt` stays null
+ * and it never joins the rotating flagged tail (this path deliberately does NOT bump that #164
+ * key). Instead the `fulfillmentErrorCount` this increments is the batch's own deprioritisation
+ * key: `findSubmittedForPolling` sub-orders the not-yet-flagged group by it ascending, so each
+ * error sinks such an order further behind fresh ones — it can no longer sit at the FRONT of the
+ * oldest-first batch every run and starve them (the pre-#170 gap this note used to describe as
+ * acceptable). The residuals this leaves share one root cause: by design fresh orders always
+ * poll before deprioritised ones and each group drains in sort order, sized to clear over
+ * successive runs (the posture #164's rotation also runs under), so any order with more than
+ * `POLL_BATCH_SIZE` rows sorting AHEAD of it for many consecutive runs isn't re-polled until
+ * that backlog drains, and won't detect a getTracking recovery until then: (a) an erroring order
+ * behind a >`POLL_BATCH_SIZE` fresh (or lower-count erroring) backlog — newly possible since
+ * #170 sinks it behind fresh, where pre-#170 it sat at the front; (b) within the erroring tier
+ * the count is a STABLE key, not a #164-style round-robin, so a high-count order can wait behind
+ * a churn of lower-count ones; (c) an order flagged-stuck FIRST and only later erroring keeps
+ * `fulfillmentStuckPolledAt` frozen while it errors, pinned at the flagged-tail front (itself
+ * always polled) rather than rotating — still strictly better than the pre-#164 fully-frozen
+ * tail. All are bounded and self-healing: the backlog drains, the order re-polls, and a clean
+ * poll resets its streak to 0 → back to fresh. (An order reaches the #163 erroring alert only if
+ * it keeps erroring past the threshold WHILE it is polled; one starved below the threshold has
+ * its count frozen, unalerted — the accepted "fresh wins, backlog drains" limit #164's rotation
+ * can't overcome either.) A #164-style re-poll rotation for the erroring tier is the natural
+ * follow-up if real data warrants it.
  */
 async function recordPollError(
   order: SubmittedOrderForPolling,
