@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { fulfillmentService } from "@/server/services/fulfillment.service";
 import { MOCK_TERMINAL_FAIL_MARKER } from "@/server/fulfillment";
+import { MOCK_ONHOLD_MARKER } from "@/server/fulfillment/mock";
 import {
   createTestTenant,
   deleteTenantDeep,
@@ -41,8 +42,16 @@ afterAll(async () => {
 
 /** Seed a SUBMITTED + PAID order carrying a provider order id — the poll's
  *  reconcilable state. A unique `externalId` keeps the mock's per-id poll counter
- *  fresh, so the "submitted → shipped" progression is deterministic per test. */
-async function seedSubmittedOrder(tenantId: string, externalId: string) {
+ *  fresh, so the "submitted → shipped" progression is deterministic per test. An
+ *  optional `createdAt` (M4 #155) backdates the order past the stuck-age
+ *  threshold — Prisma allows passing it explicitly on `.create()` despite the
+ *  column's `@default(now())`; omitted, it defaults to now (a normally-
+ *  progressing order, nowhere near the threshold). */
+async function seedSubmittedOrder(
+  tenantId: string,
+  externalId: string,
+  opts: { createdAt?: Date } = {},
+) {
   return prisma.order.create({
     data: {
       tenantId,
@@ -55,6 +64,7 @@ async function seedSubmittedOrder(tenantId: string, externalId: string) {
       fulfillmentProvider: "mock",
       fulfillmentExternalId: externalId,
       fulfillmentStatus: "SUBMITTED",
+      ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
     },
   });
 }
@@ -158,5 +168,64 @@ describe("fulfillmentService.pollOpenShipments (integration, mock provider)", ()
     });
     expect(persisted.fulfillmentStatus).toBe("FAILED");
     expect(persisted.status).toBe("PAID");
+  });
+});
+
+describe("pollOpenShipments — stuck open shipment (#155)", () => {
+  // Comfortably past STUCK_SUBMITTED_THRESHOLD_MS (10 days); a wide margin keeps the
+  // case robust to a threshold tweak (an operator-tunable knob). Age is anchored on
+  // `createdAt`, which `seedSubmittedOrder` backdates. Per the file header, every
+  // assertion below is on THIS order's persisted row — the per-run tally is an
+  // aggregate over the platform-wide poll and is proven in the unit tests instead.
+  const STUCK_AGO = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000);
+
+  it("flags a stuck open shipment once, idempotently, without ever terminalizing it", async () => {
+    const tenant = await freshTenant();
+    // The onhold marker keeps the mock's getTracking in flight on every poll (never a
+    // tracking number, never a terminal failure) — the only way to hold an order open
+    // across polls long enough to observe the age-based stuck check end-to-end (the
+    // plain progression resolves to shipped by the second poll).
+    const externalId = uniqueId(`mock-${MOCK_ONHOLD_MARKER}`);
+    const order = await seedSubmittedOrder(tenant.id, externalId, {
+      createdAt: STUCK_AGO,
+    });
+
+    // Poll 1: past the threshold and never shipping — surfaced as stuck, stamping
+    // `fulfillmentStuckAt`. Deliberately the inverse of the #151 terminal exit: the
+    // order is surfaced but NOT terminalized — still SUBMITTED + PAID, no tracking —
+    // because an onhold order can still ship and must keep being polled.
+    await fulfillmentService.pollOpenShipments();
+    let persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    const stampedAt = persisted.fulfillmentStuckAt;
+    expect(stampedAt).not.toBeNull();
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+    expect(persisted.trackingNumber).toBeNull();
+
+    // Poll 2: already surfaced — idempotent. The stamp does not move (so the operator
+    // isn't re-alerted on every cron tick), and the order is still SUBMITTED + PAID.
+    await fulfillmentService.pollOpenShipments();
+    persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).toEqual(stampedAt);
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("never flags a normally-progressing (recent) order as stuck", async () => {
+    const tenant = await freshTenant();
+    const externalId = uniqueId(`mock-${MOCK_ONHOLD_MARKER}`);
+    // createdAt defaults to now — nowhere near the threshold.
+    const order = await seedSubmittedOrder(tenant.id, externalId);
+
+    await fulfillmentService.pollOpenShipments();
+
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStuckAt,
+    ).toBeNull();
   });
 });

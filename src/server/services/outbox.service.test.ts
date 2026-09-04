@@ -136,6 +136,7 @@ function orderWithItems(o: Partial<OrderWithItems> = {}): OrderWithItems {
     trackingCarrier: null,
     trackingNumber: null,
     trackingUrl: null,
+    fulfillmentStuckAt: null,
     createdAt: NOW,
     updatedAt: NOW,
     items: [orderItem()],
