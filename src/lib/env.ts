@@ -51,6 +51,28 @@ const schema = z.object({
   // `EmailNotConfiguredError`). Never a `NEXT_PUBLIC_*`; read only inside
   // `src/server/fulfillment/**` (the provider selector, `index.ts`).
   PRINTFUL_API_KEY: optionalEnvString,
+  // Stuck-open-shipment age threshold, in DAYS (M4 #162). How long an order may sit
+  // SUBMITTED but un-shipped before the fulfillment poll surfaces it as a STUCK open
+  // shipment for an operator to chase (M4 #155) — a provider hold (`onhold`/`inreview`)
+  // that isn't resolving. OPTIONAL and server-only (read only in
+  // `src/server/services/fulfillment.service.ts`): unset OR blank keeps the built-in
+  // 10-day default, so today's behaviour needs no `.env` entry. Env-tunable so the value
+  // can be adjusted without a deploy once real Printful timing data exists — until then
+  // 10 days is a deliberately generous, still-provisional buffer over Printful's
+  // produce-and-ship window (a tracking number is assigned at carrier handoff, up to
+  // ~a week). Blank/unset reads as unset and takes the default, like `optionalEnvString`
+  // above — but UNLIKE those optional secrets, a present-but-malformed value (non-numeric
+  // or non-positive) fails fast at boot rather than silently falling back: a numeric knob's
+  // well-formedness is checkable up front, and a silent fallback would mask an operator
+  // typo (they'd believe stuck-detection runs at their value while it quietly runs at 10).
+  FULFILLMENT_STUCK_THRESHOLD_DAYS: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const trimmed = value?.trim();
+      return trimmed ? Number(trimmed) : undefined;
+    })
+    .pipe(z.number().positive().default(10)),
   NODE_ENV: z
     .enum(["development", "test", "production"])
     .default("development"),

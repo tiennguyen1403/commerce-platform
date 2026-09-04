@@ -151,7 +151,7 @@ function getTrackingMock() {
 const EXTERNAL_ID = "mock_order_1";
 
 /** A `SubmittedOrderForPolling` row as `findSubmittedForPolling` returns it.
- *  `createdAt` defaults to now — well under the 7-day stuck threshold — so every
+ *  `createdAt` defaults to now — well under the stuck threshold (10 days by default) — so every
  *  pre-existing pollOpenShipments case (which doesn't care about age) stays
  *  "pending"/"shipped"/"failed" as before and is never spuriously flagged stuck;
  *  the stuck-specific tests override it to `STUCK_AGO`. `fulfillmentStuckAt`
