@@ -721,7 +721,13 @@ describe("fulfillmentService.pollOpenShipments — stuck open shipment (#155)", 
 
     const result = await fulfillmentService.pollOpenShipments();
 
-    expect(markFulfillmentStuck).toHaveBeenCalledWith(TENANT, "order_1");
+    // The raw provider status this poll read is threaded through so the marker can
+    // snapshot it into `fulfillmentProviderStatus` for the admin view (#161).
+    expect(markFulfillmentStuck).toHaveBeenCalledWith(
+      TENANT,
+      "order_1",
+      "onhold",
+    );
     expect(markFulfillmentStuck).toHaveBeenCalledOnce();
     // #155 is the deliberate inverse of the #151 terminal-fail exit: the order is
     // surfaced but NOT terminalized — fulfillmentStatus stays SUBMITTED — so neither

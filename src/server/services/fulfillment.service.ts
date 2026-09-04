@@ -384,10 +384,11 @@ async function pollOne(
  * (no shipment, not a terminal failure) has been open too long and, if so, surface it
  * ONCE. "Too long" is `Date.now() - createdAt` past `STUCK_SUBMITTED_THRESHOLD_MS` —
  * a provider hold (`onhold`/`inreview`) that isn't resolving. Idempotency is durable,
- * not per-process: `markFulfillmentStuck` stamps `Order.fulfillmentStuckAt` under a
- * `fulfillmentStuckAt: null` guard, so only the first run across all cron ticks wins,
- * and the pre-read `fulfillmentStuckAt` short-circuits the already-surfaced case
- * without even attempting the write.
+ * not per-process: `markFulfillmentStuck` stamps `Order.fulfillmentStuckAt` (and
+ * snapshots the raw provider status into `fulfillmentProviderStatus` for the admin
+ * view, #161) under a `fulfillmentStuckAt: null` guard, so only the first run across
+ * all cron ticks wins, and the pre-read `fulfillmentStuckAt` short-circuits the
+ * already-surfaced case without even attempting the write.
  *
  * Returns `"stuck"` only on the run that first surfaces the order (stamped + alerted),
  * `"pending"` otherwise — under the threshold, already surfaced, or the guarded write
@@ -408,7 +409,11 @@ async function flagIfStuck(
     return "pending";
   }
 
-  const flagged = await orderRepository.markFulfillmentStuck(tenantId, id);
+  const flagged = await orderRepository.markFulfillmentStuck(
+    tenantId,
+    id,
+    providerStatus,
+  );
   if (!flagged) {
     // Lost the guard: another run stamped it first, or the order left PAID/SUBMITTED
     // (refunded / manually fulfilled) between the select and here — a benign no-op,
@@ -425,8 +430,9 @@ async function flagIfStuck(
   // alerts. ERROR (not warn) for the same reason as those — it's the only severity
   // signal (nothing routes through `reportError`), and a `warn` ages out of Vercel
   // Hobby's 1-hour retention before an operator sees it. `fulfillmentStatus` is left
-  // SUBMITTED on purpose (the order may still ship); the raw provider status + age are
-  // carried for context so the operator knows which hold to chase.
+  // SUBMITTED on purpose (the order may still ship); the raw provider status is
+  // snapshotted to `fulfillmentProviderStatus` for the admin view (#161) and, with the
+  // age, carried in the log line so the operator knows which hold to chase.
   pollLog.error(
     {
       orderId: id,
