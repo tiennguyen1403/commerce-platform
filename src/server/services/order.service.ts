@@ -22,6 +22,7 @@ import {
 } from "@/server/order.errors";
 import { logger } from "@/server/observability/logger";
 import type { CartLine } from "@/lib/cart";
+import type { ShippingAddress } from "@/server/fulfillment/provider";
 
 /**
  * Checkout business logic. Turns a cookie's `{ variantId, qty }[]` into a
@@ -543,6 +544,7 @@ export const orderService = {
     tenantId: string,
     lines: CartLine[],
     email: string,
+    shippingAddress: ShippingAddress,
     currency: string,
     userId: string | null,
   ): Promise<StartCheckoutResult> {
@@ -557,7 +559,19 @@ export const orderService = {
     // session-proven `userId`, a guest on `userId: null` + email — so a guest can't
     // hand back a signed-in shopper's in-flight intent by typing their email.
     const reused = await tryReuseInFlightIntent(tenantId, userId, email, cart);
-    if (reused) return reused;
+    if (reused) {
+      // The reuse match is on cart + identity, not address (#135): a shopper who
+      // edited their address on the re-submit would otherwise ship to the address
+      // the reused order was first written with. Persist the latest one so the most
+      // recent input always wins; the repo write is PENDING-guarded, so a captured
+      // order (raced by the webhook) keeps the address it actually shipped to.
+      await orderRepository.updateShippingAddressForPending(
+        tenantId,
+        reused.orderId,
+        shippingAddress,
+      );
+      return reused;
+    }
 
     const orderId = randomUUID();
     const stripe = getStripe();
@@ -598,6 +612,10 @@ export const orderService = {
         // — never client-supplied. Links a signed-in shopper's order to their
         // global `User`; a guest's stays null (#102).
         userId,
+        // Validated at the action boundary; persisted onto the order in the create
+        // transaction (#135). Stripe never sees it — the PaymentIntent below stays
+        // payment-only, so our form is the single source of shipping truth.
+        shippingAddress,
         totalCents: cart.totalCents,
         currency: cart.currency,
         stripePaymentIntentId: paymentIntent.id,

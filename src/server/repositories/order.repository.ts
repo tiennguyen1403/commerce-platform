@@ -5,6 +5,7 @@ import {
   OrderNumberTakenError,
   InsufficientStockError,
 } from "@/server/order.errors";
+import type { ShippingAddress } from "@/server/fulfillment/provider";
 
 /**
  * Data-access for orders. Every method is scoped by `tenantId` so a store can
@@ -70,11 +71,35 @@ export type CreateOrderInput = {
   email: string;
   /** The authenticated shopper's global `User` id, or null for a guest. */
   userId: string | null;
+  /** The validated shipping destination, written onto the order in the SAME
+   *  transaction as its creation (M4 #135). Field names mirror the
+   *  `ShippingAddress` domain shape; mapped to the flat `ship*` columns below. */
+  shippingAddress: ShippingAddress;
   totalCents: number;
   currency: string;
   stripePaymentIntentId: string;
   items: CreateOrderItemInput[];
 };
+
+/**
+ * Map a `ShippingAddress` to the order's flat `ship*` columns (M4 #135). The
+ * optional `line2`/`state` collapse an absent/blank value to `null` — the column
+ * convention for "not provided" (a guest/legacy order has none) — rather than an
+ * empty string. Required fields arrive already trimmed + non-empty from
+ * `shippingAddressSchema`, the sole validation boundary. Shared by the create and
+ * the reuse-path address update so the two can't drift.
+ */
+function shippingAddressColumns(address: ShippingAddress) {
+  return {
+    shipName: address.name,
+    shipLine1: address.line1,
+    shipLine2: address.line2?.trim() || null,
+    shipCity: address.city,
+    shipState: address.state?.trim() || null,
+    shipPostalCode: address.postalCode,
+    shipCountry: address.country,
+  };
+}
 
 /** Translate the `[tenantId, orderNumber]` unique-constraint failure into a
  *  typed error the service can retry on; rethrow anything else untouched. */
@@ -244,6 +269,9 @@ export const orderRepository = {
               // Null for a guest; a signed-in shopper's global `User` id
               // otherwise (server-resolved upstream, never from the client).
               userId: input.userId,
+              // Shipping destination, flattened onto the order in this SAME
+              // transaction (M4 #135) — no separate write, no order without it.
+              ...shippingAddressColumns(input.shippingAddress),
               totalCents: input.totalCents,
               currency: input.currency,
               stripePaymentIntentId: input.stripePaymentIntentId,
@@ -267,6 +295,28 @@ export const orderRepository = {
     } catch (err) {
       mapWriteError(err);
     }
+  },
+
+  /**
+   * Overwrite a still-PENDING order's shipping address — the reuse-path (#25/#135)
+   * companion to `createWithItems`. When a re-submit reuses an in-flight
+   * PaymentIntent instead of minting a fresh order, the shopper may have edited
+   * their address since it was first written, so the latest submitted address must
+   * win rather than silently shipping to the stale one. Tenant- AND status-scoped
+   * (`updateMany`, not `update` by bare id): only a PENDING order in this tenant is
+   * touched, so a raced PAID/CANCELLED order — or a foreign one — is never
+   * rewritten. Best-effort (no row-count assertion): if the order has already left
+   * PENDING we deliberately leave a captured order's address exactly as it shipped.
+   */
+  async updateShippingAddressForPending(
+    tenantId: string,
+    orderId: string,
+    address: ShippingAddress,
+  ): Promise<void> {
+    await prisma.order.updateMany({
+      where: { id: orderId, tenantId, status: "PENDING" },
+      data: shippingAddressColumns(address),
+    });
   },
 
   /**

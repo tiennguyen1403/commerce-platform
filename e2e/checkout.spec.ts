@@ -84,9 +84,23 @@ test("checkout pays a seeded product; the webhook marks it PAID and decrements s
   await page.getByRole("button", { name: "Checkout" }).click();
   await page.waitForURL(/\/checkout$/);
 
-  // 3) Checkout phase one: the email creates the PaymentIntent + a PENDING order.
+  // 3) Checkout phase one: email + shipping address create the PaymentIntent + a
+  // PENDING order (with the address persisted server-side, #135).
   const email = `e2e-${Date.now()}@example.com`;
+  const ADDRESS = {
+    name: "E2E Tester",
+    line1: "123 Test St",
+    city: "San Francisco",
+    state: "CA",
+    postalCode: "94103",
+  } as const;
   await page.getByLabel("Email").fill(email);
+  await page.getByLabel("Full name", { exact: true }).fill(ADDRESS.name);
+  await page.getByLabel("Address", { exact: true }).fill(ADDRESS.line1);
+  await page.getByLabel("City", { exact: true }).fill(ADDRESS.city);
+  await page.getByLabel("State", { exact: true }).fill(ADDRESS.state);
+  await page.getByLabel("ZIP code", { exact: true }).fill(ADDRESS.postalCode);
+  // Country defaults to the only supported country (US) — no interaction needed.
   await page.getByRole("button", { name: "Continue to payment" }).click();
 
   // 4) Checkout phase two — the REAL Payment Element. With several payment methods
@@ -138,6 +152,14 @@ test("checkout pays a seeded product; the webhook marks it PAID and decrements s
   // the reservation moved. This is precisely what proves the webhook does the work.
   const pending = await readOrderByPaymentIntent(paymentIntentId);
   expect(pending.status).toBe("PENDING");
+  // #135: the shipping address the form collected round-trips onto the order row,
+  // written in the same transaction as order creation.
+  expect(pending.shipName).toBe(ADDRESS.name);
+  expect(pending.shipLine1).toBe(ADDRESS.line1);
+  expect(pending.shipCity).toBe(ADDRESS.city);
+  expect(pending.shipState).toBe(ADDRESS.state);
+  expect(pending.shipPostalCode).toBe(ADDRESS.postalCode);
+  expect(pending.shipCountry).toBe("US");
   const afterReserve = await readVariantBySku(PRODUCT.sku);
   expect(afterReserve.stock).toBe(before.stock);
   expect(afterReserve.reserved).toBe(before.reserved + 1);

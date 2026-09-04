@@ -16,6 +16,7 @@ import {
   OrderTransitionError,
 } from "@/server/order.errors";
 import type { CartItem } from "@/lib/cart";
+import type { ShippingAddress } from "@/server/fulfillment/provider";
 
 /**
  * Unit tests for the checkout service, with Stripe and the order repository
@@ -40,6 +41,7 @@ vi.mock("@/server/repositories/order.repository", () => ({
     cancelPendingAndRelease: vi.fn(),
     markFulfilled: vi.fn(),
     markRefundedByPaymentIntent: vi.fn(),
+    updateShippingAddressForPending: vi.fn(),
   },
 }));
 // The sweep logs through pino; stub it so tests emit no lines and never load pino.
@@ -73,9 +75,22 @@ const findReusable = vi.mocked(orderRepository.findReusablePendingCandidates);
 const cancelRepo = vi.mocked(orderRepository.cancelPendingAndRelease);
 const fulfillRepo = vi.mocked(orderRepository.markFulfilled);
 const markRefunded = vi.mocked(orderRepository.markRefundedByPaymentIntent);
+const updateShipAddr = vi.mocked(
+  orderRepository.updateShippingAddressForPending,
+);
 
 const TENANT = "tenant_1";
 const EMAIL = "shopper@example.com";
+// A valid US shipping address threaded through every startCheckout call (#135).
+const SHIPPING: ShippingAddress = {
+  name: "Ada Lovelace",
+  line1: "1 Analytical Ave",
+  line2: "Apt 2",
+  city: "San Francisco",
+  state: "CA",
+  postalCode: "94103",
+  country: "US",
+};
 // Bound in the service (`MAX_ORDER_NUMBER_ATTEMPTS`); duplicated here as the
 // expected retry ceiling.
 const MAX_ORDER_NUMBER_ATTEMPTS = 5;
@@ -208,6 +223,7 @@ describe("orderService.startCheckout", () => {
       TENANT,
       lines,
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -248,6 +264,14 @@ describe("orderService.startCheckout", () => {
     expect(writeInput.items[0].titleSnapshot).toMatch(/^Tee \S Blue$/);
     // Guest checkout (no signed-in shopper resolved) → userId defaults to null.
     expect(writeInput.userId).toBeNull();
+    // The validated address is threaded straight to the repository create, to be
+    // persisted in the same transaction as the order (#135).
+    expect(writeInput.shippingAddress).toEqual(SHIPPING);
+    // The PaymentIntent stays payment-only — our form is the single source of
+    // shipping truth, so Stripe is never sent an address (#135).
+    expect(paymentIntents.create.mock.calls[0][0]).not.toHaveProperty(
+      "shipping",
+    );
 
     expect(result).toEqual({
       clientSecret: "cs_1",
@@ -273,6 +297,7 @@ describe("orderService.startCheckout", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -302,6 +327,7 @@ describe("orderService.startCheckout", () => {
         TENANT,
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
+        SHIPPING,
         "usd",
         null,
       ),
@@ -326,6 +352,7 @@ describe("orderService.startCheckout", () => {
         TENANT,
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
+        SHIPPING,
         "usd",
         null,
       ),
@@ -353,6 +380,7 @@ describe("orderService.startCheckout", () => {
         TENANT,
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
+        SHIPPING,
         "usd",
         null,
       ),
@@ -368,7 +396,7 @@ describe("orderService.startCheckout", () => {
     );
 
     await expect(
-      orderService.startCheckout(TENANT, [], EMAIL, "usd", null),
+      orderService.startCheckout(TENANT, [], EMAIL, SHIPPING, "usd", null),
     ).rejects.toBeInstanceOf(EmptyCartError);
     expect(paymentIntents.create).not.toHaveBeenCalled();
   });
@@ -386,6 +414,7 @@ describe("orderService.startCheckout", () => {
         TENANT,
         [{ variantId: "v1", qty: 2 }],
         EMAIL,
+        SHIPPING,
         "usd",
         null,
       ),
@@ -406,6 +435,7 @@ describe("orderService.startCheckout", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       "user_123",
     );
@@ -788,6 +818,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -802,6 +833,45 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
     // The whole point: no second PaymentIntent, no second order (nor its hold).
     expect(paymentIntents.create).not.toHaveBeenCalled();
     expect(createWithItems).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the reused order's shipping address so the latest input wins (#135)", async () => {
+    getCartView.mockResolvedValue(cartView());
+    findReusable.mockResolvedValue([reusableCandidate()]);
+    paymentIntents.retrieve.mockResolvedValue({
+      id: "pi_existing",
+      status: "requires_payment_method",
+      amount: 3000,
+      currency: "usd",
+      client_secret: "cs_existing",
+    });
+
+    // The shopper edited their address on the re-submit (same cart, so it still
+    // reuses the in-flight intent).
+    const edited: ShippingAddress = {
+      ...SHIPPING,
+      line1: "999 New Address Rd",
+    };
+    const result = await orderService.startCheckout(
+      TENANT,
+      [{ variantId: "v1", qty: 2 }],
+      EMAIL,
+      edited,
+      "usd",
+      null,
+    );
+
+    expect(result.orderId).toBe("order_existing");
+    // Nothing new is minted…
+    expect(paymentIntents.create).not.toHaveBeenCalled();
+    expect(createWithItems).not.toHaveBeenCalled();
+    // …but the reused PENDING order's address is overwritten with the latest one,
+    // tenant-scoped — so a re-submit that changed the address never ships stale.
+    expect(updateShipAddr).toHaveBeenCalledWith(
+      TENANT,
+      "order_existing",
+      edited,
+    );
   });
 
   it("keys the dedupe read on the RE-PRICED cart total + currency, not a stored one", async () => {
@@ -819,6 +889,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "eur",
       null,
     );
@@ -851,6 +922,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       "user_alice",
     );
@@ -876,6 +948,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -900,6 +973,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -927,6 +1001,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -957,6 +1032,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -985,6 +1061,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -1009,6 +1086,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
@@ -1041,6 +1119,7 @@ describe("orderService.startCheckout — reuse in-flight intent", () => {
       TENANT,
       [{ variantId: "v1", qty: 2 }],
       EMAIL,
+      SHIPPING,
       "usd",
       null,
     );
