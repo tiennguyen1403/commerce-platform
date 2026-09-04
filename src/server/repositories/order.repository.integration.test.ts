@@ -1520,6 +1520,187 @@ describe("orderRepository.markShipped (integration)", () => {
   });
 });
 
+/**
+ * `markFulfillmentFailedAfterSubmission` — the SUBMITTED → FAILED terminal exit the
+ * poll cron drives when the provider cancels/fails an order AFTER submission (#151),
+ * the other one-way door out of SUBMITTED beside `markShipped`. Its guarantees live
+ * in the database: the `{status: PAID, fulfillmentStatus: SUBMITTED}`-guarded
+ * `updateMany` is the idempotency point (a duplicate/racing poll is a no-op) AND the
+ * money-safety guard (a concurrently refunded/manually-fulfilled order is untouched),
+ * and it must flip ONLY `fulfillmentStatus` — leaving `Order.status` PAID and the real
+ * external id intact. A mock can't exercise `updateMany` count semantics or row
+ * locking, so these run against the same Postgres the app uses.
+ */
+describe("orderRepository.markFulfillmentFailedAfterSubmission (integration)", () => {
+  /** Seed a submitted-and-paid order carrying a real external id — the poll's
+   *  reconcilable state (as `markSubmitted` leaves it). */
+  function seedSubmitted(
+    tenantId: string,
+    opts: { status?: OrderStatus; fulfillmentStatus?: FulfillmentStatus } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+  }
+
+  it("flips SUBMITTED → FAILED, persists the provider status, and leaves status PAID + the external id intact", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(true);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("FAILED");
+    expect(persisted.fulfillmentProviderStatus).toBe("canceled");
+    // Order.status stays PAID (an operator refund/re-order decision), and the real
+    // external id is kept — a FAILED order is never polled, so it can't reach
+    // getTracking again (unlike the create-time soft-reject's placeholder id).
+    expect(persisted.status).toBe("PAID");
+    expect(persisted.fulfillmentExternalId).toBe(order.fulfillmentExternalId);
+    // No customer email: a provider cancellation is an operator concern, not a
+    // shipping notification.
+    expect(
+      await prisma.outboxMessage.count({ where: { orderId: order.id } }),
+    ).toBe(0);
+  });
+
+  it("is idempotent — a duplicate poll fails once, then no-ops", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const first = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "failed",
+    );
+    const second = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "failed",
+    );
+    expect(first).toBe(true);
+    // Already FAILED → the guarded updateMany matches nothing on the second call.
+    expect(second).toBe(false);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("FAILED");
+  });
+
+  it("does not fail a REFUNDED order (status guard) — no flip", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after submission, leaving `fulfillmentStatus` at
+    // SUBMITTED. The status guard leaves it alone (it also drops from the poll via
+    // findSubmittedForPolling's own `status: PAID` filter).
+    const order = await seedSubmitted(tenant.id, { status: "REFUNDED" });
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("REFUNDED");
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
+  });
+
+  it("does not fail a manually-FULFILLED order (status guard)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { status: "FULFILLED" });
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("SUBMITTED");
+  });
+
+  it("does not regress an already-SHIPPED order (fulfillmentStatus guard)", async () => {
+    const tenant = await freshTenant();
+    // A shipment reconciled first (SHIPPED + FULFILLED); a late terminal-fail poll
+    // must never undo it.
+    const order = await seedSubmitted(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "SHIPPED",
+    });
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("SHIPPED");
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id);
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      other.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
+  });
+
+  it("fails exactly once under a concurrent double-poll (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    // Two poll runs land at once: row locking on the guarded updateMany must let
+    // exactly one make the transition.
+    const [a, b] = await Promise.all([
+      orderRepository.markFulfillmentFailedAfterSubmission(
+        tenant.id,
+        order.id,
+        "canceled",
+      ),
+      orderRepository.markFulfillmentFailedAfterSubmission(
+        tenant.id,
+        order.id,
+        "canceled",
+      ),
+    ]);
+
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("FAILED");
+  });
+});
+
 describe("orderRepository.listByTenant (integration)", () => {
   it("returns a tenant's orders newest-first with a total", async () => {
     const tenant = await freshTenant();

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   MockProvider,
   MOCK_FAILING_VARIANT_ID,
+  MOCK_TERMINAL_FAIL_MARKER,
 } from "@/server/fulfillment/mock";
 import type {
   CreateFulfillmentInput,
@@ -92,6 +93,38 @@ describe("MockProvider", () => {
       await provider.getTracking(externalId); // submitted
       await provider.getTracking(externalId); // shipped
       expect((await provider.getTracking(externalId)).status).toBe("shipped");
+    });
+
+    it("progresses submitted → terminal failure for a marked external id", async () => {
+      const provider = new MockProvider();
+      // An order whose external id carries the terminal-fail marker is accepted at
+      // create (→ submitted), then reported cancelled — not shipped — so the poll's
+      // terminal-exit path (#151) can be driven deterministically end-to-end.
+      const { externalId } = await provider.createOrder(
+        input({ orderId: `${MOCK_TERMINAL_FAIL_MARKER}_order` }),
+      );
+
+      expect(await provider.getTracking(externalId)).toEqual({
+        status: "submitted",
+      });
+      // Terminal failure: a raw status, the provider-agnostic terminal flag, and NO
+      // tracking number (nothing shipped).
+      expect(await provider.getTracking(externalId)).toEqual({
+        status: "canceled",
+        terminalFailure: true,
+      });
+    });
+
+    it("stays terminally failed on subsequent polls", async () => {
+      const provider = new MockProvider();
+      const { externalId } = await provider.createOrder(
+        input({ orderId: `${MOCK_TERMINAL_FAIL_MARKER}_order` }),
+      );
+      await provider.getTracking(externalId); // submitted
+      await provider.getTracking(externalId); // canceled
+      const info = await provider.getTracking(externalId);
+      expect(info.terminalFailure).toBe(true);
+      expect(info.trackingNumber).toBeUndefined();
     });
   });
 });

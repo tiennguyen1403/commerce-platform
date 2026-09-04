@@ -40,6 +40,18 @@ export interface TrackingInfo {
   trackingNumber?: string;
   trackingUrl?: string;
   status: string;
+  /**
+   * Provider-computed TERMINAL-failure signal (M4 #151): `true` when the provider
+   * reports this order was cancelled/failed *after* submission and will never ship,
+   * so the poll cron can move it to a terminal `FulfillmentStatus.FAILED` instead of
+   * re-polling it forever. Kept provider-agnostic exactly like
+   * `FulfillmentResult.status`: each adapter maps its own raw vocabulary (Printful
+   * `canceled`/`failed`) onto this closed signal, so the service never reads a raw
+   * `status` string for control flow. Absent/`false` means the order is still in
+   * flight (leave it SUBMITTED, re-poll) unless a `trackingNumber` marks it shipped —
+   * a shipment always wins, so a provider never needs to set both.
+   */
+  terminalFailure?: boolean;
 }
 
 /**

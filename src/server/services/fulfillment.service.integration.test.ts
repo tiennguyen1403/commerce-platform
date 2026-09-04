@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { fulfillmentService } from "@/server/services/fulfillment.service";
+import { MOCK_TERMINAL_FAIL_MARKER } from "@/server/fulfillment";
 import {
   createTestTenant,
   deleteTenantDeep,
@@ -113,5 +114,49 @@ describe("fulfillmentService.pollOpenShipments (integration, mock provider)", ()
         where: { orderId: order.id, type: "SHIPPING_CONFIRMATION" },
       }),
     ).toBe(1);
+  });
+
+  it("moves a provider-cancelled order to FAILED over two polls, idempotently", async () => {
+    const tenant = await freshTenant();
+    // An external id carrying the terminal-fail marker: the mock accepts it, then
+    // reports it "canceled" (not shipped) once past the first poll — the poll cron's
+    // terminal-exit path (#151), end-to-end against a real Postgres.
+    const externalId = uniqueId(`mock-${MOCK_TERMINAL_FAIL_MARKER}`);
+    const order = await seedSubmittedOrder(tenant.id, externalId);
+
+    // Poll 1: the mock still reports "submitted" (no tracking) — the order is left
+    // SUBMITTED and nothing is enqueued, exactly like the shipped progression.
+    await fulfillmentService.pollOpenShipments();
+    let persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PAID");
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+
+    // Poll 2: the mock now reports "canceled" (terminal) — reconcile the fulfillment
+    // to FAILED. Order.status STAYS PAID (a refund/re-order is an operator decision),
+    // the raw provider status is persisted for admin display, no tracking is written,
+    // and — unlike a shipment — NO email is enqueued (a cancellation isn't a shopper
+    // notification).
+    await fulfillmentService.pollOpenShipments();
+    persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PAID");
+    expect(persisted.fulfillmentStatus).toBe("FAILED");
+    expect(persisted.fulfillmentProviderStatus).toBe("canceled");
+    expect(persisted.trackingNumber).toBeNull();
+    expect(
+      await prisma.outboxMessage.count({ where: { orderId: order.id } }),
+    ).toBe(0);
+
+    // Poll 3: no longer SUBMITTED, so it drops out of findSubmittedForPolling and is
+    // never re-polled — the whole point of the terminal exit. Idempotent.
+    await fulfillmentService.pollOpenShipments();
+    persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("FAILED");
+    expect(persisted.status).toBe("PAID");
   });
 });

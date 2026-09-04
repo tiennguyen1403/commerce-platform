@@ -477,8 +477,11 @@ export const orderRepository = {
    * Both filters matter. `status: "PAID"` excludes an order that left the paid state
    * after submission — a `refund.succeeded` or a manual FULFILLED both flip `status`
    * only, leaving `fulfillmentStatus` at SUBMITTED — so the poll never wastes a
-   * provider call on an order `markShipped` would refuse anyway (its guard mirrors
-   * this). SUBMITTED is a transient, low-cardinality state (an order ships or fails
+   * provider call on an order its terminal writers would refuse anyway: both
+   * `markShipped` (→ SHIPPED) and `markFulfillmentFailedAfterSubmission` (→ FAILED,
+   * #151) guard on this exact `{status: PAID, fulfillmentStatus: SUBMITTED}` predicate,
+   * so the poll's two exits out of SUBMITTED re-check this filter under the row lock.
+   * SUBMITTED is a transient, low-cardinality state (an order ships or fails
    * out of it), so the unindexed scan stays bounded in practice; if that set ever
    * grows, a `[fulfillmentStatus, status]` index is the natural follow-up. Selects
    * only the fields the poll needs — never the whole row.
@@ -1055,6 +1058,61 @@ export const orderRepository = {
       });
       return true;
     });
+  },
+
+  /**
+   * Move a SUBMITTED order to the terminal FAILED fulfillment state because the
+   * provider reported it cancelled/failed AFTER submission — the poll cron's
+   * terminal-exit analogue of `markShipped` (M4 #151), and its other one-way door
+   * out of SUBMITTED. Without it such an order (the provider will never ship it)
+   * would sit SUBMITTED + PAID forever and be re-polled every run, starving newer
+   * orders behind it (oldest-first batching) and burning provider rate limit on
+   * calls that can never resolve.
+   *
+   * Guarded on `{status: PAID, fulfillmentStatus: SUBMITTED}` — the exact predicate
+   * `findSubmittedForPolling` selects on — so the guarded `updateMany` re-checks the
+   * work-list filter under the row lock, mirroring `markShipped` so the poll's two
+   * terminal transitions (ship / fail) share one precondition. That makes a
+   * duplicate/racing poll a no-op (the order is already FAILED, matches nothing), and
+   * leaves an order that concurrently left PAID — a `refund.succeeded`
+   * (`markRefundedByPaymentIntent`) or manual FULFILLED (`markFulfilled`), both of
+   * which flip only `status` — untouched (it drops from the poll via the status
+   * filter anyway). A single guarded `updateMany` is itself atomic, so no surrounding
+   * transaction is needed (unlike `markShipped`, which must also enqueue an email).
+   *
+   * Deliberately flips ONLY `fulfillmentStatus` → FAILED (plus the raw provider
+   * status for admin display); `Order.status` stays PAID, so an operator can decide
+   * to refund or re-order — the order surfaces as the anomalous pairing "PAID order,
+   * FAILED fulfillment". The real `fulfillmentExternalId` is left intact (a FAILED
+   * order is never polled, so it can't reach `getTracking` again) — unlike the
+   * create-time soft-reject `markFulfillmentFailed`, whose only id was a synthesized
+   * placeholder it deliberately dropped. No customer email is enqueued: a provider
+   * cancellation is an operator decision (refund/re-order), not a shopper
+   * notification. Best-effort + idempotent: a re-run is a guarded no-op.
+   *
+   * Returns whether this call made the transition — `true` for the single poll that
+   * failed it, `false` when nothing moved (already FAILED, or the order left
+   * PAID+SUBMITTED underneath us) — mirroring `markShipped` so `pollOne` treats a
+   * `false` as the same benign no-op it does there.
+   */
+  async markFulfillmentFailedAfterSubmission(
+    tenantId: string,
+    orderId: string,
+    providerStatus: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+      },
+      data: {
+        fulfillmentStatus: "FAILED",
+        fulfillmentProviderStatus: providerStatus,
+      },
+    });
+    return count === 1;
   },
 
   /**

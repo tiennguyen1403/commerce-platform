@@ -16,6 +16,17 @@ import type {
 export const MOCK_FAILING_VARIANT_ID = "MOCK_FAIL";
 
 /**
+ * An `externalId` CONTAINING this marker makes the mock's `getTracking` progression
+ * end in a provider TERMINAL failure (status `"canceled"`, `terminalFailure: true`,
+ * no tracking) instead of a shipment — the post-submission analogue of
+ * `MOCK_FAILING_VARIANT_ID`'s create-time soft rejection (M4 #151). It keys off the
+ * external id (all `getTracking` ever receives), so a caller drives the poll cron's
+ * terminal-exit path deterministically by giving a SUBMITTED order a
+ * `fulfillmentExternalId` that carries it (e.g. `uniqueId("mock-TERMINAL_FAIL")`).
+ */
+export const MOCK_TERMINAL_FAIL_MARKER = "TERMINAL_FAIL";
+
+/**
  * A deterministic, in-memory `FulfillmentProvider` — the CI/test default and dev
  * fallback (no `PRINTFUL_API_KEY` needed), and the reason everything above the
  * provider boundary is buildable before the real Printful adapter exists
@@ -25,7 +36,10 @@ export const MOCK_FAILING_VARIANT_ID = "MOCK_FAIL";
  * normal order, or `"failed"` when any line carries `MOCK_FAILING_VARIANT_ID`.
  * `getTracking` returns a canned progression per `externalId` — `"submitted"` on
  * the first poll, then `"shipped"` with a fake carrier + tracking on later polls —
- * so a polling caller (the M4 poll cron) observes a shipment appear over time.
+ * so a polling caller (the M4 poll cron) observes a shipment appear over time. An
+ * external id carrying `MOCK_TERMINAL_FAIL_MARKER` instead progresses `"submitted"`
+ * → a provider TERMINAL failure (`"canceled"`, `terminalFailure: true`, no tracking),
+ * the deterministic handle on the poll's terminal-exit path (#151).
  * The progression is per-instance state, so treat one `MockProvider` as one
  * process's provider (the selector memoizes a singleton for exactly this reason).
  */
@@ -56,6 +70,12 @@ export class MockProvider implements FulfillmentProvider {
     // First poll: the provider accepted the order but hasn't shipped it yet.
     if (polls < 2) {
       return { status: "submitted" };
+    }
+    // Terminal-failure progression (#151): a marked external id is cancelled/failed
+    // after submission rather than shipped — no tracking number, flagged terminal so
+    // the poll moves it to FulfillmentStatus.FAILED instead of re-polling it forever.
+    if (externalId.includes(MOCK_TERMINAL_FAIL_MARKER)) {
+      return { status: "canceled", terminalFailure: true };
     }
     // Shipped: a canned carrier + tracking, deterministic from the external id.
     return {

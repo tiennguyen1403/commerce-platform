@@ -55,6 +55,22 @@ const REQUEST_TIMEOUT_MS = 15_000;
  */
 const REJECTED_ORDER_STATUSES = new Set(["failed", "canceled"]);
 
+/**
+ * Printful `status` values that mean the order has terminally failed *after* a
+ * successful submission — the poll-side analogue of `REJECTED_ORDER_STATUSES`
+ * (M4 #151). When `getTracking` reads one of these, the order will never ship, so
+ * the poll cron flags it (`TrackingInfo.terminalFailure`) and reconciles it to a
+ * terminal `FulfillmentStatus.FAILED` rather than re-polling it forever. Kept a
+ * SEPARATE set from the create-side rejection above — a create-time soft rejection
+ * (a 200 that already reads `failed`/`canceled`) and a post-submission terminal
+ * failure are distinct lifecycle points that just happen to share a vocabulary
+ * today, and each should stay independently evolvable. Everything else — `pending`,
+ * `inprocess`, `onhold`, `partial`, `draft`, `inreview`, … — is in flight or shipped
+ * (a shipment is signalled by a tracking number, not the status), so it is NOT
+ * terminal and the order stays SUBMITTED for the next poll.
+ */
+const TERMINAL_FAILURE_STATUSES = new Set(["failed", "canceled"]);
+
 // --- Response shapes. Printful's payloads are external input, so they're validated
 // with zod (repo convention). Only the fields we read are declared; zod strips the
 // many others Printful returns. Tracking fields are `nullish` — an unshipped order
@@ -215,6 +231,15 @@ export class PrintfulProvider implements FulfillmentProvider {
     // `Order.fulfillmentProviderStatus` (admin display only); our own closed
     // `FulfillmentStatus` enum is derived from it upstream, never here.
     const tracking: TrackingInfo = { status: result.status };
+
+    // Map Printful's raw status onto the closed `terminalFailure` signal (M4 #151),
+    // the poll-side analogue of the create path's soft rejection: a `canceled`/`failed`
+    // order has terminally failed after submission and will never ship, so the poll
+    // reconciles it to FAILED instead of re-polling it forever. Set only when true so
+    // an in-flight/shipped order's `TrackingInfo` carries no spurious flag.
+    if (TERMINAL_FAILURE_STATUSES.has(result.status)) {
+      tracking.terminalFailure = true;
+    }
 
     // An order can have multiple shipments (partial fulfillment, `status: "partial"`);
     // `TrackingInfo` carries one tracking set, so surface the first — a known,

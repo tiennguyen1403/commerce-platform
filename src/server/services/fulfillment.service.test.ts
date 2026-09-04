@@ -41,6 +41,7 @@ vi.mock("@/server/repositories/order.repository", () => ({
     markFulfillmentFailed: vi.fn(),
     findSubmittedForPolling: vi.fn(),
     markShipped: vi.fn(),
+    markFulfillmentFailedAfterSubmission: vi.fn(),
   },
 }));
 
@@ -53,6 +54,9 @@ const findSubmittedForPolling = vi.mocked(
   orderRepository.findSubmittedForPolling,
 );
 const markShipped = vi.mocked(orderRepository.markShipped);
+const markFulfillmentFailedAfterSubmission = vi.mocked(
+  orderRepository.markFulfillmentFailedAfterSubmission,
+);
 
 const TENANT = "tenant_1";
 
@@ -127,6 +131,7 @@ beforeEach(() => {
   markFulfillmentFailed.mockResolvedValue(undefined);
   findSubmittedForPolling.mockResolvedValue([]);
   markShipped.mockResolvedValue(true);
+  markFulfillmentFailedAfterSubmission.mockResolvedValue(true);
 });
 
 /** The spied `createOrder`, typed for `.mock`/`toHaveBeenCalled*` assertions. */
@@ -413,6 +418,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     // The shipped order is reported back for the route's immediate email dispatch.
     expect(result).toEqual({
       shipped: 1,
+      failed: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
@@ -447,9 +453,86 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(markShipped).not.toHaveBeenCalled();
     expect(result).toEqual({
       shipped: 0,
+      failed: 0,
       pending: 1,
       errored: 0,
       shippedOrders: [],
+    });
+  });
+
+  it("reconciles a provider terminal failure to FAILED (no tracking number, flagged terminal)", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    // The provider cancelled/failed the order after submission: no tracking number,
+    // but the adapter flags it terminal (the provider-agnostic signal). It must move
+    // to FAILED — not be treated as still-in-flight "pending" and re-polled forever.
+    getTrackingMock().mockResolvedValue({
+      status: "canceled",
+      terminalFailure: true,
+    });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    // The raw provider status is persisted for admin display; status stays PAID (the
+    // repo method owns that) so an operator can refund/re-order.
+    expect(markFulfillmentFailedAfterSubmission).toHaveBeenCalledWith(
+      TENANT,
+      "order_1",
+      "canceled",
+    );
+    // Never a shipment — no markShipped, and it is NOT reported for an email dispatch.
+    expect(markShipped).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 1,
+      pending: 0,
+      errored: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("counts a terminal-fail race (markFulfillmentFailedAfterSubmission=false) as pending", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    getTrackingMock().mockResolvedValue({
+      status: "failed",
+      terminalFailure: true,
+    });
+    // The guarded reconcile matched nothing — the order left PAID+SUBMITTED (refunded
+    // or manually fulfilled) between the find and the write. Mirrors the markShipped
+    // race: a benign no-op counted as pending, not a failure we caused this run.
+    markFulfillmentFailedAfterSubmission.mockResolvedValue(false);
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markFulfillmentFailedAfterSubmission).toHaveBeenCalledOnce();
+    expect(result).toEqual({
+      shipped: 0,
+      failed: 0,
+      pending: 1,
+      errored: 0,
+      shippedOrders: [],
+    });
+  });
+
+  it("prefers a shipment over a terminal-fail flag (tracking number wins)", async () => {
+    findSubmittedForPolling.mockResolvedValue([submitted()]);
+    // A defensive edge: a tracking number is present — the order shipped, so it is
+    // reconciled to SHIPPED regardless of any terminal-fail flag also being set.
+    getTrackingMock().mockResolvedValue({
+      status: "fulfilled",
+      trackingNumber: "TN-1",
+      terminalFailure: true,
+    });
+
+    const result = await fulfillmentService.pollOpenShipments();
+
+    expect(markShipped).toHaveBeenCalledOnce();
+    expect(markFulfillmentFailedAfterSubmission).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      shipped: 1,
+      failed: 0,
+      pending: 0,
+      errored: 0,
+      shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
     });
   });
 
@@ -462,6 +545,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(markShipped).not.toHaveBeenCalled();
     expect(result).toEqual({
       shipped: 0,
+      failed: 0,
       pending: 0,
       errored: 1,
       shippedOrders: [],
@@ -483,6 +567,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(markShipped).toHaveBeenCalledOnce();
     expect(result).toEqual({
       shipped: 0,
+      failed: 0,
       pending: 1,
       errored: 0,
       shippedOrders: [],
@@ -500,6 +585,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(markShipped).not.toHaveBeenCalled();
     expect(result).toEqual({
       shipped: 0,
+      failed: 0,
       pending: 0,
       errored: 1,
       shippedOrders: [],
@@ -526,6 +612,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     // Only the successfully-reconciled order (o2) is reported for dispatch.
     expect(result).toEqual({
       shipped: 1,
+      failed: 0,
       pending: 0,
       errored: 1,
       shippedOrders: [{ tenantId: TENANT, orderId: "o2" }],
@@ -540,6 +627,7 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     expect(findSubmittedForPolling).not.toHaveBeenCalled();
     expect(result).toEqual({
       shipped: 0,
+      failed: 0,
       pending: 0,
       errored: 0,
       shippedOrders: [],

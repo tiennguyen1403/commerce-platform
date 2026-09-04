@@ -298,6 +298,45 @@ describe("PrintfulProvider", () => {
       });
     });
 
+    it("flags a 'canceled' order as a terminal failure (no tracking)", async () => {
+      // The provider cancelled the order after submission — the poll's terminal-exit
+      // signal (#151). The raw status is kept for display; `terminalFailure` is the
+      // provider-agnostic flag the service reads.
+      fetchMock.mockResolvedValue(
+        jsonResponse(200, {
+          result: { id: 3, status: "canceled", shipments: [] },
+        }),
+      );
+
+      expect(await new PrintfulProvider().getTracking("3")).toEqual({
+        status: "canceled",
+        terminalFailure: true,
+      });
+    });
+
+    it("flags a 'failed' order as a terminal failure", async () => {
+      fetchMock.mockResolvedValue(
+        jsonResponse(200, { result: { id: 4, status: "failed" } }),
+      );
+
+      expect(await new PrintfulProvider().getTracking("4")).toEqual({
+        status: "failed",
+        terminalFailure: true,
+      });
+    });
+
+    it("does not flag an in-flight status (e.g. onhold) as terminal", async () => {
+      // `onhold` is transient, not terminal — the order stays SUBMITTED and is
+      // re-polled, so no `terminalFailure` flag leaks onto its TrackingInfo.
+      fetchMock.mockResolvedValue(
+        jsonResponse(200, { result: { id: 5, status: "onhold" } }),
+      );
+
+      const info = await new PrintfulProvider().getTracking("5");
+      expect(info).toEqual({ status: "onhold" });
+      expect(info.terminalFailure).toBeUndefined();
+    });
+
     it("throws on a non-2xx (e.g. 404 unknown order)", async () => {
       fetchMock.mockResolvedValue(
         jsonResponse(404, { code: 404, result: "Not Found" }),
