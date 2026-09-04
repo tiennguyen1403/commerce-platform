@@ -38,6 +38,21 @@ export interface CreateFulfillmentInput {
   orderId: string;
   items: FulfillmentLineItem[];
   shippingAddress: ShippingAddress;
+  /**
+   * The order's currency (`Order.currency`; lowercase ISO 4217, Stripe's
+   * convention). Order-level, never per-line — a cart/order is single-currency by
+   * construction (currency lives on `Tenant`, not the variant), so every line
+   * shares it. An adapter uses it to tell the provider which currency the per-item
+   * retail prices (`FulfillmentLineItem.priceCents`) are in, so a tenant whose
+   * currency differs from the provider account's default frames the packing slip in
+   * the ORDER's currency instead of that default (M4 #157) — otherwise Printful
+   * reads a bare `retail_price` in its single store's currency and mis-frames the
+   * slip. Stays the raw domain code on the seam: the adapter is the only place it
+   * becomes the provider's expected form (Printful's uppercase
+   * `retail_costs.currency`), and only at the outbound HTTP boundary — the currency
+   * twin of `priceCents`'s cents→decimal crossing.
+   */
+  currency: string;
 }
 
 export interface FulfillmentResult {

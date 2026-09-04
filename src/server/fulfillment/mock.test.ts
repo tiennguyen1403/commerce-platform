@@ -39,6 +39,7 @@ function input(
       },
     ],
     shippingAddress: ADDRESS,
+    currency: "usd",
     ...o,
   };
 }

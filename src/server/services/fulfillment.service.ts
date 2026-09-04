@@ -477,6 +477,11 @@ async function runSubmission(tenantId: string, orderId: string): Promise<void> {
     orderId: order.id,
     items: toLineItems(order),
     shippingAddress: toShippingAddress(order),
+    // The order's own currency (snapshot on the Order, from the tenant's store
+    // currency), carried so the adapter can frame the packing slip's retail prices
+    // in it rather than the provider account's default (M4 #157). Order-level:
+    // single-currency by construction, so it rides on the input, not each line.
+    currency: order.currency,
   };
 
   // Layer-2 idempotency guard: only the caller that flips NOT_SUBMITTED → SUBMITTING

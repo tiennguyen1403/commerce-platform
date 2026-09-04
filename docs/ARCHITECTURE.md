@@ -199,5 +199,17 @@ AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
   protocol-relative _result_ (`"/..//evil.com"` → `"//evil.com"`); the guard now
   re-resolves the returned path the way the router will and rejects it if that no
   longer lands on the same origin.
+- **Multi-currency fulfillment: send the packing-slip display currency; defer per-store
+  settlement** (M4, #157) — the per-item retail prices we print on the Printful slip (#148)
+  are framed in the order's own currency via Printful v1's `retail_costs.currency`, the
+  _only_ per-order currency lever the API exposes (there is no top-level order `currency`
+  field). Without it, a tenant whose `Tenant.currency` differs from the single platform
+  Printful store's default gets a numerically-correct but wrong-currency slip. We send
+  currency **only** — no `subtotal`/`shipping`/`tax`: it relabels the slip without
+  reintroducing the aggregate-cost breakdown #148 deferred (a partial one would misstate the
+  totals), and Printful still bills the store owner in the store's own currency (the
+  read-only `costs`). True per-currency _settlement_ — a Printful store per currency, or
+  Stripe Connect payouts — stays the deferred single-account upgrade (see §2, "Stripe
+  Connect remains a deliberately deferred upgrade").
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).
