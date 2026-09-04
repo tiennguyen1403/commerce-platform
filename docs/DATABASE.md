@@ -28,6 +28,29 @@ migrations replay in order while the table is still empty; the failure only appe
 staging/production, not a clean local DB. The `single_currency_per_tenant` migration shows
 the safe form: `ADD COLUMN "currency" TEXT NOT NULL DEFAULT 'usd'`.
 
+### Adding columns & enum values (the M4 fulfillment migration)
+
+`20260904042456_fulfillment` is the canonical _additive_ change — safe on the non-empty
+`Order`/`ProductVariant` tables by construction, so every existing row migrates with no
+manual backfill:
+
+- **Nullable columns** always backfill as `NULL`: `Order.shipName … shipCountry`,
+  `fulfillmentProvider`, `fulfillmentExternalId`, `fulfillmentProviderStatus`,
+  `trackingCarrier` / `trackingNumber` / `trackingUrl`, and
+  `ProductVariant.providerVariantId`.
+- **A `NOT NULL` column needs a `DEFAULT`.** The only one here, `fulfillmentStatus`, ships
+  `NOT NULL` with a `DEFAULT` of `'NOT_SUBMITTED'`, so `pnpm db:check-migrations` passes and
+  existing PAID/FULFILLED rows backfill to `NOT_SUBMITTED`.
+- **A new enum and new enum values are additive too:** creating `FulfillmentStatus` and
+  `ALTER TYPE "OutboxMessageType" ADD VALUE` (×2 — `FULFILLMENT_SUBMISSION` +
+  `SHIPPING_CONFIRMATION`) touch no rows. Prisma warns that PostgreSQL **11 and earlier**
+  can't add more than one enum value in a single migration; we run **16**, so both values
+  ship in one file. Removing or renaming an enum value **is** destructive — hand-author it
+  and follow `/db-change`, the same as a column drop.
+
+Per-field intent lives in `prisma/schema.prisma`'s comments; the fulfillment behaviour these
+columns support is in `docs/ARCHITECTURE.md` §6 and `docs/milestones/M4-fulfillment/`.
+
 ## Deploying onto a database seeded before a migration
 
 If `prisma migrate deploy` aborts with `column "…" contains null values` (and blocks later
