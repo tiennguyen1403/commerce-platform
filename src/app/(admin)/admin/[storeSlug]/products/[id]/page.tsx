@@ -29,6 +29,8 @@ export default async function EditProductPage({
       id: v.id,
       sku: v.sku,
       name: v.name,
+      // Read back the current mapping; null (unmapped) shows as an empty field.
+      providerVariantId: v.providerVariantId ?? "",
       price: (v.priceCents / 100).toFixed(2),
       stock: String(v.stock),
       // A variant already referenced by an order can't be deleted; the form

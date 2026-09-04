@@ -11,7 +11,9 @@ const EMPTY_PRODUCT: ProductFormValues = {
   slug: "",
   description: "",
   status: "DRAFT",
-  variants: [{ sku: "", name: "", price: "", stock: "0" }],
+  variants: [
+    { sku: "", name: "", providerVariantId: "", price: "", stock: "0" },
+  ],
 };
 
 export default async function NewProductPage({
