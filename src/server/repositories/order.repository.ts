@@ -40,11 +40,13 @@ export type StalePendingOrder = {
  *  the anomalous null rather than call the provider with an empty id.
  *
  *  `createdAt` + `fulfillmentStuckAt` feed the stuck-open-shipment check (M4 #155):
- *  `createdAt` is the age anchor — already the query's oldest-first `orderBy` key and
- *  immutable, so age reads straight off the batch order (see the threshold constant in
- *  `fulfillment.service.ts` for why creation time, not submission time, is the anchor) —
- *  and `fulfillmentStuckAt` (null until the poll first surfaces the order as stuck) lets
- *  the poll skip re-alerting one it already flagged. */
+ *  `createdAt` is the age anchor — immutable, so age reads straight off the row (see the
+ *  threshold constant in `fulfillment.service.ts` for why creation time, not submission
+ *  time, is the anchor) — and `fulfillmentStuckAt` (null until the poll first surfaces the
+ *  order as stuck) lets the poll skip re-alerting one it already flagged. Since #158
+ *  `fulfillmentStuckAt` is also the batch's PRIMARY sort key (flagged rows sort to the
+ *  tail so a never-resolving hold can't starve fresh orders — see `findSubmittedForPolling`),
+ *  with `createdAt` the secondary (oldest-first within each group). */
 export type SubmittedOrderForPolling = {
   id: string;
   tenantId: string;
@@ -490,24 +492,45 @@ export const orderRepository = {
    * `markShipped` (→ SHIPPED) and `markFulfillmentFailedAfterSubmission` (→ FAILED,
    * #151) guard on this exact `{status: PAID, fulfillmentStatus: SUBMITTED}` predicate,
    * so the poll's two exits out of SUBMITTED re-check this filter under the row lock.
-   * SUBMITTED is a transient, low-cardinality state (an order ships or fails
-   * out of it), so the unindexed scan stays bounded in practice; if that set ever
-   * grows, a `[fulfillmentStatus, status]` index is the natural follow-up. Selects
+   * SUBMITTED is a transient, low-cardinality state (an order ships or fails out of
+   * it), served by the `[fulfillmentStatus, status]` index (#158, added once a hold
+   * that never resolves — see the ordering below — could let the set grow). Selects
    * only the fields the poll needs — never the whole row.
+   *
+   * Ordering deprioritises a flagged-stuck order (M4 #158). A #155-flagged hold stays
+   * SUBMITTED (it may still ship, so #155 alerts but keeps polling it); left oldest-
+   * first it would sit at the FRONT of every batch forever — one wasted `getTracking`
+   * per run and, once enough accumulate, crowding fresh orders out of the batch limit
+   * / time budget, so their shipments never reconcile (the liveness problem #151's
+   * terminal exit was built to avoid). `fulfillmentStuckAt` is null until the poll
+   * first surfaces an order as stuck, so `nulls: "first"` floats every not-yet-flagged
+   * order ahead of every flagged one — fresh orders always poll first — while flagged
+   * rows fill the tail (oldest-flagged first). A flagged order is never dropped from the
+   * work list (the predicate is unchanged — the #155 invariant: deprioritise, don't
+   * drop), so it keeps polling and reconciles if its hold ships. (`fulfillmentStuckAt`
+   * is write-once, so the tail order is stable across runs: a pathological backlog of
+   * more than `POLL_BATCH_SIZE` holds could push the newest-flagged past the batch limit
+   * — a bounded, self-healing reconcile delay WITHIN the flagged group, deferred to #164;
+   * fresh-order liveness is unaffected.)
    */
   findSubmittedForPolling(limit: number): Promise<SubmittedOrderForPolling[]> {
     return prisma.order.findMany({
       where: { status: "PAID", fulfillmentStatus: "SUBMITTED" },
-      orderBy: { createdAt: "asc" },
+      orderBy: [
+        // Not-yet-flagged (null) first, then flagged-stuck last — #158 deprioritises a
+        // never-resolving hold so it can't starve fresh orders (see the doc comment).
+        { fulfillmentStuckAt: { sort: "asc", nulls: "first" } },
+        { createdAt: "asc" },
+      ],
       take: limit,
       select: {
         id: true,
         tenantId: true,
         fulfillmentExternalId: true,
         // Age anchor + already-surfaced marker for the stuck-open-shipment check
-        // (#155). An order past the threshold that isn't yet flagged is re-polled
-        // like any other (a hold can still resolve to a shipment), so it stays in
-        // this same `{PAID, SUBMITTED}` work list — only the alert is one-shot.
+        // (#155), and — since #158 — the batch's primary sort key: a flagged order is
+        // re-polled like any other (a hold can still resolve to a shipment), so it
+        // stays in this same `{PAID, SUBMITTED}` work list, just sorted to the tail.
         createdAt: true,
         fulfillmentStuckAt: true,
       },

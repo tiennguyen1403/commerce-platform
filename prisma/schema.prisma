@@ -338,6 +338,20 @@ model Order {
   // createdAt] serves the `status = 'PENDING'` filter + `createdAt` ordering
   // directly (mirrors the outbox's [status, nextAttemptAt] drain index).
   @@index([status, createdAt])
+  // Poll-fulfillment cron work list (`findSubmittedForPolling`, #140/#158): the
+  // platform-wide `{fulfillmentStatus: 'SUBMITTED', status: 'PAID'}` scan. Serves the
+  // two-equality filter — the dominant cost as the SUBMITTED set grows with
+  // accumulating provider holds, the exact scenario #158 addresses (the method's own
+  // doc comment had flagged this as the natural follow-up "if that set ever grows").
+  // `fulfillmentStatus` leads both because SUBMITTED is transient and low-cardinality
+  // (a selective first term) and — the stronger reason — for non-redundancy with the
+  // `[status, createdAt]` index above: a `status`-leading composite would overlap it,
+  // whereas for this two-equality predicate the index seek localises equally whichever
+  // term leads. The residual `fulfillmentStuckAt NULLS FIRST, createdAt` ordering (#158
+  // deprioritises flagged-stuck rows to the tail) runs as a cheap sort over the small
+  // filtered set — Prisma can't express NULLS FIRST in an index (only the runtime
+  // `orderBy` can), and the filtered set is small, so covering the sort isn't worth it.
+  @@index([fulfillmentStatus, status])
 }
 
 model OrderItem {

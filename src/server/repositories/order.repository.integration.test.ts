@@ -2091,6 +2091,42 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
     expect(mineInOrder).toEqual([a1.id, b1.id, a2.id]);
   });
 
+  it("deprioritises flagged-stuck orders to the tail — not-yet-flagged first, then oldest-flagged (#158)", async () => {
+    const t = await freshTenant();
+    // Two not-yet-flagged (fulfillmentStuckAt = null) orders, and two flagged-stuck
+    // ones whose `createdAt` is OLDER than both fresh orders — pre-#158 (oldest-first
+    // only) the flagged pair would poll first every run and, if the hold never
+    // resolves, starve the fresh orders. Flag order is the inverse of createdAt order
+    // (stuckA is oldest-created but flagged most recently) to prove the tail sorts by
+    // `fulfillmentStuckAt`, not `createdAt`.
+    const freshOld = await seedSubmitted(t.id, { createdAt: minsAgo(200) });
+    const freshNew = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
+    const stuckA = await seedSubmitted(t.id, { createdAt: minsAgo(500) });
+    const stuckB = await seedSubmitted(t.id, { createdAt: minsAgo(400) });
+    await prisma.order.update({
+      where: { id: stuckA.id },
+      data: { fulfillmentStuckAt: minsAgo(30) },
+    });
+    await prisma.order.update({
+      where: { id: stuckB.id },
+      data: { fulfillmentStuckAt: minsAgo(90) },
+    });
+
+    const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
+      .map((o) => o.id)
+      .filter((id) =>
+        [freshOld.id, freshNew.id, stuckA.id, stuckB.id].includes(id),
+      );
+    // Not-yet-flagged first (oldest createdAt first), THEN flagged-stuck (oldest
+    // `fulfillmentStuckAt` first) — even though stuckA/stuckB were created first.
+    expect(mineInOrder).toEqual([
+      freshOld.id,
+      freshNew.id,
+      stuckB.id,
+      stuckA.id,
+    ]);
+  });
+
   it("excludes orders whose fulfillmentStatus isn't SUBMITTED", async () => {
     const t = await freshTenant();
     const submitted = await seedSubmitted(t.id);
