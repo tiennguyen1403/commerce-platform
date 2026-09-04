@@ -150,6 +150,49 @@ export function fulfillmentAttention(
   return null;
 }
 
+/**
+ * Whether — and how — an order needs attention because the poll cron can't READ its
+ * tracking, or null when there's nothing to surface. The erroring-open-shipment sibling
+ * of `fulfillmentAttention`'s stuck-hold branch (M4 #171, surfacing the #163 streak):
+ * `pollOne` bumps `Order.fulfillmentErrorCount` every run `getTracking` throws (a
+ * bad/stale provider id or a provider-side fault) and resets it to 0 on any clean poll,
+ * so a non-zero count means the most recent poll(s) couldn't read this shipment's status.
+ *
+ * Distinct from the stuck-hold surface (#155/#161, `fulfillmentAttention`): there the
+ * provider ACCEPTED the order and is holding it (`onhold`/`inreview`) past the age
+ * threshold — the status is readable, just not shipping; here the provider CALL itself is
+ * failing — the status is unreadable. They're independent signals that can both fire on
+ * one order (a shipment held for weeks whose id then starts erroring), so this is a
+ * separate helper the page renders as its own callout, not a branch of `fulfillmentAttention`
+ * that would hide one behind the other.
+ *
+ * Gated on SUBMITTED (an open shipment) AND a non-zero streak. Unlike the write-once
+ * `fulfillmentStuckAt` (which lingers after a flagged order ships — see the SUBMITTED
+ * guard in `fulfillmentAttention`), `fulfillmentErrorCount` is reset on any clean poll,
+ * so this clears itself the moment tracking recovers — the SUBMITTED guard only covers
+ * the belt-and-braces case of a stale non-zero count on an order that left the poll's
+ * work list some other way. The count is surfaced verbatim so the copy scales with the
+ * streak (one failed lookup reads very differently from a day of them) without this
+ * client-safe module needing the server-only alert threshold.
+ *
+ * Pure and client-safe (raw `fulfillmentStatus` + the numeric count), so it's
+ * unit-testable and the admin page just renders the result.
+ */
+export function fulfillmentErrorAttention(
+  status: FulfillmentStatusValue,
+  errorCount: number,
+): FulfillmentAttention | null {
+  if (status !== "SUBMITTED" || errorCount <= 0) return null;
+  const lead =
+    errorCount === 1
+      ? "The last attempt to read this shipment’s tracking from the provider failed"
+      : `The last ${errorCount} attempts to read this shipment’s tracking from the provider failed`;
+  return {
+    title: "Tracking lookups are failing",
+    description: `${lead} — the lookup call itself is erroring, so this shipment’s status can’t be read right now. That usually means a bad or stale provider order ID or a provider-side fault. It’s still being polled and may recover, but check the provider dashboard; if the lookups keep failing, refund the shopper or re-order.`,
+  };
+}
+
 /** A shopper-facing view of an order's shipment for the account detail page. */
 export type ShopperShipmentView = { label: string; description: string };
 

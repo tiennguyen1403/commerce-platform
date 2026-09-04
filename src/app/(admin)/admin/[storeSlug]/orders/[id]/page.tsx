@@ -1,7 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, ExternalLink, TriangleAlert } from "lucide-react";
+import {
+  ArrowLeft,
+  ExternalLink,
+  SearchX,
+  TriangleAlert,
+  type LucideIcon,
+} from "lucide-react";
 import { requireAdminContext } from "@/server/auth/admin-context";
 import { orderService } from "@/server/services/order.service";
 import { ROLES, hasAtLeast } from "@/config/roles";
@@ -13,6 +19,7 @@ import {
   ORDER_STATUS_LABELS,
   formatShippingAddressLines,
   fulfillmentAttention,
+  fulfillmentErrorAttention,
   trackingHref,
 } from "@/lib/validators/orders";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +35,31 @@ import {
 import { OrderActions } from "../order-actions";
 
 export const metadata: Metadata = { title: "Order" };
+
+/** A needs-attention callout in the Fulfillment card. The icon distinguishes the
+ *  concern at a glance — a failed/stuck order (`TriangleAlert`) vs. unreadable tracking
+ *  (`SearchX`) — over a shared destructive treatment; the title/description come from a
+ *  pure `FulfillmentAttention` helper. Decorative icon (`aria-hidden`): the title carries
+ *  the meaning. */
+function FulfillmentAlert({
+  icon: Icon,
+  title,
+  description,
+}: {
+  icon: LucideIcon;
+  title: string;
+  description: string;
+}) {
+  return (
+    <div className="border-destructive/30 bg-destructive/10 flex gap-3 rounded-lg border p-4 text-sm">
+      <Icon className="text-destructive mt-0.5 size-5 shrink-0" aria-hidden />
+      <div className="flex flex-col gap-1">
+        <p className="text-foreground font-medium">{title}</p>
+        <p className="text-muted-foreground">{description}</p>
+      </div>
+    </div>
+  );
+}
 
 export default async function OrderDetailPage({
   params,
@@ -54,6 +86,13 @@ export default async function OrderDetailPage({
   const attention = fulfillmentAttention(
     fulfillmentStatus,
     order.fulfillmentStuckAt,
+  );
+  // A separate, independent callout: the poll cron can't READ this order's tracking
+  // (the #163 error streak), distinct from `attention`'s stuck-hold (the provider is
+  // holding a readable order). Both can fire at once, so they render side by side.
+  const errorAttention = fulfillmentErrorAttention(
+    fulfillmentStatus,
+    order.fulfillmentErrorCount,
   );
   const addressLines = formatShippingAddressLines(order);
   const trackingUrl = trackingHref(order.trackingUrl);
@@ -155,16 +194,18 @@ export default async function OrderDetailPage({
         </CardHeader>
         <CardContent className="flex flex-col gap-5">
           {attention ? (
-            <div className="border-destructive/30 bg-destructive/10 flex gap-3 rounded-lg border p-4 text-sm">
-              <TriangleAlert
-                className="text-destructive mt-0.5 size-5 shrink-0"
-                aria-hidden
-              />
-              <div className="flex flex-col gap-1">
-                <p className="text-foreground font-medium">{attention.title}</p>
-                <p className="text-muted-foreground">{attention.description}</p>
-              </div>
-            </div>
+            <FulfillmentAlert
+              icon={TriangleAlert}
+              title={attention.title}
+              description={attention.description}
+            />
+          ) : null}
+          {errorAttention ? (
+            <FulfillmentAlert
+              icon={SearchX}
+              title={errorAttention.title}
+              description={errorAttention.description}
+            />
           ) : null}
 
           <dl className="grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
@@ -231,6 +272,18 @@ export default async function OrderDetailPage({
               <div className="flex flex-col gap-1">
                 <dt className="text-muted-foreground">Flagged stuck</dt>
                 <dd>{formatDate(order.fulfillmentStuckAt, true)}</dd>
+              </div>
+            ) : null}
+            {errorAttention ? (
+              // The raw streak behind the erroring callout — gated on the same helper so
+              // the row and the callout can't drift. Unlike the write-once stuck marker
+              // above, the count resets on any clean poll, so this clears itself once
+              // tracking recovers (no stale-marker caveat to guard against).
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">
+                  Failed tracking lookups
+                </dt>
+                <dd className="tabular-nums">{order.fulfillmentErrorCount}</dd>
               </div>
             ) : null}
           </dl>
