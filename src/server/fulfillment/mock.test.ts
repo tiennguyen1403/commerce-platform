@@ -30,7 +30,14 @@ function input(
 ): CreateFulfillmentInput {
   return {
     orderId: "order_1",
-    items: [{ sku: "TEE-S", quantity: 2, providerVariantId: "4011" }],
+    items: [
+      {
+        sku: "TEE-S",
+        quantity: 2,
+        priceCents: 1500,
+        providerVariantId: "4011",
+      },
+    ],
     shippingAddress: ADDRESS,
     ...o,
   };
@@ -58,10 +65,16 @@ describe("MockProvider", () => {
       const result = await provider.createOrder(
         input({
           items: [
-            { sku: "TEE-S", quantity: 1, providerVariantId: "4011" },
+            {
+              sku: "TEE-S",
+              quantity: 1,
+              priceCents: 1500,
+              providerVariantId: "4011",
+            },
             {
               sku: "BAD",
               quantity: 1,
+              priceCents: 1500,
               providerVariantId: MOCK_FAILING_VARIANT_ID,
             },
           ],

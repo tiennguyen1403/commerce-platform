@@ -409,9 +409,12 @@ async function runSubmission(tenantId: string, orderId: string): Promise<void> {
 }
 
 /**
- * Resolve every line's `sku → providerVariantId` off the eager-loaded variant,
- * failing all-or-nothing: an unmapped variant is a defined, admin-visible failure
- * (map it in the product form), not a silent provider 4xx or a partial shipment.
+ * Resolve every line's `sku → providerVariantId` off the eager-loaded variant and
+ * carry its snapshot unit price, failing all-or-nothing: an unmapped variant is a
+ * defined, admin-visible failure (map it in the product form), not a silent
+ * provider 4xx or a partial shipment. The per-unit `priceCents` (M4 #148) is read
+ * off the `OrderItem` — the purchase-time snapshot, not the live variant/catalog
+ * price — so the adapter can print our retail price on the provider's packing slip.
  */
 function toLineItems(order: OrderForFulfillment): FulfillmentLineItem[] {
   const unmapped: string[] = [];
@@ -423,6 +426,10 @@ function toLineItems(order: OrderForFulfillment): FulfillmentLineItem[] {
     return {
       sku,
       quantity: item.quantity,
+      // The snapshot per-unit price (cents) rides on the line so the adapter can
+      // put OUR price on the provider's packing slip (#148). It lives on the
+      // OrderItem (a purchase-time snapshot), never re-derived from the variant.
+      priceCents: item.priceCents,
       providerVariantId: providerVariantId ?? undefined,
     };
   });

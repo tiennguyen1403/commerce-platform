@@ -169,7 +169,14 @@ describe("fulfillmentService.submitOrder — submission + persistence", () => {
     expect(claimForSubmission).toHaveBeenCalledWith(TENANT, "order_1");
     expect(createOrderMock()).toHaveBeenCalledWith({
       orderId: "order_1",
-      items: [{ sku: "TEE-S", quantity: 2, providerVariantId: "4011" }],
+      items: [
+        {
+          sku: "TEE-S",
+          quantity: 2,
+          priceCents: 1500,
+          providerVariantId: "4011",
+        },
+      ],
       shippingAddress: {
         name: "Ada Lovelace",
         line1: "1 Analytical Ave",
@@ -206,7 +213,32 @@ describe("fulfillmentService.submitOrder — submission + persistence", () => {
 
     const [input] = createOrderMock().mock.calls[0];
     expect(input.items).toEqual([
-      { sku: "HOOD-M", quantity: 3, providerVariantId: "7019" },
+      {
+        sku: "HOOD-M",
+        quantity: 3,
+        priceCents: 1500,
+        providerVariantId: "7019",
+      },
+    ]);
+  });
+
+  it("threads each line's snapshot unit price (cents) into the provider input", async () => {
+    findForFulfillment.mockResolvedValue(
+      fulfillmentOrder({ items: [item({ priceCents: 4599, quantity: 3 })] }),
+    );
+
+    await fulfillmentService.submitOrder(TENANT, "order_1");
+
+    const [input] = createOrderMock().mock.calls[0];
+    // The per-unit snapshot price (OrderItem.priceCents) rides on the line as cents,
+    // straight through — never multiplied by quantity, never re-read from the variant.
+    expect(input.items).toEqual([
+      {
+        sku: "TEE-S",
+        quantity: 3,
+        priceCents: 4599,
+        providerVariantId: "4011",
+      },
     ]);
   });
 

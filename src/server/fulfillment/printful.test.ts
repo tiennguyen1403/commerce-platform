@@ -10,7 +10,7 @@ import type {
  * `PrintfulProvider` once `PRINTFUL_API_KEY` is set — and the structured logger is
  * spied so the soft-rejection path's warn is observable and silent. The contract
  * under test: correct request shaping (URL/`confirm=1`, Bearer auth, recipient +
- * integer `variant_id`, no `retail_price`), a 400 resolved to `"failed"` (never a
+ * integer `variant_id`, decimal-string `retail_price`), a 400 resolved to `"failed"` (never a
  * throw), an immediate `failed` order status mapped to `"failed"`, everything else
  * non-2xx thrown (transient), and the tracking mapping off `shipments[0]`.
  */
@@ -40,7 +40,14 @@ function input(
 ): CreateFulfillmentInput {
   return {
     orderId: "order_1",
-    items: [{ sku: "TEE-S", quantity: 2, providerVariantId: "4011" }],
+    items: [
+      {
+        sku: "TEE-S",
+        quantity: 2,
+        priceCents: 1999,
+        providerVariantId: "4011",
+      },
+    ],
     shippingAddress: ADDRESS,
     ...o,
   };
@@ -101,11 +108,12 @@ describe("PrintfulProvider", () => {
           country_code: "US",
           zip: "94103",
         },
-        // `variant_id` is an integer; `retail_price` is absent by design (#148).
-        items: [{ variant_id: 4011, quantity: 2 }],
+        // `variant_id` is an integer; `retail_price` is our per-unit price as a
+        // plain decimal string for the packing slip (#148).
+        items: [{ variant_id: 4011, quantity: 2, retail_price: "19.99" }],
       });
       expect(sent.recipient).not.toHaveProperty("address2");
-      expect(sent.items[0]).not.toHaveProperty("retail_price");
+      expect(sent.items[0]).toHaveProperty("retail_price", "19.99");
     });
 
     it("includes recipient.address2 only when line2 is present", async () => {
@@ -119,6 +127,28 @@ describe("PrintfulProvider", () => {
 
       const sent = JSON.parse(fetchMock.mock.calls[0][1].body as string);
       expect(sent.recipient.address2).toBe("Apt 4");
+    });
+
+    it("formats retail_price per unit as a plain decimal string from cents", async () => {
+      fetchMock.mockResolvedValue(
+        jsonResponse(200, { result: { id: 1, status: "pending" } }),
+      );
+
+      await new PrintfulProvider().createOrder(
+        input({
+          items: [
+            { sku: "A", quantity: 1, priceCents: 1500, providerVariantId: "1" },
+            { sku: "B", quantity: 3, priceCents: 999, providerVariantId: "2" },
+          ],
+        }),
+      );
+
+      const sent = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+      // Cents → a bare two-decimal string (Printful's slip price): a whole-dollar
+      // price keeps its ".00", and it's the UNIT price — quantity 3 never scales it.
+      expect(
+        sent.items.map((i: { retail_price: string }) => i.retail_price),
+      ).toEqual(["15.00", "9.99"]);
     });
 
     it("resolves to 'failed' (not a throw) on a 400 soft rejection", async () => {
@@ -197,7 +227,14 @@ describe("PrintfulProvider", () => {
 
       await new PrintfulProvider().createOrder(
         input({
-          items: [{ sku: "TEE-S", quantity: 1, providerVariantId: "1e3" }],
+          items: [
+            {
+              sku: "TEE-S",
+              quantity: 1,
+              priceCents: 1500,
+              providerVariantId: "1e3",
+            },
+          ],
         }),
       );
 

@@ -101,9 +101,14 @@ curl -sS -X DELETE "https://api.printful.com/orders/$ORDER_ID" \
 
 ## What the adapter does not do (by design)
 
-- **No `retail_price` on line items.** The `FulfillmentLineItem` interface carries no per-line
-  price, so the adapter omits the optional `retail_price`; Printful then prints its own base
-  price on the packing slip. Threading our retail price through is tracked in **#148**.
+- **No order-level `retail_costs`.** Each line now carries our retail price as Printful's
+  optional per-item `retail_price` (a decimal string, e.g. `"19.99"`, formatted from the
+  order item's integer `priceCents` — M4 **#148**), so the packing slip shows our prices
+  instead of Printful's base price. The aggregate `retail_costs` object (`currency` /
+  `subtotal` / `shipping` / `tax`), which Printful uses only when _every_ item has a
+  `retail_price`, is deliberately not sent: the fulfillment input carries no shipping/tax
+  breakdown, so a partial `retail_costs` would misstate the slip totals. Revisit if we want
+  fully itemized customer-facing costs on the slip.
 - **One shipment surfaced.** `TrackingInfo` carries a single tracking set, so a partial
   (multi-shipment) order surfaces the first shipment only.
 - **Tracking is polled, not webhook-driven** (see `research.md` / `GOAL.md`).

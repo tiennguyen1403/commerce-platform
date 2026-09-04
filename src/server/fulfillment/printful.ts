@@ -157,13 +157,14 @@ export class PrintfulProvider implements FulfillmentProvider {
         // WRONG product — see `toVariantId`.
         variant_id: toVariantId(item.providerVariantId),
         quantity: item.quantity,
-        // `retail_price` (an OPTIONAL decimal-string packing-slip price) is
-        // deliberately omitted: the frozen `FulfillmentLineItem` carries no
-        // per-line price (M4 #137), and omitting it simply makes Printful print
-        // its own base price on the slip (the order still fulfills). When a price
-        // is threaded through the interface (M4 #148), format it HERE as
-        // `(priceCents / 100).toFixed(2)` — the one place cents may become a
-        // decimal string (golden rule 3).
+        // `retail_price` is Printful's OPTIONAL per-item price for the
+        // customer-facing packing slip; sending it makes the slip show OUR retail
+        // price instead of Printful's own base price (M4 #148). Printful wants a
+        // plain decimal STRING ("19.99"), so this is the one place the line's
+        // integer cents cross into a decimal — at the outbound HTTP edge only
+        // (golden rule #3). Deliberately not `formatMoney`: that adds a currency
+        // symbol and grouping ("$1,234.56"), which Printful would reject.
+        retail_price: toRetailPrice(item.priceCents),
       })),
     };
 
@@ -268,6 +269,19 @@ export class PrintfulProvider implements FulfillmentProvider {
 function toVariantId(providerVariantId: string | undefined): number {
   const trimmed = providerVariantId?.trim();
   return trimmed && /^\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
+}
+
+/**
+ * Format a line's integer-cents unit price as Printful's `retail_price` — a plain
+ * decimal string, e.g. `1999 → "19.99"`, `1500 → "15.00"` (M4 #148). This is the
+ * single point where the money boundary (golden rule #3) is crossed: cents are the
+ * internal unit everywhere else, and only here, at the outbound HTTP edge, do they
+ * become a two-decimal string. `/ 100` then `toFixed(2)` is exact for any realistic
+ * order price (well within `Number.MAX_SAFE_INTEGER`). Not `formatMoney`, whose
+ * currency symbol and grouping separators Printful would reject.
+ */
+function toRetailPrice(priceCents: number): string {
+  return (priceCents / 100).toFixed(2);
 }
 
 /**
