@@ -114,6 +114,13 @@ describe("fulfillmentAttention", () => {
     expect(fulfillmentAttention("SUBMITTED", null)).toBeNull();
   });
 
+  it("does not flag a SHIPPED order that still carries a stale stuck marker", () => {
+    // `fulfillmentStuckAt` is write-once and never cleared, so a shipment flagged
+    // stuck (#155) that then ships still carries it. The banner must NOT fire on a
+    // shipped order — otherwise it contradicts the order's own tracking.
+    expect(fulfillmentAttention("SHIPPED", new Date())).toBeNull();
+  });
+
   it.each(["NOT_SUBMITTED", "SHIPPED"] as const)(
     "does not flag a %s order",
     (status) => {

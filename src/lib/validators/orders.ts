@@ -106,9 +106,14 @@ export type FulfillmentAttention = { title: string; description: string };
  *    one outbox-drain tick). An order still SUBMITTING is a lost worker part-way
  *    through submission, and the order-level SUBMITTING guard (M4 #139) never
  *    retries it automatically — a human must reconcile it.
- *  - `stuckAt` set — a SUBMITTED shipment the poll cron flagged as open past the
- *    age threshold (a provider hold like `onhold`/`inreview` that isn't resolving,
- *    M4 #155). It's still polled (it may yet ship), but it's worth a look.
+ *  - `stuckAt` set on a still-SUBMITTED order — a shipment the poll cron flagged as
+ *    open past the age threshold (a provider hold like `onhold`/`inreview` that isn't
+ *    resolving, M4 #155). It's still polled (it may yet ship), but it's worth a look.
+ *    Gated on SUBMITTED because `fulfillmentStuckAt` is write-once and never cleared
+ *    (`markShipped` and the terminal writers don't null it), so a shipment flagged
+ *    stuck that *then* ships — the #155 "alert but keep polling, an onhold order can
+ *    still ship" path — still carries the marker; without the guard a now-SHIPPED
+ *    order would show a false "hasn't shipped" alert above its own tracking.
  * Pure and client-safe (takes the raw `fulfillmentStatus` + nullable `stuckAt`),
  * so it's unit-testable and the admin page just renders the result.
  */
@@ -130,7 +135,12 @@ export function fulfillmentAttention(
         "A submission started but never confirmed. It won’t retry automatically — reconcile with the provider before re-attempting, so the order isn’t submitted twice.",
     };
   }
-  if (stuckAt) {
+  // Only while the order is still an OPEN shipment. `fulfillmentStuckAt` is
+  // write-once (never cleared on ship/fail), so a shipment flagged stuck that then
+  // ships still carries it — this guard keeps a now-SHIPPED order from showing a
+  // false "hasn't shipped" alert above its tracking. (FAILED is handled above and
+  // keeps its own banner; a lingering marker on any non-SUBMITTED state is stale.)
+  if (status === "SUBMITTED" && stuckAt) {
     return {
       title: "Shipment open longer than expected",
       description:

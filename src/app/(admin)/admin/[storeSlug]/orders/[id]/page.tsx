@@ -224,7 +224,10 @@ export default async function OrderDetailPage({
                 </dd>
               </div>
             ) : null}
-            {order.fulfillmentStuckAt ? (
+            {order.fulfillmentStuckAt && fulfillmentStatus === "SUBMITTED" ? (
+              // Only while still open — `fulfillmentStuckAt` is write-once and lingers
+              // after a stuck shipment ships, so gate it (like the banner) on SUBMITTED
+              // to avoid a stale "Flagged stuck" row on an order that already shipped.
               <div className="flex flex-col gap-1">
                 <dt className="text-muted-foreground">Flagged stuck</dt>
                 <dd>{formatDate(order.fulfillmentStuckAt, true)}</dd>
