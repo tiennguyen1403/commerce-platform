@@ -1,4 +1,5 @@
 import "server-only";
+import { env } from "@/lib/env";
 import {
   getFulfillmentProvider,
   type FulfillmentProvider,
@@ -52,13 +53,18 @@ const POLL_TIME_BUDGET_MS = 45_000;
  *  terminal `markShipped`/`markFulfillmentFailedAfterSubmission` that leave the work list
  *  — but `createdAt` is already the ordering key and needs no reasoning about write
  *  patterns.) Set well beyond a normal produce-and-ship window: Printful assigns a
- *  tracking number at carrier handoff after production, up to ~a week, so 10 days leaves
- *  a clear buffer and a normally-progressing order (SHIPPED and gone from the SUBMITTED
- *  work list long before this) is never flagged — a provider hold (`onhold`/`inreview`)
- *  that never resolves is what trips it. Alert-only: a flagged order is NOT removed from
- *  polling (it may still ship); a human contacts the provider / refunds / re-orders.
- *  Module-local like the other poll knobs above. */
-const STUCK_SUBMITTED_THRESHOLD_MS = 10 * 24 * 60 * 60_000; // 10 days
+ *  tracking number at carrier handoff after production, up to ~a week, so the 10-day
+ *  default leaves a clear buffer and a normally-progressing order (SHIPPED and gone from
+ *  the SUBMITTED work list long before this) is never flagged — a provider hold
+ *  (`onhold`/`inreview`) that never resolves is what trips it. Alert-only: a flagged order
+ *  is NOT removed from polling (it may still ship); a human contacts the provider /
+ *  refunds / re-orders. The 10-day default is a still-provisional guess until real
+ *  Printful timing data exists (M4 #162); it is env-tunable via
+ *  `FULFILLMENT_STUCK_THRESHOLD_DAYS` (a positive number of days — see `src/lib/env.ts`)
+ *  so it can be adjusted without a deploy, and unset/blank keeps 10. Resolved from `env`
+ *  once at module load, exactly like the literal it replaced. */
+const STUCK_SUBMITTED_THRESHOLD_MS =
+  env.FULFILLMENT_STUCK_THRESHOLD_DAYS * 24 * 60 * 60_000;
 
 const pollLog = logger.child({ component: "fulfillment-poll" });
 
