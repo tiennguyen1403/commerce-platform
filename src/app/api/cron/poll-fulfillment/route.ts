@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { verifyCronRequest } from "@/server/cron/verify-cron-request";
 import { fulfillmentService } from "@/server/services/fulfillment.service";
+import { outboxService } from "@/server/services/outbox.service";
 import { logger } from "@/server/observability/logger";
 
 // Reads the request's Authorization header and writes to the DB (reconciling
@@ -19,6 +20,16 @@ export const maxDuration = 60;
 // deprecated (see `src/app/api/webhooks/stripe/route.ts` for the doc citation).
 // The poll needs Node + Prisma anyway.
 
+// Wall-clock ceiling for the whole request, a margin under `maxDuration` (60s). The
+// poll phase has its own 45s budget (`POLL_TIME_BUDGET_MS`); this bounds the
+// immediate shipping-email dispatch that follows so a large shipping burst — e.g.
+// the Vercel-only daily backstop reconciling a full day of shipments at once — can't
+// push the request past `maxDuration` (a Vercel timeout, or the GitHub cron's
+// `curl -m 70` tripping the job red). One in-flight send can still run ~5s
+// (`SEND_TIMEOUT_MS`) past this, comfortably under 60s. Overflow falls to the
+// durable outbox drain — the immediate send is only a latency optimization.
+const REQUEST_TIME_BUDGET_MS = 52_000;
+
 /**
  * Cron entry point for the **poll-fulfillment reconciliation** (issue #140).
  *
@@ -26,7 +37,13 @@ export const maxDuration = 60;
  * SUBMITTED (still PAID) orders across all tenants, asks the provider for each
  * one's tracking, and for the shipped ones flips the order PAID → FULFILLED with
  * tracking persisted and the shipping-confirmation email enqueued — idempotently.
- * Its per-run counts are returned in the body for observability.
+ * For every order reconciled this run it then fires an immediate best-effort
+ * shipping-email dispatch (the same latency optimization the Stripe webhook does
+ * after PAID, #139): without it an email enqueued by a poll run would wait for the
+ * next cron tick's outbox drain — ~10 min under the primary GitHub Actions cron
+ * (`.github/workflows/cron.yml`, which drains every tick), up to ~a day if only the
+ * Vercel daily backstop is active. Its per-run counts are returned in the body for
+ * observability.
  *
  * Cron delivery is best-effort and never retried by Vercel, so the poll is
  * reconciliation-based: a missed or duplicated run is a safe no-op (the next run
@@ -42,12 +59,37 @@ export async function GET(request: Request): Promise<NextResponse> {
     );
   }
 
+  const started = Date.now();
   const log = logger.child({ component: "cron:poll-fulfillment" });
-  const result = await fulfillmentService.pollOpenShipments();
-  log.info(result, "cron poll-fulfillment: reconciled open shipments");
+  const { shippedOrders, ...counts } =
+    await fulfillmentService.pollOpenShipments();
+  log.info(counts, "cron poll-fulfillment: reconciled open shipments");
+
+  // Immediate best-effort shipping-email dispatch for the orders just reconciled to
+  // SHIPPED — the message is already durably queued (in the reconcile transaction)
+  // and the outbox drain is the safety net, so this is pure latency optimization,
+  // mirroring the Stripe webhook's `dispatchForOrder` after PAID (#139).
+  // `dispatchForOrder` never throws and each send is bounded, so it can't fail the
+  // poll; if the run is force-killed mid-dispatch, the stranded claim is reclaimed by
+  // stale-claim recovery. Bounded by the request time budget so a large shipping
+  // burst can't push the run past `maxDuration`; whatever isn't reached this run
+  // simply drains on the next outbox run (the durable path).
+  const dispatchDeadline = started + REQUEST_TIME_BUDGET_MS;
+  let dispatched = 0;
+  for (const { tenantId, orderId } of shippedOrders) {
+    if (Date.now() >= dispatchDeadline) {
+      log.info(
+        { dispatched, remaining: shippedOrders.length - dispatched },
+        "cron poll-fulfillment: dispatch time budget reached — remaining shipping emails left to the outbox drain",
+      );
+      break;
+    }
+    await outboxService.dispatchForOrder(tenantId, orderId);
+    dispatched += 1;
+  }
 
   return NextResponse.json(
-    { ok: true, task: "poll-fulfillment", ...result },
+    { ok: true, task: "poll-fulfillment", ...counts },
     { headers: { "cache-control": "no-store" } },
   );
 }
