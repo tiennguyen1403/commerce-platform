@@ -10,6 +10,7 @@ import {
   formatCountry,
   formatShippingAddressLines,
   fulfillmentAttention,
+  fulfillmentErrorAttention,
   listOrdersParamsSchema,
   shopperShipmentView,
   trackingHref,
@@ -133,6 +134,49 @@ describe("fulfillmentAttention", () => {
     // lingers on the row — the FAILED branch wins.
     const attention = fulfillmentAttention("FAILED", new Date());
     expect(attention?.title).toBe("Fulfillment failed");
+  });
+});
+
+describe("fulfillmentErrorAttention", () => {
+  it("flags a SUBMITTED open shipment whose tracking lookups are failing", () => {
+    const attention = fulfillmentErrorAttention("SUBMITTED", 144);
+    expect(attention?.title).toBe("Tracking lookups are failing");
+    // Action-oriented copy that distinguishes it from a provider hold: the lookup
+    // call itself is failing (unreadable), vs. a readable-but-held stuck shipment.
+    expect(attention?.description).toContain("provider dashboard");
+    expect(attention?.description).toContain(
+      "the lookup call itself is erroring",
+    );
+  });
+
+  it("clears once a clean poll resets the streak (count 0), order still SUBMITTED", () => {
+    // `fulfillmentErrorCount` resets to 0 on any clean poll, so the surface clears
+    // itself the moment tracking recovers — no write-once caveat (contrast the stuck
+    // marker). This is the AC's "it clears when the streak resets" case.
+    expect(fulfillmentErrorAttention("SUBMITTED", 0)).toBeNull();
+  });
+
+  it("scales the copy with the streak (singular vs. the exact count)", () => {
+    // "Copy that scales": one failed lookup reads differently from a long streak, and
+    // the count is surfaced verbatim so severity is self-evident.
+    expect(fulfillmentErrorAttention("SUBMITTED", 1)?.description).toContain(
+      "The last attempt",
+    );
+    const many = fulfillmentErrorAttention("SUBMITTED", 144)?.description;
+    expect(many).toContain("The last 144 attempts");
+  });
+
+  it.each(["NOT_SUBMITTED", "SUBMITTING", "SHIPPED", "FAILED"] as const)(
+    "does not flag a %s order even with a non-zero count",
+    (status) => {
+      // Only an OPEN shipment (SUBMITTED) surfaces as erroring — a normally-progressing,
+      // shipped, or failed order never does, even if a stale count lingers on the row.
+      expect(fulfillmentErrorAttention(status, 200)).toBeNull();
+    },
+  );
+
+  it("does not flag a normally-progressing SUBMITTED order (no errors)", () => {
+    expect(fulfillmentErrorAttention("SUBMITTED", 0)).toBeNull();
   });
 });
 
