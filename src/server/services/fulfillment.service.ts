@@ -461,11 +461,19 @@ async function pollOne(
  * snapshots the raw provider status into `fulfillmentProviderStatus` for the admin
  * view, #161) under a `fulfillmentStuckAt: null` guard, so only the first run across
  * all cron ticks wins, and the pre-read `fulfillmentStuckAt` short-circuits the
- * already-surfaced case without even attempting the write.
+ * already-surfaced case without re-alerting.
+ *
+ * That already-surfaced branch is not a pure no-op since #164: it bumps the order's
+ * round-robin re-poll key (`markStuckRepolled` → `fulfillmentStuckPolledAt = now()`) so the
+ * deprioritised flagged tail ROTATES run over run. #158 keyed the tail on the write-once
+ * `fulfillmentStuckAt`, pinning the same oldest-flagged orders to its front forever, so a
+ * backlog past `POLL_BATCH_SIZE` could permanently starve the newest-flagged; bumping the
+ * key each re-poll makes least-recently-repolled sort first, so every flagged order is
+ * reached within a bounded number of runs and one that later ships still reconciles.
  *
  * Returns `"stuck"` only on the run that first surfaces the order (stamped + alerted),
- * `"pending"` otherwise — under the threshold, already surfaced, or the guarded write
- * lost a benign PAID/SUBMITTED race (refunded / manually fulfilled underneath us). The
+ * `"pending"` otherwise — under the threshold, already surfaced (key bumped), or the guarded
+ * write lost a benign PAID/SUBMITTED race (refunded / manually fulfilled underneath us). The
  * order is left SUBMITTED and keeps being polled in every case: #155 alerts, it does
  * not stop reconciliation, because an onhold order can still ship.
  */
@@ -475,10 +483,22 @@ async function flagIfStuck(
 ): Promise<PollOutcome> {
   const { id, tenantId, createdAt, fulfillmentStuckAt, fulfillmentExternalId } =
     order;
-
-  // Still within the window, or already surfaced in an earlier run — nothing to do.
   const age = Date.now() - createdAt.getTime();
-  if (age < STUCK_SUBMITTED_THRESHOLD_MS || fulfillmentStuckAt !== null) {
+
+  // Already surfaced in an earlier run: this order is in the deprioritised flagged tail
+  // (#158). Bump its round-robin re-poll key (#164) so the tail rotates fairly — a
+  // >POLL_BATCH_SIZE flagged backlog can't permanently starve the newest-flagged — then
+  // no-op: we've already alerted, and it stays SUBMITTED to keep polling (an onhold order
+  // can still ship). No age check needed here: an already-flagged order is necessarily past
+  // the threshold, since `createdAt` (the age anchor) only gets older.
+  if (fulfillmentStuckAt !== null) {
+    await orderRepository.markStuckRepolled(tenantId, id);
+    return "pending";
+  }
+
+  // Not yet flagged and still within the window — genuinely in flight, write nothing (the
+  // "a not-shipped poll writes nothing" invariant for the common, fresh-order case).
+  if (age < STUCK_SUBMITTED_THRESHOLD_MS) {
     return "pending";
   }
 
@@ -538,6 +558,19 @@ async function flagIfStuck(
  * condition is monotonic). A `null` return is the benign race its siblings share — the
  * order left PAID/SUBMITTED (refunded / manually fulfilled) between the select and here —
  * so there is nothing to surface.
+ *
+ * Deliberately does NOT bump the flagged tail's round-robin re-poll key (#164): a getTracking
+ * error routes here, bypassing `flagIfStuck`, so an order that is BOTH flagged-stuck AND
+ * erroring keeps its `fulfillmentStuckPolledAt` frozen and stays pinned at the tail FRONT
+ * rather than rotating. This is a bounded, acceptable residual, not a starvation vector: (a)
+ * an order erroring from the start is never flagged at all — flagging needs a clean read past
+ * the age threshold, which an always-throwing getTracking never delivers — so it stays in the
+ * high-priority not-yet-flagged (null-key) group, never the tail; (b) an order flagged first
+ * and only later erroring keeps being polled (front of the tail — itself never starved),
+ * reconciles at once if its hold ships, and is surfaced within ~24h by the erroring alert
+ * above. Its only cost is holding one fixed tail slot, marginally lowering rotation throughput
+ * for the other flagged orders — bounded by the count of such already-#163-alerted orders, and
+ * strictly better than the pre-#164 fully-frozen tail.
  */
 async function recordPollError(
   order: SubmittedOrderForPolling,

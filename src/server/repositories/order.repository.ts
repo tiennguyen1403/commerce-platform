@@ -43,10 +43,13 @@ export type StalePendingOrder = {
  *  `createdAt` is the age anchor — immutable, so age reads straight off the row (see the
  *  threshold constant in `fulfillment.service.ts` for why creation time, not submission
  *  time, is the anchor) — and `fulfillmentStuckAt` (null until the poll first surfaces the
- *  order as stuck) lets the poll skip re-alerting one it already flagged. Since #158
- *  `fulfillmentStuckAt` is also the batch's PRIMARY sort key (flagged rows sort to the
- *  tail so a never-resolving hold can't starve fresh orders — see `findSubmittedForPolling`),
- *  with `createdAt` the secondary (oldest-first within each group).
+ *  order as stuck) lets the poll skip re-alerting one it already flagged — and, since #164,
+ *  drives the poll's write path: on the already-flagged branch (`fulfillmentStuckAt !== null`)
+ *  the poll bumps `fulfillmentStuckPolledAt` (`markStuckRepolled`) to rotate the flagged tail.
+ *  The batch's PRIMARY sort key is that `fulfillmentStuckPolledAt` (#158 deprioritises flagged
+ *  rows to the tail; #164 rotates it — see `findSubmittedForPolling`), with `createdAt` the
+ *  secondary; neither is selected into this shape (the ordering happens in the DB, and the
+ *  poll bumps the key without reading it).
  *
  *  `fulfillmentErrorCount` feeds the erroring-open-shipment check (M4 #163): the poll
  *  reads it so it can tell "this order has never errored / just recovered" (0) from an
@@ -504,29 +507,43 @@ export const orderRepository = {
    * that never resolves — see the ordering below — could let the set grow). Selects
    * only the fields the poll needs — never the whole row.
    *
-   * Ordering deprioritises a flagged-stuck order (M4 #158). A #155-flagged hold stays
-   * SUBMITTED (it may still ship, so #155 alerts but keeps polling it); left oldest-
-   * first it would sit at the FRONT of every batch forever — one wasted `getTracking`
-   * per run and, once enough accumulate, crowding fresh orders out of the batch limit
-   * / time budget, so their shipments never reconcile (the liveness problem #151's
-   * terminal exit was built to avoid). `fulfillmentStuckAt` is null until the poll
-   * first surfaces an order as stuck, so `nulls: "first"` floats every not-yet-flagged
-   * order ahead of every flagged one — fresh orders always poll first — while flagged
-   * rows fill the tail (oldest-flagged first). A flagged order is never dropped from the
-   * work list (the predicate is unchanged — the #155 invariant: deprioritise, don't
-   * drop), so it keeps polling and reconciles if its hold ships. (`fulfillmentStuckAt`
-   * is write-once, so the tail order is stable across runs: a pathological backlog of
-   * more than `POLL_BATCH_SIZE` holds could push the newest-flagged past the batch limit
-   * — a bounded, self-healing reconcile delay WITHIN the flagged group, deferred to #164;
-   * fresh-order liveness is unaffected.)
+   * Ordering deprioritises a flagged-stuck order (M4 #158) AND rotates the flagged tail
+   * fairly (M4 #164). A #155-flagged hold stays SUBMITTED (it may still ship, so #155
+   * alerts but keeps polling it); left oldest-first it would sit at the FRONT of every
+   * batch forever — one wasted `getTracking` per run and, once enough accumulate, crowding
+   * fresh orders out of the batch limit / time budget, so their shipments never reconcile
+   * (the liveness problem #151's terminal exit was built to avoid). The sort key is
+   * `fulfillmentStuckPolledAt`, which is non-null IFF the order is flagged-stuck, so
+   * `nulls: "first"` floats every not-yet-flagged order ahead of every flagged one — fresh
+   * orders always poll first — while flagged rows fill the tail. A flagged order is never
+   * dropped from the work list (the predicate is unchanged — the #155 invariant:
+   * deprioritise, don't drop), so it keeps polling and reconciles if its hold ships.
+   *
+   * Within the tail the key rotates (#164): #158 keyed the tail on the WRITE-ONCE
+   * `fulfillmentStuckAt`, so the tail order was stable across runs and a backlog past
+   * `POLL_BATCH_SIZE` permanently starved the newest-flagged (a hold that later ships would
+   * never reconcile). `fulfillmentStuckPolledAt` is instead bumped `now()` on every re-poll
+   * of a flagged order (`markStuckRepolled`), so the tail sorts least-recently-repolled
+   * first: each run re-polls a different slice, every flagged order is reached within
+   * ~⌈flaggedCount / freeSlots⌉ runs, and one that eventually ships reconciles regardless of
+   * flagged-set size. (`createdAt` remains the final tiebreak — oldest-first within a group.
+   * One exception to the bound: a flagged order whose getTracking THROWS every run is not
+   * rotated — its key is only bumped on a clean re-poll — so it stays pinned at the tail
+   * front, itself always polled but holding a fixed slot; bounded and #163-alerted, see
+   * `recordPollError`.)
    */
   findSubmittedForPolling(limit: number): Promise<SubmittedOrderForPolling[]> {
     return prisma.order.findMany({
       where: { status: "PAID", fulfillmentStatus: "SUBMITTED" },
       orderBy: [
         // Not-yet-flagged (null) first, then flagged-stuck last — #158 deprioritises a
-        // never-resolving hold so it can't starve fresh orders (see the doc comment).
-        { fulfillmentStuckAt: { sort: "asc", nulls: "first" } },
+        // never-resolving hold so it can't starve fresh orders. Keyed on
+        // `fulfillmentStuckPolledAt` (not the write-once `fulfillmentStuckAt`) since #164:
+        // it is non-null IFF flagged (so `nulls: "first"` still floats fresh orders ahead,
+        // unchanged) AND is bumped on every re-poll of a flagged order, so the flagged tail
+        // sorts least-recently-repolled first and ROTATES — a >POLL_BATCH_SIZE flagged
+        // backlog can no longer permanently starve the newest-flagged (see the doc comment).
+        { fulfillmentStuckPolledAt: { sort: "asc", nulls: "first" } },
         { createdAt: "asc" },
       ],
       take: limit,
@@ -534,10 +551,12 @@ export const orderRepository = {
         id: true,
         tenantId: true,
         fulfillmentExternalId: true,
-        // Age anchor + already-surfaced marker for the stuck-open-shipment check
-        // (#155), and — since #158 — the batch's primary sort key: a flagged order is
-        // re-polled like any other (a hold can still resolve to a shipment), so it
-        // stays in this same `{PAID, SUBMITTED}` work list, just sorted to the tail.
+        // Age anchor + already-surfaced marker for the stuck-open-shipment check (#155).
+        // The poll READS `fulfillmentStuckAt` to branch: null → maybe flag; non-null →
+        // already in the tail, so bump the re-poll key instead (#164). A flagged order is
+        // never dropped (a hold can still ship), so it stays in this `{PAID, SUBMITTED}`
+        // work list, just deprioritised to the tail. The tail's sort key is
+        // `fulfillmentStuckPolledAt` (#158/#164) — ordered in the DB, not selected here.
         createdAt: true,
         fulfillmentStuckAt: true,
         // Current consecutive-getTracking-error streak, for the erroring-open-shipment
@@ -1206,6 +1225,11 @@ export const orderRepository = {
     orderId: string,
     providerStatus: string,
   ): Promise<boolean> {
+    // Seed `fulfillmentStuckPolledAt` = `fulfillmentStuckAt` (one shared timestamp) as the
+    // order enters the flagged tail (M4 #164): the round-robin re-poll key must be non-null
+    // the instant an order is flagged, so it sorts into the flagged group — not the fresh
+    // one — from its very next poll, and `markStuckRepolled` bumps it from there.
+    const now = new Date();
     const { count } = await prisma.order.updateMany({
       where: {
         id: orderId,
@@ -1215,11 +1239,46 @@ export const orderRepository = {
         fulfillmentStuckAt: null,
       },
       data: {
-        fulfillmentStuckAt: new Date(),
+        fulfillmentStuckAt: now,
+        fulfillmentStuckPolledAt: now,
         fulfillmentProviderStatus: providerStatus,
       },
     });
     return count === 1;
+  },
+
+  /**
+   * Bump a flagged-stuck order's round-robin re-poll key (M4 #164): stamp
+   * `fulfillmentStuckPolledAt = now()` so the next `findSubmittedForPolling` sorts this
+   * order to the BACK of the deprioritised flagged tail (that query orders the tail by this
+   * key ascending — least-recently-repolled first). Called by the poll on every re-poll of
+   * an ALREADY-flagged in-flight order (`flagIfStuck`'s already-surfaced branch), so the
+   * tail rotates run over run instead of the write-once `fulfillmentStuckAt` pinning the
+   * same oldest-flagged orders to the front forever — the residual #158 left, where a
+   * backlog past `POLL_BATCH_SIZE` could permanently starve the newest-flagged.
+   *
+   * Guarded on the same `{status: PAID, fulfillmentStatus: SUBMITTED}` work-list predicate
+   * as its poll siblings, PLUS `fulfillmentStuckAt: { not: null }` so it only ever re-stamps
+   * an order that IS flagged — keeping the invariant "`fulfillmentStuckPolledAt` is non-null
+   * IFF flagged" (on which the `nulls: "first"` fresh-orders-first ordering depends) airtight
+   * even if mis-called. Tenant-scoped (golden rule #1). Best-effort + idempotent: a
+   * concurrently refunded / manually-fulfilled order (which flips only `status`) simply
+   * no-ops, exactly like the marker writers, so no row-count assertion is needed — a lost
+   * bump just means one more run before this order rotates, never a correctness problem.
+   * Returns nothing: unlike the marker/terminal writers it drives no alert or state change,
+   * only the batch ordering.
+   */
+  async markStuckRepolled(tenantId: string, orderId: string): Promise<void> {
+    await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+        fulfillmentStuckAt: { not: null },
+      },
+      data: { fulfillmentStuckPolledAt: new Date() },
+    });
   },
 
   /**
