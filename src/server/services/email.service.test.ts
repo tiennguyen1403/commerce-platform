@@ -348,3 +348,179 @@ describe("emailService.sendOrderConfirmation — oversold order (#40)", () => {
     expect(email.html).not.toContain("fulfil part of this order");
   });
 });
+
+/**
+ * #141: the shipping-confirmation email, sent from the poll-fulfillment reconcile
+ * via the same outbox path. A shipped order carries the tracking the reconcile
+ * persisted (carrier/number/url) plus its `ship*` address; the render shows the
+ * carrier + a tracking link + the address, escaping every shopper-un-authored value.
+ */
+describe("emailService.sendShippingConfirmation", () => {
+  function shippedOrder(o: Partial<OrderWithItems> = {}): OrderWithItems {
+    return orderWithItems({
+      orderNumber: "20250101-SHIP01",
+      email: "shopper@example.com",
+      shipName: "Ada Lovelace",
+      shipLine1: "1 Analytical Ave",
+      shipLine2: "Apt 2",
+      shipCity: "San Francisco",
+      shipState: "CA",
+      shipPostalCode: "94103",
+      shipCountry: "US",
+      trackingCarrier: "UPS",
+      trackingNumber: "1Z999AA10123456784",
+      trackingUrl: "https://track.example.test/1Z999AA10123456784",
+      items: [orderItem({ titleSnapshot: "Widget — Blue", quantity: 2 })],
+      ...o,
+    });
+  }
+
+  it("sends via Resend with store branding, the tracking carrier + link, and the address", async () => {
+    findById.mockResolvedValue(tenant({ name: "Acme Store" }));
+
+    await emailService.sendShippingConfirmation(shippedOrder());
+
+    expect(findById).toHaveBeenCalledWith("tenant_1");
+    const email = lastEmail();
+    expect(email.from).toBe("Acme <orders@acme.test>");
+    expect(email.to).toBe("shopper@example.com");
+    expect(email.subject).toBe("Your order 20250101-SHIP01 has shipped");
+
+    // AC: shows the tracking carrier + a tracking link.
+    expect(email.html).toContain("UPS");
+    expect(email.html).toContain("1Z999AA10123456784");
+    expect(email.html).toContain(
+      'href="https://track.example.test/1Z999AA10123456784"',
+    );
+    expect(email.html).toContain("Track your shipment");
+    expect(email.html).toContain("Acme Store");
+
+    // The shipping address and the ordered item (title) are rendered.
+    expect(email.html).toContain("Ada Lovelace");
+    expect(email.html).toContain("1 Analytical Ave");
+    expect(email.html).toContain("San Francisco, CA 94103");
+    expect(email.html).toContain("Widget — Blue");
+
+    // The plain-text alternative carries the same tracking details for deliverability.
+    expect(email.text).toContain("Carrier: UPS");
+    expect(email.text).toContain("Tracking number: 1Z999AA10123456784");
+    expect(email.text).toContain(
+      "Track your shipment: https://track.example.test/1Z999AA10123456784",
+    );
+    expect(email.text).toContain("Ada Lovelace");
+  });
+
+  it("forwards an idempotency key to Resend as request options (outbox drain)", async () => {
+    await emailService.sendShippingConfirmation(shippedOrder(), {
+      idempotencyKey: "sc_order_1",
+    });
+
+    expect(sendMock.mock.calls[0][1]).toMatchObject({
+      idempotencyKey: "sc_order_1",
+    });
+  });
+
+  it("escapes HTML-significant characters in order titles and the address", async () => {
+    findById.mockResolvedValue(tenant({ name: `A&W "Root" <b>'s` }));
+
+    await emailService.sendShippingConfirmation(
+      shippedOrder({
+        shipName: `<script>alert("x")&'</script>`,
+        items: [orderItem({ titleSnapshot: `<b>Widget</b> & "Co"` })],
+      }),
+    );
+
+    const email = lastEmail();
+    // Raw markup from admin/address text must never reach the HTML body verbatim.
+    expect(email.html).not.toContain("<script>");
+    expect(email.html).toContain("&lt;script&gt;");
+    expect(email.html).toContain("&lt;b&gt;Widget&lt;/b&gt;");
+    expect(email.html).toContain("&amp;");
+    expect(email.html).toContain("A&amp;W");
+    // The plain-text part is not HTML, so it carries the raw title unescaped.
+    expect(email.text).toContain(`<b>Widget</b> & "Co"`);
+  });
+
+  it("renders the tracking link only for an http(s) url, else falls back to text", async () => {
+    await emailService.sendShippingConfirmation(
+      shippedOrder({ trackingUrl: "javascript:alert(1)" }),
+    );
+
+    const email = lastEmail();
+    // A non-web (or unsafe) url is never rendered as a link...
+    expect(email.html).not.toContain("Track your shipment");
+    expect(email.html).not.toContain("javascript:");
+    expect(email.text).not.toContain("Track your shipment:");
+    // ...but the carrier + tracking number still show.
+    expect(email.html).toContain("UPS");
+    expect(email.html).toContain("1Z999AA10123456784");
+  });
+
+  it("omits the carrier line when the shipment has no carrier (number is the signal)", async () => {
+    // The poll maps a carrier-less shipment to `trackingCarrier: null` (Printful can
+    // report a tracking number with no carrier), so this is a real runtime shape.
+    await emailService.sendShippingConfirmation(
+      shippedOrder({ trackingCarrier: null }),
+    );
+
+    const email = lastEmail();
+    expect(email.html).not.toContain("Carrier");
+    expect(email.text).not.toContain("Carrier:");
+    // The tracking number + link still render.
+    expect(email.html).toContain("1Z999AA10123456784");
+    expect(email.html).toContain("Track your shipment");
+  });
+
+  it("omits the address section when the order carries no shipping address", async () => {
+    await emailService.sendShippingConfirmation(
+      shippedOrder({
+        shipName: null,
+        shipLine1: null,
+        shipLine2: null,
+        shipCity: null,
+        shipState: null,
+        shipPostalCode: null,
+        shipCountry: null,
+      }),
+    );
+
+    const email = lastEmail();
+    expect(email.html).not.toContain("Shipping to");
+    expect(email.text).not.toContain("Shipping to:");
+    // The tracking details are unaffected.
+    expect(email.html).toContain("1Z999AA10123456784");
+  });
+
+  it("falls back to a neutral store name when the tenant can't be resolved", async () => {
+    findById.mockResolvedValue(null);
+
+    await emailService.sendShippingConfirmation(shippedOrder());
+
+    const email = lastEmail();
+    expect(email.html).toContain("our store");
+    expect(email.text).toContain("our store");
+  });
+
+  it("throws EmailNotConfiguredError before any work when the API key is unset", async () => {
+    env.RESEND_API_KEY = undefined;
+
+    await expect(
+      emailService.sendShippingConfirmation(shippedOrder()),
+    ).rejects.toBeInstanceOf(EmailNotConfiguredError);
+    expect(findById).not.toHaveBeenCalled();
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("throws when Resend reports an error", async () => {
+    sendMock.mockResolvedValue({
+      data: null,
+      error: { name: "rate_limit_exceeded", message: "Too many requests" },
+    });
+
+    await expect(
+      emailService.sendShippingConfirmation(shippedOrder()),
+    ).rejects.toThrow(
+      "Resend failed to send shipping confirmation (rate_limit_exceeded): Too many requests",
+    );
+  });
+});

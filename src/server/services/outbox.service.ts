@@ -11,10 +11,7 @@ import {
   FulfillmentError,
   FulfillmentNotConfiguredError,
 } from "@/server/fulfillment.errors";
-import {
-  OutboxDeferredError,
-  OutboxPermanentError,
-} from "@/server/outbox.errors";
+import { OutboxPermanentError } from "@/server/outbox.errors";
 import { reportError } from "@/server/observability/error-reporter";
 import { logger, type Logger } from "@/server/observability/logger";
 
@@ -74,13 +71,6 @@ const BACKOFF_CAP_MS = 6 * 60 * 60_000; // 6 h ceiling
 
 /** Keep `lastError` bounded — it is diagnostics, not a payload. */
 const MAX_LAST_ERROR_LEN = 500;
-
-/** How long to hold a message whose send path isn't implemented yet
- *  (`SHIPPING_CONFIRMATION` until M4-08). Comfortably short so the backlog drains
- *  soon after the send path lands, yet long enough that a still-unimplemented type
- *  isn't re-claimed every run. A deferral counts no attempt, so this never marches
- *  a row toward DEAD. */
-const DEFER_MS = 60 * 60_000; // 1 h
 
 const log = logger.child({ component: "outbox" });
 
@@ -146,17 +136,28 @@ async function sendMessage(message: OutboxMessageSummary): Promise<void> {
       // transient, retried then DEAD.)
       await fulfillmentService.submitOrder(message.tenantId, message.orderId);
       return;
-    case "SHIPPING_CONFIRMATION":
-      // The shipped + tracking email. The poll-fulfillment cron enqueues these on
-      // the SUBMITTED → SHIPPED reconcile (M4 #140), but the SEND path is M4-08
-      // (#141). Until it lands, DEFER rather than fail: throwing OutboxDeferredError
-      // makes the drain hold the row PENDING (no attempt counted, never DEAD, never
-      // alerted), so a real shipped order's email waits safely for #141 instead of
-      // being permanently dead-lettered on the happy path. #141 replaces this throw
-      // with the real `emailService.sendShippingConfirmation(order, …)`.
-      throw new OutboxDeferredError(
-        `outbox message ${message.id} has no send path for type ${message.type} yet`,
+    case "SHIPPING_CONFIRMATION": {
+      // The shipped + tracking email (M4-08). The poll-fulfillment cron enqueues
+      // these on the SUBMITTED → SHIPPED reconcile (M4 #140); this sends them. Same
+      // shape as ORDER_CONFIRMATION: re-read the order tenant-scoped — its row now
+      // carries the trackingCarrier/Number/Url the reconcile persisted and the
+      // ship* address the email renders — and a missing order is a permanent
+      // failure for the same reason (orders are never deleted; the FK cascade would
+      // take this row with it, so an orphan is a data-integrity anomaly).
+      const order = await orderRepository.findByIdForTenant(
+        message.tenantId,
+        message.orderId,
       );
+      if (!order) {
+        throw new OutboxPermanentError(
+          `outbox message ${message.id} references missing order ${message.orderId}`,
+        );
+      }
+      await emailService.sendShippingConfirmation(order, {
+        idempotencyKey: message.idempotencyKey,
+      });
+      return;
+    }
     default: {
       // Exhaustive: `message.type` is `never` here, so adding a new enum value
       // without a case above is a compile error, not a runtime surprise.
@@ -252,16 +253,6 @@ async function dispatchOne(
   try {
     await sendMessage(message);
   } catch (err) {
-    // A type whose send path isn't implemented yet (SHIPPING_CONFIRMATION until
-    // #141): hold it PENDING for a later run — no attempt counted, never DEAD,
-    // never alerted — so #140's legitimately-enqueued rows wait safely for the send
-    // path instead of being permanently dead-lettered (which would drop a real
-    // shipping email and false-alarm on the happy path). NOT a failure: skipped.
-    if (err instanceof OutboxDeferredError) {
-      await outboxRepository.defer(message.id, new Date(Date.now() + DEFER_MS));
-      child.info("outbox: deferred — no send path for this type yet");
-      return "skipped";
-    }
     return settleFailure(message, attempt, err, child);
   }
 

@@ -219,6 +219,160 @@ ${notice}
   return { subject, html, text };
 }
 
+/**
+ * Build the shipping-address block as display lines in postal order, skipping any
+ * absent field — name / line1 / line2? / "city, state postal" / country. A shipped
+ * order always carries a full address (fulfillment required it at submission), but
+ * the `ship*` columns are nullable, so this stays defensive: an empty result means
+ * "nothing to show" and the caller omits the section. Returns RAW lines; the HTML
+ * render escapes each, the text render uses them as-is (the same raw/escaped split
+ * `renderOrderConfirmation` applies to order titles).
+ */
+function shippingAddressLines(order: OrderWithItems): string[] {
+  const cityRegion = [order.shipCity, order.shipState]
+    .map((v) => v?.trim())
+    .filter((v): v is string => !!v)
+    .join(", ");
+  const cityLine = [cityRegion, order.shipPostalCode?.trim()]
+    .filter((v): v is string => !!v)
+    .join(" ");
+  return [
+    order.shipName,
+    order.shipLine1,
+    order.shipLine2,
+    cityLine,
+    order.shipCountry,
+  ]
+    .map((v) => v?.trim() ?? "")
+    .filter((v) => v.length > 0);
+}
+
+/**
+ * Render the shipping-confirmation email (M4-08 / #141) — the "your order has
+ * shipped" notification the poll-fulfillment reconcile enqueues once a provider
+ * reports a shipment. Mirrors `renderOrderConfirmation`'s email-client-safe shape
+ * (a max-width table, inline hex — email clients honour neither CSS custom
+ * properties nor external stylesheets — and a plain-text alternative) and its
+ * escaping discipline: every value the shopper didn't author — the store name,
+ * order titles, the shipping address, and the provider-supplied carrier + tracking
+ * — is escaped into the HTML body as text, never trusted as markup (the tracking
+ * URL is escaped for its `href` too).
+ *
+ * The `tracking*` columns are nullable, but a `SHIPPING_CONFIRMATION` is only ever
+ * enqueued right after `markShipped` persists a real tracking NUMBER (the poll's
+ * provider-agnostic "shipped" signal), so a number is present in practice; the
+ * carrier and URL may still be absent (a shipment can carry a number but no carrier
+ * or link). The "Track your shipment" link renders only for an http(s) URL, so a
+ * missing or non-web value degrades to carrier + number as text rather than an odd
+ * or unsafe `href`.
+ */
+function renderShippingConfirmation(
+  order: OrderWithItems,
+  storeName: string,
+): RenderedEmail {
+  const rows = order.items
+    .map(
+      (item) => `
+            <tr>
+              <td style="padding:12px 0;border-bottom:1px solid #ececec;font-weight:500;">${escapeHtml(item.titleSnapshot)}</td>
+              <td style="padding:12px 0;border-bottom:1px solid #ececec;text-align:right;white-space:nowrap;color:#6b7280;">Qty ${item.quantity}</td>
+            </tr>`,
+    )
+    .join("");
+
+  const subject = `Your order ${order.orderNumber} has shipped`;
+
+  // A tracking link renders only for a web URL; carrier + number always show as
+  // text. The URL comes from the provider (server-side), but is still escaped for
+  // the `href` — and gated to http(s) — so a garbage value can't break the attribute.
+  const trackingUrl =
+    order.trackingUrl && /^https?:\/\//i.test(order.trackingUrl)
+      ? order.trackingUrl
+      : null;
+
+  const trackingRows = [
+    order.trackingCarrier
+      ? `
+            <tr>
+              <td style="color:#6b7280;">Carrier</td>
+              <td style="text-align:right;font-weight:600;">${escapeHtml(order.trackingCarrier)}</td>
+            </tr>`
+      : "",
+    order.trackingNumber
+      ? `
+            <tr>
+              <td style="color:#6b7280;">Tracking number</td>
+              <td style="text-align:right;font-weight:600;">${escapeHtml(order.trackingNumber)}</td>
+            </tr>`
+      : "",
+  ].join("");
+
+  const trackButton = trackingUrl
+    ? `
+          <a href="${escapeHtml(trackingUrl)}" style="display:inline-block;margin:20px 0 0;padding:12px 22px;background:#111827;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">Track your shipment</a>`
+    : "";
+
+  const addressLines = shippingAddressLines(order);
+  const address =
+    addressLines.length > 0
+      ? `
+          <h2 style="margin:32px 0 8px;font-size:14px;">Shipping to</h2>
+          <p style="margin:0;color:#374151;font-size:14px;line-height:1.5;">${addressLines
+            .map(escapeHtml)
+            .join("<br />")}</p>`
+      : "";
+
+  const html = `<!doctype html>
+<html lang="en">
+  <body style="margin:0;background:#f6f6f6;padding:24px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #ececec;border-radius:12px;">
+      <tr>
+        <td style="padding:32px;">
+          <div style="font-size:13px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:#6b7280;">${escapeHtml(storeName)}</div>
+          <h1 style="margin:8px 0 4px;font-size:22px;">Your order is on its way</h1>
+          <p style="margin:0 0 24px;color:#6b7280;font-size:14px;">Good news — your order has shipped. Use the tracking details below to follow its journey.</p>
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;margin-bottom:8px;">
+            <tr>
+              <td style="color:#6b7280;">Order number</td>
+              <td style="text-align:right;font-weight:600;">${escapeHtml(order.orderNumber)}</td>
+            </tr>${trackingRows}
+          </table>${trackButton}
+
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;margin-top:24px;">${rows}
+          </table>${address}
+
+          <p style="margin:32px 0 0;color:#6b7280;font-size:13px;">This notification was sent to ${escapeHtml(order.email)}. Reply to this email if you have any questions.</p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+
+  const text = [
+    `${storeName} — your order has shipped`,
+    "",
+    "Good news — your order has shipped.",
+    "",
+    `Order number: ${order.orderNumber}`,
+    ...(order.trackingCarrier ? [`Carrier: ${order.trackingCarrier}`] : []),
+    ...(order.trackingNumber
+      ? [`Tracking number: ${order.trackingNumber}`]
+      : []),
+    ...(trackingUrl ? [`Track your shipment: ${trackingUrl}`] : []),
+    "",
+    "Items:",
+    ...order.items.map(
+      (item) => `- ${item.titleSnapshot} (Qty ${item.quantity})`,
+    ),
+    ...(addressLines.length > 0 ? ["", "Shipping to:", ...addressLines] : []),
+    "",
+    `This notification was sent to ${order.email}.`,
+  ].join("\n");
+
+  return { subject, html, text };
+}
+
 export const emailService = {
   /**
    * Email a shopper their order confirmation — or, for an oversold order, the
@@ -271,6 +425,59 @@ export const emailService = {
     if (error) {
       throw new Error(
         `Resend failed to send order confirmation (${error.name}): ${error.message}`,
+      );
+    }
+  },
+
+  /**
+   * Email a shopper that their order has shipped — with the carrier + a tracking
+   * link and the shipping address (#141). The poll-fulfillment reconcile (M4 #140)
+   * enqueues it, and the outbox drain delivers it through the SAME path as the
+   * confirmation, so it shares that path's failure policy: an unset/blank Resend
+   * config throws the permanent `EmailNotConfiguredError` (the drain marks it DEAD,
+   * never spins on it), and a Resend API error — or an `EmailSendTimeoutError` if
+   * the send exceeds `SEND_TIMEOUT_MS` (#31) — surfaces as a throw the drain
+   * retries with backoff. Branded with the tenant's store name (looked up from
+   * `order.tenantId`), falling back to a neutral label if the tenant can't be
+   * resolved.
+   *
+   * `options.idempotencyKey` (the drain passes `sc_<orderId>`) rides along as
+   * Resend's `Idempotency-Key`, so a send that succeeds but whose row update is
+   * then lost to a killed worker is deduped on the re-drain instead of sending a
+   * second email (24h window).
+   */
+  async sendShippingConfirmation(
+    order: OrderWithItems,
+    options?: { idempotencyKey?: string },
+  ): Promise<void> {
+    // Same send-time config gate as the confirmation: unset/blank is a permanent
+    // failure, checked before any DB or network work.
+    const apiKey = env.RESEND_API_KEY;
+    const from = env.EMAIL_FROM;
+    if (!apiKey || !from) {
+      throw new EmailNotConfiguredError();
+    }
+
+    const tenant = await tenantRepository.findById(order.tenantId);
+    const storeName = tenant?.name ?? "our store";
+    const { subject, html, text } = renderShippingConfirmation(
+      order,
+      storeName,
+    );
+
+    // Resend reports API failures via `error`, not a throw — turn it into a throw
+    // so callers have one failure channel. Bounded by `withSendTimeout` (#31); the
+    // idempotency key (if any) rides in the request options, not the payload.
+    const { error } = await withSendTimeout(
+      getResend(apiKey).emails.send(
+        { from, to: order.email, subject, html, text },
+        { idempotencyKey: options?.idempotencyKey },
+      ),
+      SEND_TIMEOUT_MS,
+    );
+    if (error) {
+      throw new Error(
+        `Resend failed to send shipping confirmation (${error.name}): ${error.message}`,
       );
     }
   },

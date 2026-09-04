@@ -42,8 +42,13 @@ const POLL_TIME_BUDGET_MS = 45_000;
 
 const pollLog = logger.child({ component: "fulfillment-poll" });
 
+/** A tenant-scoped order reference the poll hands back for the route's immediate
+ *  best-effort shipping-email dispatch (the #139 webhook pattern). */
+export type ShippedOrderRef = { tenantId: string; orderId: string };
+
 /** Per-run tallies from the poll-fulfillment cron (M4 #140), surfaced by the
- *  route for observability. */
+ *  route for observability, plus the orders reconciled this run so the route can
+ *  fire an immediate best-effort shipping-email dispatch (#141). */
 export type PollResult = {
   /** Orders reconciled SUBMITTED → SHIPPED (Order PAID → FULFILLED) this run. */
   shipped: number;
@@ -53,6 +58,10 @@ export type PollResult = {
   /** Poll hit a transient provider/DB fault (isolated so one can't abort the
    *  batch); the order is left SUBMITTED and retried next run. */
   errored: number;
+  /** The orders reconciled to SHIPPED this run — the route dispatches each one's
+   *  shipping email immediately (the outbox drain being the durable path).
+   *  Consumed by the route; deliberately NOT echoed in its JSON response body. */
+  shippedOrders: ShippedOrderRef[];
 };
 
 /** Outcome of polling one open shipment (drives the `PollResult` tally). */
@@ -129,7 +138,9 @@ export const fulfillmentService = {
    * guarded flip enqueues the email exactly once. Batch- and time-bounded; whatever
    * isn't reached this run is polled by the next. When no provider is configured
    * (production without `PRINTFUL_API_KEY`) there is nothing to reconcile — warn and
-   * return zeros. Per-run counts are returned for the route to log.
+   * return zeros. Per-run counts are returned for the route to log, alongside the
+   * orders reconciled this run so the route can dispatch their shipping emails
+   * immediately (#141) rather than wait for the next cron tick's outbox drain.
    */
   async pollOpenShipments(): Promise<PollResult> {
     const provider = getFulfillmentProvider();
@@ -139,12 +150,17 @@ export const fulfillmentService = {
       pollLog.warn(
         "poll: no fulfillment provider configured — nothing to reconcile",
       );
-      return { shipped: 0, pending: 0, errored: 0 };
+      return { shipped: 0, pending: 0, errored: 0, shippedOrders: [] };
     }
 
     const open = await orderRepository.findSubmittedForPolling(POLL_BATCH_SIZE);
 
-    const result: PollResult = { shipped: 0, pending: 0, errored: 0 };
+    const result: PollResult = {
+      shipped: 0,
+      pending: 0,
+      errored: 0,
+      shippedOrders: [],
+    };
     const deadline = Date.now() + POLL_TIME_BUDGET_MS;
     for (const order of open) {
       // Stop starting new work once the budget is spent — better to leave the rest
@@ -158,7 +174,16 @@ export const fulfillmentService = {
         break;
       }
       try {
-        result[await pollOne(provider, order)] += 1;
+        const outcome = await pollOne(provider, order);
+        result[outcome] += 1;
+        // Collect the just-shipped order so the route can fire its immediate
+        // best-effort shipping-email dispatch (the daily drain is the durable path).
+        if (outcome === "shipped") {
+          result.shippedOrders.push({
+            tenantId: order.tenantId,
+            orderId: order.id,
+          });
+        }
       } catch (err) {
         // Unexpected (a DB error in markShipped not already handled inside pollOne).
         // Leave the order SUBMITTED — still reconcilable — for the next run.

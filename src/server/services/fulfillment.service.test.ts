@@ -410,7 +410,13 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
       trackingNumber: "1Z999",
       trackingUrl: "https://track.example.test/1Z999",
     });
-    expect(result).toEqual({ shipped: 1, pending: 0, errored: 0 });
+    // The shipped order is reported back for the route's immediate email dispatch.
+    expect(result).toEqual({
+      shipped: 1,
+      pending: 0,
+      errored: 0,
+      shippedOrders: [{ tenantId: TENANT, orderId: "order_1" }],
+    });
   });
 
   it("maps a shipment with no carrier/url to nulls (tracking number is the signal)", async () => {
@@ -439,7 +445,12 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     const result = await fulfillmentService.pollOpenShipments();
 
     expect(markShipped).not.toHaveBeenCalled();
-    expect(result).toEqual({ shipped: 0, pending: 1, errored: 0 });
+    expect(result).toEqual({
+      shipped: 0,
+      pending: 1,
+      errored: 0,
+      shippedOrders: [],
+    });
   });
 
   it("counts a transient getTracking failure as errored, without reconciling", async () => {
@@ -449,7 +460,12 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     const result = await fulfillmentService.pollOpenShipments();
 
     expect(markShipped).not.toHaveBeenCalled();
-    expect(result).toEqual({ shipped: 0, pending: 0, errored: 1 });
+    expect(result).toEqual({
+      shipped: 0,
+      pending: 0,
+      errored: 1,
+      shippedOrders: [],
+    });
   });
 
   it("counts a refunded/fulfilled race (markShipped=false) as pending, not shipped", async () => {
@@ -465,7 +481,12 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     const result = await fulfillmentService.pollOpenShipments();
 
     expect(markShipped).toHaveBeenCalledOnce();
-    expect(result).toEqual({ shipped: 0, pending: 1, errored: 0 });
+    expect(result).toEqual({
+      shipped: 0,
+      pending: 1,
+      errored: 0,
+      shippedOrders: [],
+    });
   });
 
   it("skips an order with no fulfillmentExternalId (errored, never calls the provider)", async () => {
@@ -477,7 +498,12 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
 
     expect(getTrackingMock()).not.toHaveBeenCalled();
     expect(markShipped).not.toHaveBeenCalled();
-    expect(result).toEqual({ shipped: 0, pending: 0, errored: 1 });
+    expect(result).toEqual({
+      shipped: 0,
+      pending: 0,
+      errored: 1,
+      shippedOrders: [],
+    });
   });
 
   it("isolates a markShipped DB error per order and keeps polling the rest", async () => {
@@ -497,7 +523,13 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     const result = await fulfillmentService.pollOpenShipments();
 
     expect(markShipped).toHaveBeenCalledTimes(2);
-    expect(result).toEqual({ shipped: 1, pending: 0, errored: 1 });
+    // Only the successfully-reconciled order (o2) is reported for dispatch.
+    expect(result).toEqual({
+      shipped: 1,
+      pending: 0,
+      errored: 1,
+      shippedOrders: [{ tenantId: TENANT, orderId: "o2" }],
+    });
   });
 
   it("returns zeros and queries nothing when no provider is configured", async () => {
@@ -506,6 +538,11 @@ describe("fulfillmentService.pollOpenShipments — reconciliation", () => {
     const result = await fulfillmentService.pollOpenShipments();
 
     expect(findSubmittedForPolling).not.toHaveBeenCalled();
-    expect(result).toEqual({ shipped: 0, pending: 0, errored: 0 });
+    expect(result).toEqual({
+      shipped: 0,
+      pending: 0,
+      errored: 0,
+      shippedOrders: [],
+    });
   });
 });

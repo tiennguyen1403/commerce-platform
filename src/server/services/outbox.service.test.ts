@@ -36,14 +36,16 @@ vi.mock("@/server/repositories/outbox.repository", () => ({
     markSent: vi.fn(),
     reschedule: vi.fn(),
     markDead: vi.fn(),
-    defer: vi.fn(),
   },
 }));
 vi.mock("@/server/repositories/order.repository", () => ({
   orderRepository: { findByIdForTenant: vi.fn() },
 }));
 vi.mock("@/server/services/email.service", () => ({
-  emailService: { sendOrderConfirmation: vi.fn() },
+  emailService: {
+    sendOrderConfirmation: vi.fn(),
+    sendShippingConfirmation: vi.fn(),
+  },
 }));
 vi.mock("@/server/services/fulfillment.service", () => ({
   fulfillmentService: { submitOrder: vi.fn() },
@@ -69,9 +71,11 @@ const claim = vi.mocked(outboxRepository.claim);
 const markSent = vi.mocked(outboxRepository.markSent);
 const reschedule = vi.mocked(outboxRepository.reschedule);
 const markDead = vi.mocked(outboxRepository.markDead);
-const defer = vi.mocked(outboxRepository.defer);
 const findOrder = vi.mocked(orderRepository.findByIdForTenant);
 const sendOrderConfirmation = vi.mocked(emailService.sendOrderConfirmation);
+const sendShippingConfirmation = vi.mocked(
+  emailService.sendShippingConfirmation,
+);
 const submitOrder = vi.mocked(fulfillmentService.submitOrder);
 const report = vi.mocked(reportError);
 
@@ -80,7 +84,6 @@ const report = vi.mocked(reportError);
 const NOW = new Date("2026-01-15T12:00:00.000Z");
 const CLAIM_TIMEOUT_MS = 5 * 60_000;
 const BACKOFF_FIRST_MS = 60_000;
-const DEFER_MS = 60 * 60_000;
 
 function summary(o: Partial<OutboxMessageSummary> = {}): OutboxMessageSummary {
   return {
@@ -152,9 +155,9 @@ beforeEach(() => {
   markSent.mockResolvedValue(undefined);
   reschedule.mockResolvedValue(undefined);
   markDead.mockResolvedValue(undefined);
-  defer.mockResolvedValue(undefined);
   findOrder.mockResolvedValue(orderWithItems());
   sendOrderConfirmation.mockResolvedValue(undefined);
+  sendShippingConfirmation.mockResolvedValue(undefined);
   submitOrder.mockResolvedValue(undefined);
   report.mockResolvedValue(undefined);
 });
@@ -415,7 +418,7 @@ describe("outboxService.drain — FULFILLMENT_SUBMISSION (M4 #139)", () => {
   });
 });
 
-describe("outboxService.drain — SHIPPING_CONFIRMATION (M4 #140; send path is #141)", () => {
+describe("outboxService.drain — SHIPPING_CONFIRMATION (M4-08 #141)", () => {
   const shippingMsg = (o: Partial<OutboxMessageSummary> = {}) =>
     summary({
       type: "SHIPPING_CONFIRMATION",
@@ -423,40 +426,63 @@ describe("outboxService.drain — SHIPPING_CONFIRMATION (M4 #140; send path is #
       ...o,
     });
 
-  it("defers the message instead of sending, failing, or dead-lettering it", async () => {
-    findDue.mockResolvedValue([shippingMsg({ attempts: 0 })]);
+  it("re-reads the order tenant-scoped and dispatches the shipping email, then SENT", async () => {
+    findDue.mockResolvedValue([shippingMsg()]);
 
     const result = await outboxService.drain();
 
-    // #140 enqueues these before the send path exists (#141): the drain must HOLD
-    // the row (PENDING, pushed out) rather than dead-letter it — dead-lettering
-    // would permanently drop a real shipping email and false-alarm on the happy path.
-    expect(defer).toHaveBeenCalledWith(
-      "msg_1",
-      new Date(NOW.getTime() + DEFER_MS),
-    );
-    expect(markDead).not.toHaveBeenCalled();
-    expect(reschedule).not.toHaveBeenCalled();
-    expect(report).not.toHaveBeenCalled();
-    // Neither the confirmation nor the fulfillment send path is touched.
+    expect(findOrder).toHaveBeenCalledWith("tenant_1", "order_1");
+    expect(sendShippingConfirmation).toHaveBeenCalledWith(orderWithItems(), {
+      idempotencyKey: "sc_order_1",
+    });
+    // Its own send path — neither the confirmation nor the fulfillment path fires.
     expect(sendOrderConfirmation).not.toHaveBeenCalled();
     expect(submitOrder).not.toHaveBeenCalled();
-    // A deferral is benign — counted as skipped, not sent/failed/dead.
-    expect(result).toMatchObject({ sent: 0, failed: 0, dead: 0, skipped: 1 });
+    expect(markSent).toHaveBeenCalledWith("msg_1");
+    expect(result).toMatchObject({ sent: 1, failed: 0, dead: 0, skipped: 0 });
   });
 
-  it("never dead-letters a deferral, even at a high attempt count", async () => {
-    // A deferral counts no attempt (`defer` leaves `attempts` untouched), so a
-    // SHIPPING_CONFIRMATION row can never march toward the DEAD budget while its
-    // send path is still pending — it simply waits.
-    findDue.mockResolvedValue([shippingMsg({ attempts: 9 })]);
+  it("marks DEAD and alerts when the referenced order is gone (permanent)", async () => {
+    findDue.mockResolvedValue([shippingMsg({ attempts: 0 })]);
+    findOrder.mockResolvedValue(null);
 
     const result = await outboxService.drain();
 
-    expect(defer).toHaveBeenCalledOnce();
+    expect(sendShippingConfirmation).not.toHaveBeenCalled();
+    expect(markDead).toHaveBeenCalledOnce();
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(report).toHaveBeenCalledOnce(); // a data-integrity anomaly, alert
+    expect(result).toMatchObject({ dead: 1 });
+  });
+
+  it("marks DEAD without alerting when email is simply not configured", async () => {
+    // The acceptance-criteria path: an unset/blank Resend config resolves to the
+    // same EmailNotConfiguredError → DEAD handling as the confirmation (never spins).
+    findDue.mockResolvedValue([shippingMsg({ attempts: 0 })]);
+    sendShippingConfirmation.mockRejectedValue(new EmailNotConfiguredError());
+
+    const result = await outboxService.drain();
+
+    expect(markDead).toHaveBeenCalledOnce();
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(report).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ dead: 1 });
+  });
+
+  it("reschedules a transient send failure with backoff (retry, never DEAD)", async () => {
+    findDue.mockResolvedValue([shippingMsg({ attempts: 0 })]);
+    sendShippingConfirmation.mockRejectedValue(new Error("Resend 503"));
+
+    const result = await outboxService.drain();
+
+    expect(reschedule).toHaveBeenCalledWith(
+      "msg_1",
+      new Date(NOW.getTime() + BACKOFF_FIRST_MS),
+      "Error: Resend 503",
+    );
     expect(markDead).not.toHaveBeenCalled();
     expect(report).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ dead: 0, skipped: 1 });
+    expect(result).toMatchObject({ failed: 1, dead: 0 });
   });
 });
 
