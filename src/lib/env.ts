@@ -73,6 +73,34 @@ const schema = z.object({
       return trimmed ? Number(trimmed) : undefined;
     })
     .pipe(z.number().positive().default(10)),
+  // Erroring-open-shipment alert threshold, a positive COUNT of consecutive failed
+  // `getTracking` polls (M4 #172; the erroring-streak sibling of the age-based
+  // `FULFILLMENT_STUCK_THRESHOLD_DAYS` above, made tunable the same way #162 did that one).
+  // How many runs in a row `getTracking` may throw before the fulfillment poll surfaces an
+  // order as ERRORING for an operator to chase (M4 #163) — tracking unreadable (a bad/stale
+  // external id or a persistent provider fault), money captured, no reconciliation possible.
+  // OPTIONAL and server-only (read only in `src/server/services/fulfillment.service.ts`):
+  // unset OR blank keeps the built-in 144 default (≈ 24h at the every-10-minute cron cadence),
+  // so today's behaviour needs no `.env` entry. Env-tunable so the value can be adjusted
+  // without a deploy — provisional until real Printful error data exists, and cadence-coupled
+  // by construction (the wall-clock 144 represents shifts if the cron interval changes), so
+  // revisit it alongside any such change. Blank/unset reads as unset and takes the default,
+  // like `optionalEnvString` above — but UNLIKE those optional secrets, a present-but-malformed
+  // value fails fast at boot rather than silently falling back (same reasoning as the stuck
+  // knob: a numeric knob's well-formedness is checkable up front, and a silent fallback would
+  // mask an operator typo — they'd believe erroring-detection runs at their value while it
+  // quietly ran at 144). Validated as `.int()` (NOT just `.positive()` like the stuck-days
+  // knob, which multiplies into milliseconds and may be fractional): the alert is an EXACT
+  // `count === threshold` match against an always-integer poll count, so a fractional value
+  // would boot yet never fire — the very silent-typo failure fail-fast exists to prevent.
+  FULFILLMENT_ERROR_ALERT_THRESHOLD: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const trimmed = value?.trim();
+      return trimmed ? Number(trimmed) : undefined;
+    })
+    .pipe(z.number().int().positive().default(144)),
   NODE_ENV: z
     .enum(["development", "test", "production"])
     .default("development"),

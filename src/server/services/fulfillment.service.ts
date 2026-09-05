@@ -88,16 +88,21 @@ const STUCK_SUBMITTED_THRESHOLD_MS =
  *  low-false-alarm philosophy as #155's generous 10-day hold buffer). Alert-only: like
  *  #155 the order is left SUBMITTED and keeps polling — a getTracking error means we can't
  *  READ the status, not that the order won't ship (a long outage still recovers), so it is
- *  never terminalized (that's #151's job, for a provider-confirmed cancel/fail). A module
- *  constant, not env-tunable (unlike #162's stuck-days knob): provisional until real
- *  Printful error data exists — an env knob, and decoupling the count from the poll cadence,
- *  are natural follow-ups. Note it is cadence-coupled by construction: a change to the cron
- *  interval reweights the wall-clock this represents, so revisit it alongside any such change.
+ *  never terminalized (that's #151's job, for a provider-confirmed cancel/fail). Env-tunable
+ *  via `FULFILLMENT_ERROR_ALERT_THRESHOLD` (a positive integer count — see `src/lib/env.ts`,
+ *  which also holds the 144 default), resolved from `env` once at module load exactly like
+ *  `STUCK_SUBMITTED_THRESHOLD_MS` above, so the value can be adjusted without a deploy while it
+ *  stays provisional (M4 #172, mirroring #162's stuck-days knob; unset/blank keeps 144). It is
+ *  cadence-coupled by construction: a change to the cron interval reweights the wall-clock 144
+ *  represents, so revisit it alongside any such change — decoupling the count from the cadence
+ *  (expressing the threshold as a wall-clock first-error-timestamp streak) is the deferred
+ *  follow-up, weighed against its cost: a pure count keeps this alert's free `=== threshold`
+ *  idempotency, whereas a timestamp would need a separate "surfaced" marker.
  *
  *  Exported (unlike the other poll knobs) so the poll tests can assert the surface-once
  *  boundary against the single source of truth — the alert is an EXACT `=== threshold`
  *  match, so a magic literal in the test would silently drift from this value. */
-export const ERROR_POLL_ALERT_THRESHOLD = 144;
+export const ERROR_POLL_ALERT_THRESHOLD = env.FULFILLMENT_ERROR_ALERT_THRESHOLD;
 
 const pollLog = logger.child({ component: "fulfillment-poll" });
 
