@@ -162,6 +162,48 @@ const PRODUCTS: SeedProduct[] = [
   },
 ];
 
+type SeedImage = {
+  // Filename committed under public/seed/; served statically at `/seed/<file>`.
+  file: string;
+  altText: string;
+  // Intrinsic pixel dimensions — MUST match the committed file. Load-bearing for
+  // next/image's remote-src contract once M5-05 renders these.
+  width: number;
+  height: number;
+};
+
+// Demo images for a few `demo`-store products, keyed by product slug.
+// Deliberately partial: `classic-tee` gets two shots (so the PDP gallery /
+// thumbnail rail has something to render once M5-05 lands), `everyday-hoodie`
+// one, and every other product none — so the storefront's image-less placeholder
+// fallback stays exercised too. Provider-independent: `url` = `/seed/<file>`
+// (served from public/), `key` = `seed/<file>` (an opaque, non-Blob storage key).
+// Only `demo` is seeded with images; `aurora` stays image-less.
+const PRODUCT_IMAGES: Record<string, SeedImage[]> = {
+  "classic-tee": [
+    {
+      file: "classic-tee-front.png",
+      altText: "Classic Tee — front",
+      width: 1200,
+      height: 1200,
+    },
+    {
+      file: "classic-tee-back.png",
+      altText: "Classic Tee — back",
+      width: 1200,
+      height: 1200,
+    },
+  ],
+  "everyday-hoodie": [
+    {
+      file: "everyday-hoodie.png",
+      altText: "Everyday Hoodie",
+      width: 1000,
+      height: 1250,
+    },
+  ],
+};
+
 // A distinct accent hue for the second store so per-tenant theming (#98) is
 // visible side by side: violet, well clear of the platform emerald (162°).
 const AURORA_HUE = 285;
@@ -230,6 +272,46 @@ async function seedProducts(tenantId: string, products: SeedProduct[]) {
   }
 }
 
+/**
+ * Seed a tenant's demo product images (idempotent). Each row uses a stable,
+ * derived id (`seed-img-<tenantSlug>-<productSlug>-<position>`) so re-seeding
+ * upserts in place rather than piling up duplicates — `ProductImage` has no
+ * natural unique key. Products absent from `imagesBySlug` are left untouched
+ * (their storefront surfaces fall back to the placeholder).
+ */
+async function seedProductImages(
+  tenantSlug: string,
+  tenantId: string,
+  imagesBySlug: Record<string, SeedImage[]>,
+) {
+  for (const [slug, images] of Object.entries(imagesBySlug)) {
+    const product = await prisma.product.findUnique({
+      where: { tenantId_slug: { tenantId, slug } },
+      select: { id: true },
+    });
+    if (!product) continue; // catalog changed under us — skip, don't throw.
+
+    for (const [position, image] of images.entries()) {
+      const id = `seed-img-${tenantSlug}-${slug}-${position}`;
+      const fields = {
+        tenantId,
+        productId: product.id,
+        url: `/seed/${image.file}`,
+        key: `seed/${image.file}`,
+        altText: image.altText,
+        position,
+        width: image.width,
+        height: image.height,
+      };
+      await prisma.productImage.upsert({
+        where: { id },
+        update: fields,
+        create: { id, ...fields },
+      });
+    }
+  }
+}
+
 async function main() {
   // Primary store, on the platform default hue (162° emerald) — themeHue is left
   // to the column default, so it stays a visual no-op (#98).
@@ -239,6 +321,7 @@ async function main() {
     create: { slug: DEMO_TENANT_SLUG, name: "Demo Store", currency: "usd" },
   });
   await seedProducts(demo.id, PRODUCTS);
+  await seedProductImages(DEMO_TENANT_SLUG, demo.id, PRODUCT_IMAGES);
   const owner = await seedMembers(demo.id);
 
   // A second store on a distinct hue so per-tenant theming is visible at a glance:
@@ -258,8 +341,13 @@ async function main() {
   });
   await seedProducts(aurora.id, AURORA_PRODUCTS);
 
+  const demoImageCount = Object.values(PRODUCT_IMAGES).reduce(
+    (n, imgs) => n + imgs.length,
+    0,
+  );
   console.log(
-    `Seeded "${demo.slug}" (emerald, ${PRODUCTS.length} products) and ` +
+    `Seeded "${demo.slug}" (emerald, ${PRODUCTS.length} products, ${demoImageCount} ` +
+      `images) and ` +
       `"${aurora.slug}" (violet hue ${AURORA_HUE}, ${AURORA_PRODUCTS.length} products, ` +
       `storefront-only); owner "${owner.email}" (OWNER of ${demo.slug}), a STAFF member ` +
       `(staff@demo.test), and an unassigned account (teammate@demo.test) to add via the ` +
