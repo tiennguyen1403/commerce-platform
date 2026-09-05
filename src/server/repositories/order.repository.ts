@@ -5,6 +5,7 @@ import {
   OrderNumberTakenError,
   InsufficientStockError,
 } from "@/server/order.errors";
+import type { ShippingAddress } from "@/server/fulfillment/provider";
 
 /**
  * Data-access for orders. Every method is scoped by `tenantId` so a store can
@@ -29,6 +30,44 @@ export type StalePendingOrder = {
   id: string;
   tenantId: string;
   stripePaymentIntentId: string | null;
+};
+
+/** The fields the poll-fulfillment cron (M4 #140) needs to reconcile one open
+ *  shipment: its id + tenant (for the tenant-scoped reconcile write) and the
+ *  provider's own order id to call `getTracking` against. `fulfillmentExternalId`
+ *  is nullable to mirror the column, but a SUBMITTED order always carries a real
+ *  one (`markSubmitted` is its only writer, on the success path) — the poll skips
+ *  the anomalous null rather than call the provider with an empty id.
+ *
+ *  `createdAt` + `fulfillmentStuckAt` feed the stuck-open-shipment check (M4 #155):
+ *  `createdAt` is the age anchor — immutable, so age reads straight off the row (see the
+ *  threshold constant in `fulfillment.service.ts` for why creation time, not submission
+ *  time, is the anchor) — and `fulfillmentStuckAt` (null until the poll first surfaces the
+ *  order as stuck) lets the poll skip re-alerting one it already flagged — and, since #164,
+ *  drives the poll's write path: on the already-flagged branch (`fulfillmentStuckAt !== null`)
+ *  the poll bumps `fulfillmentStuckPolledAt` (`markStuckRepolled`) to rotate the flagged tail.
+ *  The batch's PRIMARY sort key is that `fulfillmentStuckPolledAt` (#158 deprioritises flagged
+ *  rows to the tail; #164 rotates it — see `findSubmittedForPolling`), with `createdAt` the
+ *  secondary; neither is selected into this shape (the ordering happens in the DB, and the
+ *  poll bumps the key without reading it).
+ *
+ *  `fulfillmentErrorCount` feeds the erroring-open-shipment check (M4 #163): the poll
+ *  reads it so it can tell "this order has never errored / just recovered" (0) from an
+ *  ongoing streak, and reset it to 0 only when it was non-zero — keeping a clean poll of a
+ *  never-errored order write-free. The alert idempotency itself lives in the DB, on the
+ *  post-increment count returned by `recordFulfillmentPollError`, not on this pre-read. The
+ *  batch ordering that once rode on this count moved to `fulfillmentErrorPolledAt` in #175:
+ *  #170 sub-ordered the not-yet-flagged group by this count to sink a perpetually-erroring order
+ *  behind fresh ones, but a stable count could starve a high-count order within a large erroring
+ *  backlog, so #175 rotates the tier by re-poll time instead. This field now feeds only the
+ *  streak read above, never the sort (neither key is selected — the ordering happens in the DB). */
+export type SubmittedOrderForPolling = {
+  id: string;
+  tenantId: string;
+  fulfillmentExternalId: string | null;
+  createdAt: Date;
+  fulfillmentStuckAt: Date | null;
+  fulfillmentErrorCount: number;
 };
 
 /** Who a reuse read is on behalf of — the identity binding that closes #92. A
@@ -70,11 +109,60 @@ export type CreateOrderInput = {
   email: string;
   /** The authenticated shopper's global `User` id, or null for a guest. */
   userId: string | null;
+  /** The validated shipping destination, written onto the order in the SAME
+   *  transaction as its creation (M4 #135). Field names mirror the
+   *  `ShippingAddress` domain shape; mapped to the flat `ship*` columns below. */
+  shippingAddress: ShippingAddress;
   totalCents: number;
   currency: string;
   stripePaymentIntentId: string;
   items: CreateOrderItemInput[];
 };
+
+/**
+ * Map a `ShippingAddress` to the order's flat `ship*` columns (M4 #135). The
+ * optional `line2`/`state` collapse an absent/blank value to `null` — the column
+ * convention for "not provided" (a guest/legacy order has none) — rather than an
+ * empty string. Required fields arrive already trimmed + non-empty from
+ * `shippingAddressSchema`, the sole validation boundary. Shared by the create and
+ * the reuse-path address update so the two can't drift.
+ */
+function shippingAddressColumns(address: ShippingAddress) {
+  return {
+    shipName: address.name,
+    shipLine1: address.line1,
+    shipLine2: address.line2?.trim() || null,
+    shipCity: address.city,
+    shipState: address.state?.trim() || null,
+    shipPostalCode: address.postalCode,
+    shipCountry: address.country,
+  };
+}
+
+/**
+ * Does this order carry a complete shipping address? Checks the same required
+ * columns the fulfillment service narrows to a `ShippingAddress`
+ * (name/line1/city/postalCode/country; line2/state are optional) — kept beside
+ * `shippingAddressColumns` so the two views of the `ship*` columns can't drift.
+ * Gates the `FULFILLMENT_SUBMISSION` enqueue in `markPaidByPaymentIntent` (M4
+ * #139): a guest/legacy order with no address has nowhere to ship, so it never
+ * attempts submission (a `FulfillmentAddressMissingError` would only fail it).
+ */
+function hasShippingAddressColumns(order: {
+  shipName: string | null;
+  shipLine1: string | null;
+  shipCity: string | null;
+  shipPostalCode: string | null;
+  shipCountry: string | null;
+}): boolean {
+  return (
+    !!order.shipName &&
+    !!order.shipLine1 &&
+    !!order.shipCity &&
+    !!order.shipPostalCode &&
+    !!order.shipCountry
+  );
+}
 
 /** Translate the `[tenantId, orderNumber]` unique-constraint failure into a
  *  typed error the service can retry on; rethrow anything else untouched. */
@@ -193,6 +281,19 @@ export type OrderTransitionResult =
   | { transitioned: true }
   | { transitioned: false; currentStatus: OrderStatus | null };
 
+/** The reconciled shipment a poll persists onto an order (M4 #140): the carrier +
+ *  tracking the provider reported, plus its raw status string (→
+ *  `fulfillmentProviderStatus`, admin display only). `carrier`/`trackingUrl` are
+ *  nullable — a shipment may carry a tracking number but no carrier or link — but a
+ *  reconciliation only runs once a `trackingNumber` is present (the poll's
+ *  provider-agnostic "shipped" signal), so that field is non-null. */
+export type ShipmentReconciliation = {
+  providerStatus: string;
+  carrier: string | null;
+  trackingNumber: string;
+  trackingUrl: string | null;
+};
+
 export const orderRepository = {
   /**
    * Create a PENDING order and its line items, reserving inventory for each line
@@ -244,6 +345,9 @@ export const orderRepository = {
               // Null for a guest; a signed-in shopper's global `User` id
               // otherwise (server-resolved upstream, never from the client).
               userId: input.userId,
+              // Shipping destination, flattened onto the order in this SAME
+              // transaction (M4 #135) — no separate write, no order without it.
+              ...shippingAddressColumns(input.shippingAddress),
               totalCents: input.totalCents,
               currency: input.currency,
               stripePaymentIntentId: input.stripePaymentIntentId,
@@ -267,6 +371,28 @@ export const orderRepository = {
     } catch (err) {
       mapWriteError(err);
     }
+  },
+
+  /**
+   * Overwrite a still-PENDING order's shipping address — the reuse-path (#25/#135)
+   * companion to `createWithItems`. When a re-submit reuses an in-flight
+   * PaymentIntent instead of minting a fresh order, the shopper may have edited
+   * their address since it was first written, so the latest submitted address must
+   * win rather than silently shipping to the stale one. Tenant- AND status-scoped
+   * (`updateMany`, not `update` by bare id): only a PENDING order in this tenant is
+   * touched, so a raced PAID/CANCELLED order — or a foreign one — is never
+   * rewritten. Best-effort (no row-count assertion): if the order has already left
+   * PENDING we deliberately leave a captured order's address exactly as it shipped.
+   */
+  async updateShippingAddressForPending(
+    tenantId: string,
+    orderId: string,
+    address: ShippingAddress,
+  ): Promise<void> {
+    await prisma.order.updateMany({
+      where: { id: orderId, tenantId, status: "PENDING" },
+      data: shippingAddressColumns(address),
+    });
   },
 
   /**
@@ -317,6 +443,32 @@ export const orderRepository = {
   },
 
   /**
+   * An order, scoped to the tenant, with its line items each joined to the
+   * fulfillment mapping on their variant (`sku` + `providerVariantId`) — the shape
+   * the submission service (M4 #137) reads to build a provider
+   * `CreateFulfillmentInput`. Tenant in the WHERE (golden rule #1) so one store can
+   * never submit another's order. Only the two mapping fields are selected off the
+   * variant (not the whole row) — the price/stock are snapshotted on the
+   * `OrderItem` already; fulfillment needs just the sku→provider link. Return type
+   * left to inference like the other `include` reads here (a `ReturnType`-derived
+   * annotation would make `orderRepository` reference a type derived from itself, a
+   * circular reference); its shape is captured by the `OrderForFulfillment` type
+   * exported below.
+   */
+  findForFulfillment(tenantId: string, id: string) {
+    return prisma.order.findFirst({
+      where: { tenantId, id },
+      include: {
+        items: {
+          include: {
+            variant: { select: { sku: true, providerVariantId: true } },
+          },
+        },
+      },
+    });
+  },
+
+  /**
    * PENDING orders created before `olderThan`, oldest first, up to `limit` — the
    * abandoned-checkout sweep's work list (#25). Like the outbox drain's `findDue`,
    * this is a **platform-wide** cron query and deliberately spans all tenants — the
@@ -336,6 +488,118 @@ export const orderRepository = {
       orderBy: { createdAt: "asc" },
       take: limit,
       select: { id: true, tenantId: true, stripePaymentIntentId: true },
+    });
+  },
+
+  /**
+   * Open shipments awaiting reconciliation — the poll-fulfillment cron's work list
+   * (M4 #140): orders the provider has accepted (`fulfillmentStatus: SUBMITTED`)
+   * that are still PAID, up to `limit`, oldest first. Like `findStalePending` and
+   * the outbox drain, this is a **platform-wide** cron query and deliberately spans
+   * every tenant — the intentional exception to golden rule #1. There is no leakage:
+   * each row carries its own `tenantId`, and the reconcile write runs through the
+   * tenant-scoped `markShipped(order.tenantId, …)`.
+   *
+   * Both filters matter. `status: "PAID"` excludes an order that left the paid state
+   * after submission — a `refund.succeeded` or a manual FULFILLED both flip `status`
+   * only, leaving `fulfillmentStatus` at SUBMITTED — so the poll never wastes a
+   * provider call on an order its terminal writers would refuse anyway: both
+   * `markShipped` (→ SHIPPED) and `markFulfillmentFailedAfterSubmission` (→ FAILED,
+   * #151) guard on this exact `{status: PAID, fulfillmentStatus: SUBMITTED}` predicate,
+   * so the poll's two exits out of SUBMITTED re-check this filter under the row lock.
+   * SUBMITTED is a transient, low-cardinality state (an order ships or fails out of
+   * it), served by the `[fulfillmentStatus, status]` index (#158, added once a hold
+   * that never resolves — see the ordering below — could let the set grow). Selects
+   * only the fields the poll needs — never the whole row.
+   *
+   * Ordering runs in three tiers so a never-resolving open shipment can never starve fresh
+   * orders (the liveness problem #151's terminal exit was built to avoid), whatever its
+   * failure mode: (1) fresh — not flagged-stuck, not erroring — first; (2) then orders whose
+   * `getTracking` throws every poll (M4 #163/#170), that erroring tier rotating fairly (M4 #175);
+   * (3) then flagged-stuck holds last (M4 #158), that tail rotating fairly (M4 #164). Every tier
+   * stays in the work list — the predicate is unchanged (the #155 invariant: deprioritise, don't
+   * drop) — so a deprioritised order keeps polling and reconciles the moment its hold ships or
+   * its getTracking recovers.
+   *
+   * The PRIMARY key `fulfillmentStuckPolledAt` is non-null IFF the order is flagged-stuck, so
+   * `nulls: "first"` floats every not-yet-flagged order (tiers 1–2) ahead of every flagged one
+   * (tier 3) — fresh orders always poll before a hold. Within the flagged tail the key ROTATES
+   * (#164): #158 keyed the tail on the WRITE-ONCE `fulfillmentStuckAt`, so the tail order was
+   * stable across runs and a backlog past `POLL_BATCH_SIZE` permanently starved the
+   * newest-flagged; `fulfillmentStuckPolledAt` is instead bumped `now()` on every re-poll of a
+   * flagged order (`markStuckRepolled`), so the tail sorts least-recently-repolled first —
+   * each run re-polls a different slice and every flagged order is reached within
+   * ~⌈flaggedCount / freeSlots⌉ runs.
+   *
+   * The SECONDARY key `fulfillmentErrorPolledAt` splits tiers 1 and 2 and, since #175, rotates
+   * tier 2. An order whose `getTracking` THROWS every run returns via `recordPollError` BEFORE
+   * `flagIfStuck`, so it is never flagged-stuck and its `fulfillmentStuckPolledAt` stays null —
+   * leaving it, pre-#170, in the tier-1 null-key group and (being old, having errored a while) at
+   * the FRONT of the oldest-first batch every run, re-creating #158's starvation for erroring
+   * orders. #170 first fixed this by sub-ordering the null-key group on the error STREAK
+   * (`fulfillmentErrorCount ASC`), sinking a perpetually-erroring order behind every fresh one;
+   * but a stable count let a high-count order starve WITHIN a >`POLL_BATCH_SIZE` erroring backlog
+   * (the write-once-tail problem #164 solved for the flagged tail). #175 keys tier 2 on
+   * `fulfillmentErrorPolledAt` instead — non-null IFF the streak > 0 (written together with it) —
+   * so `nulls: "first"` still floats fresh (null) ahead of erroring, AND, bumped `now()` on each
+   * erroring poll, it makes the tier rotate least-recently-errored first, reaching every erroring
+   * order within ~⌈erroringCount / freeSlots⌉ runs. A clean poll nulls the key as it resets the
+   * streak (#163), floating a recovered order straight back to the fresh tier so it reconciles at
+   * once. `createdAt` is the final tiebreak — oldest-first within a tier. (Bounded, self-healing
+   * residuals, all one shape: because fresh always polls first and each group drains in sort
+   * order, any order with >`POLL_BATCH_SIZE` rows sorting ahead of it for many runs waits until
+   * that backlog drains, so it won't detect a recovery until then — an erroring order behind a
+   * large FRESH backlog (#170 sinks it behind fresh, by design, not this issue), and a
+   * flagged-AND-erroring order whose `fulfillmentStuckPolledAt` freezes while it errors (the error
+   * path bypasses `markStuckRepolled`), pinning it at the flagged-tail front rather than rotating
+   * — still strictly better than the pre-#164 fully-frozen tail. Full note on `recordPollError`.)
+   */
+  findSubmittedForPolling(limit: number): Promise<SubmittedOrderForPolling[]> {
+    return prisma.order.findMany({
+      where: { status: "PAID", fulfillmentStatus: "SUBMITTED" },
+      orderBy: [
+        // Three-tier deprioritisation so no never-resolving open shipment starves fresh
+        // orders (see the doc comment). PRIMARY: not-yet-flagged (null) first, flagged-stuck
+        // last — #158/#164. Keyed on `fulfillmentStuckPolledAt` (not the write-once
+        // `fulfillmentStuckAt`) since #164: it is non-null IFF flagged (so `nulls: "first"`
+        // floats fresh orders ahead) AND is bumped on every re-poll of a flagged order
+        // (`markStuckRepolled`), so the flagged tail rotates least-recently-repolled first —
+        // a >POLL_BATCH_SIZE flagged backlog can't permanently starve the newest-flagged.
+        { fulfillmentStuckPolledAt: { sort: "asc", nulls: "first" } },
+        // SECONDARY (#170 tier split, #175 rotation): within the not-yet-flagged group, sink an
+        // order that errors on every poll behind every fresh one. Such an order returns via
+        // `recordPollError` BEFORE `flagIfStuck`, so it never joins the flagged tail; without
+        // this it sat at the FRONT of the oldest-first batch every run, re-creating #158's
+        // starvation for erroring orders. Keyed on `fulfillmentErrorPolledAt` (not the #170
+        // stable `fulfillmentErrorCount`) since #175: it is non-null IFF the streak > 0 — the
+        // two are written together — so `nulls: "first"` floats every fresh order (null) ahead
+        // of every erroring one exactly as the count did, AND, bumped `now()` on each erroring
+        // poll (`recordFulfillmentPollError`), it makes the erroring tier ROTATE least-recently-
+        // errored first — so a >POLL_BATCH_SIZE erroring backlog can't permanently starve a
+        // high-count order (the #164 fix, for the erroring tier). A clean poll nulls it as it
+        // resets the streak (#163) → the order floats back to the fresh tier.
+        { fulfillmentErrorPolledAt: { sort: "asc", nulls: "first" } },
+        // TIEBREAK: oldest-first within a tier.
+        { createdAt: "asc" },
+      ],
+      take: limit,
+      select: {
+        id: true,
+        tenantId: true,
+        fulfillmentExternalId: true,
+        // Age anchor + already-surfaced marker for the stuck-open-shipment check (#155).
+        // The poll READS `fulfillmentStuckAt` to branch: null → maybe flag; non-null →
+        // already in the tail, so bump the re-poll key instead (#164). A flagged order is
+        // never dropped (a hold can still ship), so it stays in this `{PAID, SUBMITTED}`
+        // work list, just deprioritised to the tail. The tail's sort key is
+        // `fulfillmentStuckPolledAt` (#158/#164) — ordered in the DB, not selected here.
+        createdAt: true,
+        fulfillmentStuckAt: true,
+        // Current consecutive-getTracking-error streak, for the erroring-open-shipment
+        // check (#163): the poll resets it to 0 only when it's non-zero, so a clean poll
+        // of a never-errored order stays write-free.
+        fulfillmentErrorCount: true,
+      },
     });
   },
 
@@ -465,6 +729,27 @@ export const orderRepository = {
             idempotencyKey: `oc_${order.id}`,
           },
         });
+
+        // Fulfillment submission (M4 #139): queue the provider submission in this
+        // SAME PENDING → PAID transaction, so a paid order that CAN be fulfilled
+        // always has its submission durably enqueued — the outbox drain submits it
+        // (behind a second, order-level SUBMITTING guard) exactly as it sends the
+        // confirmation above. Enqueued only when the order carries a complete
+        // shipping address: a guest/legacy order without one has nowhere to ship,
+        // so it never attempts submission. Runs only on the single transition (the
+        // duplicate delivery already returned above), and the distinct `fs_`
+        // idempotencyKey (vs the confirmation's `oc_`) lets both coexist for one
+        // order while the unique constraint still forbids ever writing two.
+        if (hasShippingAddressColumns(order)) {
+          await tx.outboxMessage.create({
+            data: {
+              tenantId,
+              orderId: order.id,
+              type: "FULFILLMENT_SUBMISSION",
+              idempotencyKey: `fs_${order.id}`,
+            },
+          });
+        }
 
         // We own the transition — allocate inventory in the same transaction. A
         // line whose stock can't cover its quantity is collected as a shortfall
@@ -717,6 +1002,435 @@ export const orderRepository = {
   },
 
   /**
+   * Layer-2 idempotency claim for provider submission: atomically move the order's
+   * `fulfillmentStatus` NOT_SUBMITTED → SUBMITTING, tenant-scoped. Returns `true`
+   * for the single caller that made the move — it, and only it, may call
+   * `provider.createOrder` — and `false` for everyone else: a concurrent claimer,
+   * or an order already SUBMITTING / SUBMITTED / SHIPPED / FAILED. The guarded
+   * `updateMany` is atomic (the `markFulfilled` one-shot idiom, row-locked under
+   * READ COMMITTED), so of two racing submissions exactly one wins.
+   *
+   * This is the SECOND idempotency layer, on top of the outbox message's own
+   * claim: a duplicate POD order is real money + a physical shipment, and Printful
+   * has no idempotency key, so a submission can never be safely re-attempted once
+   * begun. A lost worker (its `createOrder` succeeded but the SUBMITTED write never
+   * landed) leaves the order stuck in SUBMITTING; this claim then returns `false`
+   * forever, so it is never re-submitted — surfaced for manual reconciliation
+   * instead of silently retrying (M4 research, "Idempotent submission").
+   *
+   * Also guarded on `status: "PAID"` — the only submittable order state. The
+   * fulfillment message is enqueued at PENDING → PAID but drained later (the daily
+   * outbox cron, or the webhook's immediate dispatch), and in that gap the order
+   * may have moved on: a `refund.succeeded` (`markRefundedByPaymentIntent` flips
+   * only `status`, not `fulfillmentStatus`) or a manual FULFILLED attestation
+   * (`markFulfilled`) both leave `fulfillmentStatus` at NOT_SUBMITTED. Without this
+   * guard a refunded order — money already returned — or a hand-fulfilled one would
+   * still be shipped to the provider. Both write `status` under the same order row
+   * lock, so of the refund/fulfil flip and this claim exactly one wins: a claim
+   * that finds the order no longer PAID matches nothing and returns `false`.
+   */
+  async claimForSubmission(
+    tenantId: string,
+    orderId: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "NOT_SUBMITTED",
+      },
+      data: { fulfillmentStatus: "SUBMITTING" },
+    });
+    return count === 1;
+  },
+
+  /**
+   * Persist a successful submission: the claim-winner (still SUBMITTING) moves
+   * SUBMITTING → SUBMITTED and records the provider's own order id
+   * (`FulfillmentResult.externalId`) + which provider handled it, so the poll cron
+   * can reconcile tracking against them. Guarded on SUBMITTING (like `markSent`'s
+   * SENDING guard) so nothing can clobber a FAILED/SHIPPED order. Returns whether
+   * the write landed; `false` would mean the order left SUBMITTING underneath us —
+   * a should-never-happen (the caller that won the claim holds it exclusively for
+   * the one submission), so the caller does not branch on it.
+   */
+  async markSubmitted(
+    tenantId: string,
+    orderId: string,
+    externalId: string,
+    provider: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: { id: orderId, tenantId, fulfillmentStatus: "SUBMITTING" },
+      data: {
+        fulfillmentStatus: "SUBMITTED",
+        fulfillmentExternalId: externalId,
+        fulfillmentProvider: provider,
+      },
+    });
+    return count === 1;
+  },
+
+  /**
+   * Move the order to the terminal FAILED fulfillment state — a provider
+   * soft-rejection, or a permanent unmapped / unconfigured / missing-address
+   * failure. Guarded to the two pre-terminal states (NOT_SUBMITTED before the
+   * claim, SUBMITTING after it) so a FAILED write can never regress an
+   * already-SUBMITTED/SHIPPED order. Deliberately persists NO `externalId`: a soft
+   * rejection's provider id is a synthesized placeholder (Printful) that must never
+   * reach `getTracking`, and FAILED orders are not polled. Best-effort and
+   * idempotent — a re-drain after a lost worker re-runs it as a no-op.
+   */
+  async markFulfillmentFailed(
+    tenantId: string,
+    orderId: string,
+  ): Promise<void> {
+    await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        fulfillmentStatus: { in: ["NOT_SUBMITTED", "SUBMITTING"] },
+      },
+      data: { fulfillmentStatus: "FAILED" },
+    });
+  },
+
+  /**
+   * Reconcile a shipped order — the SUBMITTED → SHIPPED leg the poll-fulfillment
+   * cron drives (M4 #140), and the milestone's second one-way door after PAID. In
+   * ONE transaction it (a) flips the order via a guarded `updateMany`, persisting
+   * the carrier/number/url the provider reported plus its raw status string
+   * (`fulfillmentProviderStatus`, admin display only), and (b) — only if that flip
+   * moved a row — enqueues the `SHIPPING_CONFIRMATION` email in the SAME
+   * transaction, so a shipped order can never exist without its notification queued
+   * (the `markPaidByPaymentIntent` outbox pattern). The distinct `sc_` key coexists
+   * with the order's `oc_`/`fs_` messages while the unique constraint still forbids
+   * ever writing two.
+   *
+   * The `updateMany` guard is the idempotency point and does double duty. Guarding
+   * on `fulfillmentStatus: "SUBMITTED"` makes a duplicate or racing poll a no-op —
+   * the second finds the order already SHIPPED, matches nothing, and enqueues no
+   * second email (row locking under READ COMMITTED serializes the two). Guarding
+   * ALSO on `status: "PAID"` is the same defence `claimForSubmission` needs: a
+   * `refund.succeeded` (`markRefundedByPaymentIntent`) or a manual FULFILLED
+   * (`markFulfilled`) flips `status` only, leaving `fulfillmentStatus` at SUBMITTED
+   * — without this guard the blind `data.status = "FULFILLED"` would regress a
+   * REFUNDED order back to FULFILLED. Both write `status` under the one order-row
+   * lock, so of the refund/fulfil flip and this reconcile exactly one wins.
+   *
+   * Returns whether this call made the transition: `true` for the single poll that
+   * reconciled it (order flipped, email enqueued), `false` when nothing moved (a
+   * duplicate poll, or the order left PAID+SUBMITTED underneath us) — a safe no-op
+   * either way. Never persists a placeholder id: only real SUBMITTED orders (which
+   * carry a real `fulfillmentExternalId`) are ever polled here.
+   */
+  async markShipped(
+    tenantId: string,
+    orderId: string,
+    shipment: ShipmentReconciliation,
+  ): Promise<boolean> {
+    return prisma.$transaction(async (tx) => {
+      const { count } = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          tenantId,
+          status: "PAID",
+          fulfillmentStatus: "SUBMITTED",
+        },
+        data: {
+          status: "FULFILLED",
+          fulfillmentStatus: "SHIPPED",
+          fulfillmentProviderStatus: shipment.providerStatus,
+          trackingCarrier: shipment.carrier,
+          trackingNumber: shipment.trackingNumber,
+          trackingUrl: shipment.trackingUrl,
+        },
+      });
+      // Nothing moved: a duplicate/racing poll (already SHIPPED), or the order left
+      // PAID+SUBMITTED (refunded / manually fulfilled) between the find and here.
+      // Enqueue nothing — the email is queued only alongside the real transition.
+      if (count === 0) return false;
+
+      // Queue the shipping-confirmation email in this SAME transaction, so a shipped
+      // order always has exactly one notification enqueued. Runs only on the single
+      // transition above; the unique `sc_` key is belt-and-suspenders against a
+      // second write. The send path is M4-08 (#141) — this only records the intent.
+      await tx.outboxMessage.create({
+        data: {
+          tenantId,
+          orderId,
+          type: "SHIPPING_CONFIRMATION",
+          idempotencyKey: `sc_${orderId}`,
+        },
+      });
+      return true;
+    });
+  },
+
+  /**
+   * Move a SUBMITTED order to the terminal FAILED fulfillment state because the
+   * provider reported it cancelled/failed AFTER submission — the poll cron's
+   * terminal-exit analogue of `markShipped` (M4 #151), and its other one-way door
+   * out of SUBMITTED. Without it such an order (the provider will never ship it)
+   * would sit SUBMITTED + PAID forever and be re-polled every run, starving newer
+   * orders behind it (oldest-first batching) and burning provider rate limit on
+   * calls that can never resolve.
+   *
+   * Guarded on `{status: PAID, fulfillmentStatus: SUBMITTED}` — the exact predicate
+   * `findSubmittedForPolling` selects on — so the guarded `updateMany` re-checks the
+   * work-list filter under the row lock, mirroring `markShipped` so the poll's two
+   * terminal transitions (ship / fail) share one precondition. That makes a
+   * duplicate/racing poll a no-op (the order is already FAILED, matches nothing), and
+   * leaves an order that concurrently left PAID — a `refund.succeeded`
+   * (`markRefundedByPaymentIntent`) or manual FULFILLED (`markFulfilled`), both of
+   * which flip only `status` — untouched (it drops from the poll via the status
+   * filter anyway). A single guarded `updateMany` is itself atomic, so no surrounding
+   * transaction is needed (unlike `markShipped`, which must also enqueue an email).
+   *
+   * Deliberately flips ONLY `fulfillmentStatus` → FAILED (plus the raw provider
+   * status for admin display); `Order.status` stays PAID, so an operator can decide
+   * to refund or re-order — the order surfaces as the anomalous pairing "PAID order,
+   * FAILED fulfillment". The real `fulfillmentExternalId` is left intact (a FAILED
+   * order is never polled, so it can't reach `getTracking` again) — unlike the
+   * create-time soft-reject `markFulfillmentFailed`, whose only id was a synthesized
+   * placeholder it deliberately dropped. No customer email is enqueued: a provider
+   * cancellation is an operator decision (refund/re-order), not a shopper
+   * notification. Best-effort + idempotent: a re-run is a guarded no-op.
+   *
+   * Returns whether this call made the transition — `true` for the single poll that
+   * failed it, `false` when nothing moved (already FAILED, or the order left
+   * PAID+SUBMITTED underneath us) — mirroring `markShipped` so `pollOne` treats a
+   * `false` as the same benign no-op it does there.
+   */
+  async markFulfillmentFailedAfterSubmission(
+    tenantId: string,
+    orderId: string,
+    providerStatus: string,
+  ): Promise<boolean> {
+    const { count } = await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+      },
+      data: {
+        fulfillmentStatus: "FAILED",
+        fulfillmentProviderStatus: providerStatus,
+      },
+    });
+    return count === 1;
+  },
+
+  /**
+   * Stamp a SUBMITTED order as a STUCK open shipment (M4 #155) so the poll cron can
+   * surface it to the operator exactly once, and snapshot the raw provider status
+   * (`onhold`/`inreview`) into `fulfillmentProviderStatus` so the admin order view
+   * shows WHICH hold to chase without log-diving (M4 #161). Still the deliberate
+   * INVERSE of `markFulfillmentFailedAfterSubmission`: `fulfillmentStatus` stays
+   * SUBMITTED and `status` stays PAID — an order the provider is holding can still
+   * ship, so it must keep being polled; we only mark that we've alerted on it. #155
+   * is about AGE, not a terminal provider status like #151's cancelled/failed.
+   *
+   * The provider status is a one-shot SNAPSHOT taken on the single flagging run, not
+   * refreshed each poll: the write rides the same `fulfillmentStuckAt: null`-guarded
+   * `updateMany` as the marker, so it fires exactly once and never again — preserving
+   * both the "surface once" idempotency and the invariant that an in-flight (not-yet-
+   * shipped) poll writes nothing on later runs. That mirrors the two terminal writers
+   * (`markShipped`, `markFulfillmentFailedAfterSubmission`), which likewise persist the
+   * status as a snapshot at their transition, and it stays admin-display only, never a
+   * control-flow input. Trade-off: a later `onhold`→`inreview` shift isn't reflected —
+   * acceptable, since the operator, once alerted, gets live status from the provider.
+   *
+   * Guarded on `{status: PAID, fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: null}`.
+   * The PAID+SUBMITTED pair is the exact `findSubmittedForPolling` work-list predicate
+   * its two terminal siblings (`markShipped`, `markFulfillmentFailedAfterSubmission`)
+   * guard on, so a concurrently refunded / manually-fulfilled order (which flips only
+   * `status`) is left untouched here too. The `fulfillmentStuckAt: null` clause is the
+   * idempotency point: the single guarded `updateMany` is atomic (no surrounding
+   * transaction, like the #151 method), so of two racing polls exactly one stamps it,
+   * and every later cron tick matches nothing — the alert fires once, never again.
+   *
+   * Returns whether THIS call stamped it — `true` for the one poll that surfaced the
+   * order, `false` otherwise (already surfaced, or it left PAID/SUBMITTED underneath
+   * us) — so `pollOne` alerts only on the `true`, mirroring `markShipped`'s contract.
+   */
+  async markFulfillmentStuck(
+    tenantId: string,
+    orderId: string,
+    providerStatus: string,
+  ): Promise<boolean> {
+    // Seed `fulfillmentStuckPolledAt` = `fulfillmentStuckAt` (one shared timestamp) as the
+    // order enters the flagged tail (M4 #164): the round-robin re-poll key must be non-null
+    // the instant an order is flagged, so it sorts into the flagged group — not the fresh
+    // one — from its very next poll, and `markStuckRepolled` bumps it from there.
+    const now = new Date();
+    const { count } = await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+        fulfillmentStuckAt: null,
+      },
+      data: {
+        fulfillmentStuckAt: now,
+        fulfillmentStuckPolledAt: now,
+        fulfillmentProviderStatus: providerStatus,
+      },
+    });
+    return count === 1;
+  },
+
+  /**
+   * Bump a flagged-stuck order's round-robin re-poll key (M4 #164): stamp
+   * `fulfillmentStuckPolledAt = now()` so the next `findSubmittedForPolling` sorts this
+   * order to the BACK of the deprioritised flagged tail (that query orders the tail by this
+   * key ascending — least-recently-repolled first). Called by the poll on every re-poll of
+   * an ALREADY-flagged in-flight order (`flagIfStuck`'s already-surfaced branch), so the
+   * tail rotates run over run instead of the write-once `fulfillmentStuckAt` pinning the
+   * same oldest-flagged orders to the front forever — the residual #158 left, where a
+   * backlog past `POLL_BATCH_SIZE` could permanently starve the newest-flagged.
+   *
+   * Guarded on the same `{status: PAID, fulfillmentStatus: SUBMITTED}` work-list predicate
+   * as its poll siblings, PLUS `fulfillmentStuckAt: { not: null }` so it only ever re-stamps
+   * an order that IS flagged — keeping the invariant "`fulfillmentStuckPolledAt` is non-null
+   * IFF flagged" (on which the `nulls: "first"` fresh-orders-first ordering depends) airtight
+   * even if mis-called. Tenant-scoped (golden rule #1). Best-effort + idempotent: a
+   * concurrently refunded / manually-fulfilled order (which flips only `status`) simply
+   * no-ops, exactly like the marker writers, so no row-count assertion is needed — a lost
+   * bump just means one more run before this order rotates, never a correctness problem.
+   * Returns nothing: unlike the marker/terminal writers it drives no alert or state change,
+   * only the batch ordering.
+   */
+  async markStuckRepolled(tenantId: string, orderId: string): Promise<void> {
+    await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+        fulfillmentStuckAt: { not: null },
+      },
+      data: { fulfillmentStuckPolledAt: new Date() },
+    });
+  },
+
+  /**
+   * Record one failed `getTracking` poll for a SUBMITTED order and return the new
+   * consecutive-error count (M4 #163) — the erroring-open-shipment sibling of
+   * `markFulfillmentStuck`. Atomically increments `fulfillmentErrorCount` — and stamps
+   * `fulfillmentErrorPolledAt = now()`, the erroring-tier round-robin re-poll key (M4 #175),
+   * in the SAME write — under the same `{status: PAID, fulfillmentStatus: SUBMITTED}`
+   * work-list guard its poll siblings use, then reads the incremented value back **in the
+   * same transaction** so the caller can surface the order exactly once — on the single poll
+   * that brings the streak to the alert threshold (`count === THRESHOLD`, never `>=`, so later
+   * ticks past it don't re-alert). Deliberately leaves `fulfillmentStatus` at SUBMITTED (the
+   * #155 posture, not #151's terminal exit): a getTracking error proves only that we
+   * can't READ the order's status, not that it won't ship, so the order keeps being
+   * polled and a `resetFulfillmentPollErrors` on the next clean poll zeroes the streak.
+   *
+   * The increment + read-back share one interactive transaction so the returned count
+   * is authoritative under concurrency: the guarded `updateMany` row-locks the order
+   * until commit, so two racing polls serialize (5→6 then 6→7) and each reads a
+   * distinct value — exactly one can ever observe the threshold. `updateMany` can't
+   * return the updated row, hence the paired read; both are keyed by `{id, tenantId}`,
+   * and the tiny two-statement transaction stays well within Prisma's default timeout.
+   *
+   * The `fulfillmentErrorPolledAt = now()` stamp (M4 #175) is why this write drives the
+   * erroring tier's fair rotation: `findSubmittedForPolling` keys that tier on the column
+   * ascending, so bumping it each error poll sends this order to the tier's BACK — the
+   * least-recently-errored order sorts first — and no erroring order is starved within a
+   * >`POLL_BATCH_SIZE` backlog (the #164 fix, for the erroring tier rather than the flagged
+   * tail). It rides this existing write for free (the erroring path always increments), so
+   * unlike #164's flagged tail — whose re-poll bump needed a dedicated `markStuckRepolled`
+   * because its already-flagged branch otherwise writes nothing — the erroring tier needs no
+   * separate writer. Bumped together with the count and never apart, so the "non-null IFF
+   * count > 0" invariant the sort relies on holds after every write here.
+   *
+   * Returns the new count for the poll that incremented it, or `null` when the guard
+   * matched nothing — the order left PAID+SUBMITTED (refunded / manually fulfilled)
+   * between `findSubmittedForPolling` and here, a benign race the poll treats exactly
+   * like the `markShipped` / `markFulfillmentStuck` `false` return (no alert). Only the
+   * poll cron calls this; it never touches a terminal or non-PAID order.
+   */
+  async recordFulfillmentPollError(
+    tenantId: string,
+    orderId: string,
+  ): Promise<number | null> {
+    return prisma.$transaction(async (tx) => {
+      const { count } = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          tenantId,
+          status: "PAID",
+          fulfillmentStatus: "SUBMITTED",
+        },
+        // Bump the erroring-tier round-robin re-poll key (M4 #175) in the SAME write as the
+        // increment: `fulfillmentErrorPolledAt = now()` sends this order to the BACK of the
+        // erroring tier so `findSubmittedForPolling` rotates it (that query keys the tier on
+        // this column ascending — least-recently-errored first). Written together with the
+        // count and never apart, so `fulfillmentErrorPolledAt` is non-null IFF the count > 0 —
+        // the invariant `resetFulfillmentPollErrors` restores by nulling both on recovery.
+        data: {
+          fulfillmentErrorCount: { increment: 1 },
+          fulfillmentErrorPolledAt: new Date(),
+        },
+      });
+      // Guard matched nothing — the order left PAID+SUBMITTED underneath us (refunded /
+      // manually fulfilled). A benign no-op: the caller skips the alert, mirroring the
+      // `markShipped` / `markFulfillmentStuck` race paths.
+      if (count === 0) return null;
+      // Read our own just-committed-in-transaction increment back (updateMany returns
+      // only a row count). The guarded update matched, so the row exists in this tenant.
+      const row = await tx.order.findFirstOrThrow({
+        where: { id: orderId, tenantId },
+        select: { fulfillmentErrorCount: true },
+      });
+      return row.fulfillmentErrorCount;
+    });
+  },
+
+  /**
+   * Zero a SUBMITTED order's consecutive-getTracking-error streak AND null its
+   * `fulfillmentErrorPolledAt` re-poll key (M4 #163/#175) — called on any poll that reads
+   * tracking cleanly, so a few transient errors followed by a success can never accumulate to
+   * the alert threshold (the "transient blips recover silently" invariant). Nulling the re-poll
+   * key alongside the count is the recovery-return: a null key sorts into the FRESH tier of
+   * `findSubmittedForPolling`, so a recovered order polls promptly again instead of lingering in
+   * the deprioritised erroring tier — and it keeps the "non-null IFF count > 0" invariant the
+   * sort relies on (the two fields are only ever written together, here and in
+   * `recordFulfillmentPollError`). Guarded on the same `{status: PAID, fulfillmentStatus:
+   * SUBMITTED}` work-list predicate as its siblings, so it never touches an order that
+   * has left the poll's work list, and tenant-scoped (golden rule #1). Best-effort and
+   * idempotent — a re-run just re-clears an already-clear streak + key. The caller only
+   * invokes it when the pre-read `fulfillmentErrorCount` was non-zero, so a clean poll of
+   * a never-errored order stays write-free (the poll's "a not-shipped poll writes
+   * nothing" invariant); this method is nonetheless safe to call unconditionally.
+   */
+  async resetFulfillmentPollErrors(
+    tenantId: string,
+    orderId: string,
+  ): Promise<void> {
+    await prisma.order.updateMany({
+      where: {
+        id: orderId,
+        tenantId,
+        status: "PAID",
+        fulfillmentStatus: "SUBMITTED",
+      },
+      // Zero the streak AND null the erroring-tier re-poll key together (M4 #163/#175): a clean
+      // poll is the recovery signal, so clearing `fulfillmentErrorPolledAt` returns the order to
+      // the FRESH tier of `findSubmittedForPolling` (a null key sorts first) rather than leaving
+      // it stranded in the deprioritised erroring tier — and keeps the "non-null IFF count > 0"
+      // invariant the sort relies on. The two are always written together (here and in
+      // `recordFulfillmentPollError`), never apart.
+      data: { fulfillmentErrorCount: 0, fulfillmentErrorPolledAt: null },
+    });
+  },
+
+  /**
    * Mark a PAID or FULFILLED order REFUNDED by its Stripe PaymentIntent — the
    * REFUND leg of the state machine, driven solely by the verified `refund.*`
    * webhook (the admin initiation only calls Stripe; it never writes). The
@@ -766,4 +1480,11 @@ export const orderRepository = {
  *  returns (never null). The one order type the webhook and email layer share. */
 export type OrderWithItems = NonNullable<
   Awaited<ReturnType<typeof orderRepository.findByPaymentIntentForTenant>>
+>;
+
+/** An order joined with its items and, per item, the variant's fulfillment
+ *  mapping (`sku` + `providerVariantId`) — the shape `findForFulfillment` returns
+ *  (never null). The one order type the fulfillment service reads (M4 #137). */
+export type OrderForFulfillment = NonNullable<
+  Awaited<ReturnType<typeof orderRepository.findForFulfillment>>
 >;

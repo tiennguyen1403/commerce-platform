@@ -79,6 +79,11 @@ type SeedVariant = {
   name: string;
   priceCents: number;
   stock: number;
+  // Optional mapping to the fulfillment provider's catalog variant id (M4).
+  // Illustrative Printful-style integers on a couple of variants so the mock/
+  // real submission flow has mapped data; the rest stay unmapped (null) to
+  // exercise the "unmapped variant" path end to end.
+  providerVariantId?: string;
 };
 
 type SeedProduct = {
@@ -100,8 +105,22 @@ const PRODUCTS: SeedProduct[] = [
     description: "A comfortable everyday t-shirt.",
     status: "ACTIVE",
     variants: [
-      { sku: "TEE-S", name: "Small", priceCents: 1999, stock: 100 },
-      { sku: "TEE-M", name: "Medium", priceCents: 1999, stock: 100 },
+      {
+        sku: "TEE-S",
+        name: "Small",
+        priceCents: 1999,
+        stock: 100,
+        providerVariantId: "4011",
+      },
+      {
+        sku: "TEE-M",
+        name: "Medium",
+        priceCents: 1999,
+        stock: 100,
+        providerVariantId: "4012",
+      },
+      // TEE-L is deliberately left unmapped (providerVariantId null) so the demo
+      // catalog covers both the mapped and unmapped states in one product.
       { sku: "TEE-L", name: "Large", priceCents: 2199, stock: 50 },
     ],
   },
@@ -201,6 +220,7 @@ async function seedProducts(tenantId: string, products: SeedProduct[]) {
           create: product.variants.map((v) => ({
             sku: v.sku,
             name: v.name,
+            providerVariantId: v.providerVariantId ?? null,
             priceCents: v.priceCents,
             stock: v.stock,
           })),

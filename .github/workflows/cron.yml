@@ -43,7 +43,7 @@ jobs:
           set -euo pipefail
           base="${BASE_URL%/}" # tolerate a trailing slash so we never build //api
           status=0
-          for path in dispatch-outbox sweep-orders; do
+          for path in dispatch-outbox sweep-orders poll-fulfillment; do
             url="${base}/api/cron/${path}"
             echo "→ GET ${url}"
             # Secret comes from the step env (not hard-coded; GitHub masks it in

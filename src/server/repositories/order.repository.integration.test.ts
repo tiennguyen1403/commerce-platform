@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
-import type { OrderStatus } from "@prisma/client";
+import type { FulfillmentStatus, OrderStatus } from "@prisma/client";
 import {
   orderRepository,
   type CreateOrderInput,
@@ -8,6 +8,7 @@ import {
   InsufficientStockError,
   OrderNumberTakenError,
 } from "@/server/order.errors";
+import type { ShippingAddress } from "@/server/fulfillment/provider";
 import {
   createTestTenant,
   deleteTenantDeep,
@@ -101,11 +102,14 @@ type SeedLine = {
   titleSnapshot?: string;
 };
 
-/** Seed a PENDING order carrying the given lines and PaymentIntent id. */
+/** Seed a PENDING order carrying the given lines and PaymentIntent id. Pass
+ *  `opts.shipping` to persist a complete shipping address (the FULFILLMENT_SUBMISSION
+ *  enqueue gate, #139); omit it for a guest/legacy order that has none. */
 async function seedPendingOrder(
   tenantId: string,
   stripePaymentIntentId: string,
   lines: SeedLine[],
+  opts: { shipping?: ShippingAddress } = {},
 ) {
   return prisma.order.create({
     data: {
@@ -116,6 +120,17 @@ async function seedPendingOrder(
       totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
       currency: "usd",
       stripePaymentIntentId,
+      ...(opts.shipping
+        ? {
+            shipName: opts.shipping.name,
+            shipLine1: opts.shipping.line1,
+            shipLine2: opts.shipping.line2?.trim() || null,
+            shipCity: opts.shipping.city,
+            shipState: opts.shipping.state?.trim() || null,
+            shipPostalCode: opts.shipping.postalCode,
+            shipCountry: opts.shipping.country,
+          }
+        : {}),
       items: {
         create: lines.map((l) => ({
           variantId: l.variantId,
@@ -144,6 +159,10 @@ async function seedOrder(
     currency?: string;
     totalCents?: number;
     userId?: string | null;
+    fulfillmentStatus?: FulfillmentStatus;
+    fulfillmentExternalId?: string;
+    fulfillmentErrorCount?: number;
+    fulfillmentErrorPolledAt?: Date | null;
   } = {},
 ) {
   const lines = opts.lines ?? [];
@@ -159,6 +178,18 @@ async function seedOrder(
         lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
       currency: opts.currency ?? "usd",
       stripePaymentIntentId: opts.stripePaymentIntentId ?? uniqueId("pi"),
+      ...(opts.fulfillmentStatus
+        ? { fulfillmentStatus: opts.fulfillmentStatus }
+        : {}),
+      ...(opts.fulfillmentExternalId
+        ? { fulfillmentExternalId: opts.fulfillmentExternalId }
+        : {}),
+      ...(opts.fulfillmentErrorCount !== undefined
+        ? { fulfillmentErrorCount: opts.fulfillmentErrorCount }
+        : {}),
+      ...(opts.fulfillmentErrorPolledAt !== undefined
+        ? { fulfillmentErrorPolledAt: opts.fulfillmentErrorPolledAt }
+        : {}),
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
       items: {
         create: lines.map((l) => ({
@@ -173,6 +204,19 @@ async function seedOrder(
   });
 }
 
+/** A valid US shipping address `orderInput` attaches by default (#135), so every
+ *  `createWithItems` call persists one and the round-trip can be asserted. `line2`
+ *  is intentionally blank to exercise the empty→null column normalization. */
+const TEST_SHIPPING: ShippingAddress = {
+  name: "Ada Lovelace",
+  line1: "1 Analytical Ave",
+  line2: "",
+  city: "San Francisco",
+  state: "CA",
+  postalCode: "94103",
+  country: "US",
+};
+
 /** Build a `CreateOrderInput` (the shape `createWithItems` reserves + writes). */
 function orderInput(
   tenantId: string,
@@ -182,6 +226,7 @@ function orderInput(
     orderNumber?: string;
     stripePaymentIntentId?: string;
     userId?: string | null;
+    shippingAddress?: ShippingAddress;
   } = {},
 ): CreateOrderInput {
   return {
@@ -190,6 +235,7 @@ function orderInput(
     orderNumber: overrides.orderNumber ?? uniqueId("order"),
     email: "shopper@example.com",
     userId: overrides.userId ?? null,
+    shippingAddress: overrides.shippingAddress ?? TEST_SHIPPING,
     totalCents: lines.reduce((sum, l) => sum + l.priceCents * l.qty, 0),
     currency: "usd",
     stripePaymentIntentId: overrides.stripePaymentIntentId ?? uniqueId("pi"),
@@ -263,6 +309,59 @@ describe("orderRepository.markPaidByPaymentIntent (integration)", () => {
       attempts: 0,
       idempotencyKey: `oc_${order.id}`,
     });
+  });
+
+  it("also enqueues a FULFILLMENT_SUBMISSION in the flip transaction when the order has a shipping address", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, {
+      stock: 5,
+      priceCents: 1000,
+    });
+    const intent = uniqueId("pi");
+    const order = await seedPendingOrder(
+      tenant.id,
+      intent,
+      [{ variantId: variant.id, qty: 1, priceCents: 1000 }],
+      { shipping: TEST_SHIPPING },
+    );
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    // A shippable paid order queues BOTH the confirmation and the provider
+    // submission (M4 #139), atomically with the flip, under distinct keys.
+    const messages = await prisma.outboxMessage.findMany({
+      where: { tenantId: tenant.id, orderId: order.id },
+    });
+    expect(messages.map((m) => m.type).sort()).toEqual([
+      "FULFILLMENT_SUBMISSION",
+      "ORDER_CONFIRMATION",
+    ]);
+    expect(
+      messages.find((m) => m.type === "FULFILLMENT_SUBMISSION"),
+    ).toMatchObject({
+      status: "PENDING",
+      attempts: 0,
+      idempotencyKey: `fs_${order.id}`,
+    });
+  });
+
+  it("does not enqueue a FULFILLMENT_SUBMISSION when the order has no shipping address", async () => {
+    const tenant = await freshTenant();
+    const variant = await seedVariant(tenant.id, { stock: 5 });
+    const intent = uniqueId("pi");
+    // seedPendingOrder without `shipping` → a guest/legacy order with no address.
+    const order = await seedPendingOrder(tenant.id, intent, [
+      { variantId: variant.id, qty: 1, priceCents: 1000 },
+    ]);
+
+    await orderRepository.markPaidByPaymentIntent(tenant.id, intent);
+
+    // Nowhere to ship, so no submission is enqueued — it could only fail with a
+    // missing address. The confirmation email still goes out.
+    const types = (
+      await prisma.outboxMessage.findMany({ where: { orderId: order.id } })
+    ).map((m) => m.type);
+    expect(types).toEqual(["ORDER_CONFIRMATION"]);
   });
 
   it("does not enqueue a second outbox message on a duplicate delivery", async () => {
@@ -536,6 +635,16 @@ describe("orderRepository.createWithItems (reservation, integration)", () => {
     });
     expect(persisted.status).toBe("PENDING");
     expect(persisted.items).toHaveLength(1);
+
+    // #135: the shipping address is persisted in the same create transaction; a
+    // blank line2 is normalized to null (the "not provided" column convention).
+    expect(persisted.shipName).toBe(TEST_SHIPPING.name);
+    expect(persisted.shipLine1).toBe(TEST_SHIPPING.line1);
+    expect(persisted.shipLine2).toBeNull();
+    expect(persisted.shipCity).toBe(TEST_SHIPPING.city);
+    expect(persisted.shipState).toBe(TEST_SHIPPING.state);
+    expect(persisted.shipPostalCode).toBe(TEST_SHIPPING.postalCode);
+    expect(persisted.shipCountry).toBe("US");
 
     // Inventory is held: `reserved` bumped, physical `stock` untouched.
     const after = await prisma.productVariant.findUniqueOrThrow({
@@ -1209,6 +1318,938 @@ describe("orderRepository.markRefundedByPaymentIntent (integration)", () => {
   });
 });
 
+/**
+ * `markShipped` — the SUBMITTED → SHIPPED reconcile the poll-fulfillment cron
+ * drives (#140). Its guarantees live in the database: the `{status: PAID,
+ * fulfillmentStatus: SUBMITTED}`-guarded `updateMany` is the sole idempotency
+ * point (exactly-once PAID → FULFILLED under a repeated/racing poll) and doubles as
+ * the money-safety guard against reconciling a refunded / manually-fulfilled order,
+ * and the shipping-confirmation enqueue must be atomic with the flip. A mock can't
+ * exercise row locking or `updateMany` count semantics, so these run against the
+ * same Postgres the app uses.
+ */
+describe("orderRepository.markShipped (integration)", () => {
+  const TRACKING = {
+    providerStatus: "shipped",
+    carrier: "UPS",
+    trackingNumber: "1Z999AA10123456784",
+    trackingUrl: "https://track.example.test/1Z999AA10123456784",
+  };
+
+  /** Seed a submitted-and-paid order — the poll's reconcilable state. */
+  function seedSubmitted(
+    tenantId: string,
+    opts: { status?: OrderStatus; fulfillmentStatus?: FulfillmentStatus } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+  }
+
+  async function outboxFor(orderId: string) {
+    return prisma.outboxMessage.findMany({ where: { orderId } });
+  }
+
+  it("flips SUBMITTED+PAID → SHIPPED+FULFILLED, persists tracking, enqueues one email", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const shipped = await orderRepository.markShipped(
+      tenant.id,
+      order.id,
+      TRACKING,
+    );
+    expect(shipped).toBe(true);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("FULFILLED");
+    expect(persisted.fulfillmentStatus).toBe("SHIPPED");
+    expect(persisted.fulfillmentProviderStatus).toBe("shipped");
+    expect(persisted.trackingCarrier).toBe(TRACKING.carrier);
+    expect(persisted.trackingNumber).toBe(TRACKING.trackingNumber);
+    expect(persisted.trackingUrl).toBe(TRACKING.trackingUrl);
+
+    // The shipping-confirmation email is queued atomically with the flip, under a
+    // distinct `sc_` key (the send path is M4-08). Exactly one, PENDING.
+    const messages = await outboxFor(order.id);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: "SHIPPING_CONFIRMATION",
+      status: "PENDING",
+      attempts: 0,
+      idempotencyKey: `sc_${order.id}`,
+    });
+  });
+
+  it("persists a null carrier/url when the shipment carries only a tracking number", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    await orderRepository.markShipped(tenant.id, order.id, {
+      providerStatus: "fulfilled",
+      carrier: null,
+      trackingNumber: "TN-ONLY",
+      trackingUrl: null,
+    });
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.trackingNumber).toBe("TN-ONLY");
+    expect(persisted.trackingCarrier).toBeNull();
+    expect(persisted.trackingUrl).toBeNull();
+    expect(persisted.fulfillmentProviderStatus).toBe("fulfilled");
+  });
+
+  it("is idempotent — a duplicate poll flips once, then no-ops without a second email", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const first = await orderRepository.markShipped(
+      tenant.id,
+      order.id,
+      TRACKING,
+    );
+    const second = await orderRepository.markShipped(
+      tenant.id,
+      order.id,
+      TRACKING,
+    );
+
+    expect(first).toBe(true);
+    // The order is now SHIPPED → the second poll matches nothing and enqueues no
+    // second email (the unique `sc_` key would also reject a duplicate).
+    expect(second).toBe(false);
+    expect(await outboxFor(order.id)).toHaveLength(1);
+  });
+
+  it("does not reconcile a REFUNDED order (status guard) — no flip, no email", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after submission, leaving `fulfillmentStatus` at
+    // SUBMITTED — the money-safety case the status guard exists for.
+    const order = await seedSubmitted(tenant.id, { status: "REFUNDED" });
+
+    const shipped = await orderRepository.markShipped(
+      tenant.id,
+      order.id,
+      TRACKING,
+    );
+    expect(shipped).toBe(false);
+
+    // Untouched: the blind `status = FULFILLED` must never regress a REFUNDED order.
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("REFUNDED");
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.trackingNumber).toBeNull();
+    expect(await outboxFor(order.id)).toHaveLength(0);
+  });
+
+  it("does not reconcile a manually-FULFILLED order (status guard)", async () => {
+    const tenant = await freshTenant();
+    // A manual markFulfilled flipped `status` to FULFILLED, leaving fulfillmentStatus
+    // at SUBMITTED. The poll must not re-flip it or enqueue a shipping email.
+    const order = await seedSubmitted(tenant.id, { status: "FULFILLED" });
+
+    const shipped = await orderRepository.markShipped(
+      tenant.id,
+      order.id,
+      TRACKING,
+    );
+    expect(shipped).toBe(false);
+    expect(await outboxFor(order.id)).toHaveLength(0);
+  });
+
+  it("does not reconcile an order that isn't SUBMITTED (fulfillmentStatus guard)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, {
+      fulfillmentStatus: "NOT_SUBMITTED",
+    });
+
+    const shipped = await orderRepository.markShipped(
+      tenant.id,
+      order.id,
+      TRACKING,
+    );
+    expect(shipped).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("NOT_SUBMITTED");
+    expect(await outboxFor(order.id)).toHaveLength(0);
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id);
+
+    const shipped = await orderRepository.markShipped(
+      other.id,
+      order.id,
+      TRACKING,
+    );
+    expect(shipped).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("PAID");
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(await outboxFor(order.id)).toHaveLength(0);
+  });
+
+  it("reconciles exactly once under a concurrent double-poll (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    // Two poll runs land at once (or a poll racing a manual reconcile). Row locking
+    // on the guarded updateMany must let exactly one win — and enqueue exactly one
+    // shipping-confirmation.
+    const [a, b] = await Promise.all([
+      orderRepository.markShipped(tenant.id, order.id, TRACKING),
+      orderRepository.markShipped(tenant.id, order.id, TRACKING),
+    ]);
+
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect(await outboxFor(order.id)).toHaveLength(1);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("FULFILLED");
+    expect(persisted.fulfillmentStatus).toBe("SHIPPED");
+  });
+});
+
+/**
+ * `markFulfillmentFailedAfterSubmission` — the SUBMITTED → FAILED terminal exit the
+ * poll cron drives when the provider cancels/fails an order AFTER submission (#151),
+ * the other one-way door out of SUBMITTED beside `markShipped`. Its guarantees live
+ * in the database: the `{status: PAID, fulfillmentStatus: SUBMITTED}`-guarded
+ * `updateMany` is the idempotency point (a duplicate/racing poll is a no-op) AND the
+ * money-safety guard (a concurrently refunded/manually-fulfilled order is untouched),
+ * and it must flip ONLY `fulfillmentStatus` — leaving `Order.status` PAID and the real
+ * external id intact. A mock can't exercise `updateMany` count semantics or row
+ * locking, so these run against the same Postgres the app uses.
+ */
+describe("orderRepository.markFulfillmentFailedAfterSubmission (integration)", () => {
+  /** Seed a submitted-and-paid order carrying a real external id — the poll's
+   *  reconcilable state (as `markSubmitted` leaves it). */
+  function seedSubmitted(
+    tenantId: string,
+    opts: { status?: OrderStatus; fulfillmentStatus?: FulfillmentStatus } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+  }
+
+  it("flips SUBMITTED → FAILED, persists the provider status, and leaves status PAID + the external id intact", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(true);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("FAILED");
+    expect(persisted.fulfillmentProviderStatus).toBe("canceled");
+    // Order.status stays PAID (an operator refund/re-order decision), and the real
+    // external id is kept — a FAILED order is never polled, so it can't reach
+    // getTracking again (unlike the create-time soft-reject's placeholder id).
+    expect(persisted.status).toBe("PAID");
+    expect(persisted.fulfillmentExternalId).toBe(order.fulfillmentExternalId);
+    // No customer email: a provider cancellation is an operator concern, not a
+    // shipping notification.
+    expect(
+      await prisma.outboxMessage.count({ where: { orderId: order.id } }),
+    ).toBe(0);
+  });
+
+  it("is idempotent — a duplicate poll fails once, then no-ops", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const first = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "failed",
+    );
+    const second = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "failed",
+    );
+    expect(first).toBe(true);
+    // Already FAILED → the guarded updateMany matches nothing on the second call.
+    expect(second).toBe(false);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("FAILED");
+  });
+
+  it("does not fail a REFUNDED order (status guard) — no flip", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after submission, leaving `fulfillmentStatus` at
+    // SUBMITTED. The status guard leaves it alone (it also drops from the poll via
+    // findSubmittedForPolling's own `status: PAID` filter).
+    const order = await seedSubmitted(tenant.id, { status: "REFUNDED" });
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("REFUNDED");
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
+  });
+
+  it("does not fail a manually-FULFILLED order (status guard)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { status: "FULFILLED" });
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("SUBMITTED");
+  });
+
+  it("does not regress an already-SHIPPED order (fulfillmentStatus guard)", async () => {
+    const tenant = await freshTenant();
+    // A shipment reconciled first (SHIPPED + FULFILLED); a late terminal-fail poll
+    // must never undo it.
+    const order = await seedSubmitted(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "SHIPPED",
+    });
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      tenant.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("SHIPPED");
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id);
+
+    const failed = await orderRepository.markFulfillmentFailedAfterSubmission(
+      other.id,
+      order.id,
+      "canceled",
+    );
+    expect(failed).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
+  });
+
+  it("fails exactly once under a concurrent double-poll (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    // Two poll runs land at once: row locking on the guarded updateMany must let
+    // exactly one make the transition.
+    const [a, b] = await Promise.all([
+      orderRepository.markFulfillmentFailedAfterSubmission(
+        tenant.id,
+        order.id,
+        "canceled",
+      ),
+      orderRepository.markFulfillmentFailedAfterSubmission(
+        tenant.id,
+        order.id,
+        "canceled",
+      ),
+    ]);
+
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } }))
+        .fulfillmentStatus,
+    ).toBe("FAILED");
+  });
+});
+
+/**
+ * `markFulfillmentStuck` — the poll cron's "surface a stuck open shipment" write
+ * (M4 #155), the deliberate INVERSE of `markFulfillmentFailedAfterSubmission` right
+ * above: it stamps `fulfillmentStuckAt` and snapshots the raw provider status into
+ * `fulfillmentProviderStatus` (admin display, #161) but does NOT terminalize —
+ * `fulfillmentStatus` stays SUBMITTED and `status` stays PAID, because a provider hold
+ * (`onhold`/`inreview`) can still ship. Its guarantees live in the database: the
+ * `{status: PAID,
+ * fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: null}`-guarded `updateMany` is the
+ * idempotency point (a duplicate/racing poll is a no-op) AND the money-safety guard (a
+ * concurrently refunded/manually-fulfilled order is untouched). A mock can't exercise
+ * `updateMany` count semantics or row locking, so these run against the same Postgres
+ * the app uses.
+ */
+describe("orderRepository.markFulfillmentStuck (integration)", () => {
+  /** Seed a submitted-and-paid order carrying a real external id — the poll's
+   *  reconcilable state (as `markSubmitted` leaves it). */
+  function seedSubmitted(
+    tenantId: string,
+    opts: { status?: OrderStatus; fulfillmentStatus?: FulfillmentStatus } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+  }
+
+  it("stamps fulfillmentStuckAt and snapshots the provider status, leaving fulfillmentStatus SUBMITTED and status PAID untouched", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+    expect(order.fulfillmentStuckAt).toBeNull();
+    expect(order.fulfillmentProviderStatus).toBeNull();
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+      "onhold",
+    );
+    expect(flagged).toBe(true);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).not.toBeNull();
+    // #164: the round-robin re-poll key is seeded to the SAME instant as the marker, so the
+    // order enters the flagged poll tail (non-null key) from its very next poll instead of
+    // momentarily sorting as fresh; markStuckRepolled bumps it from there.
+    expect(persisted.fulfillmentStuckPolledAt).toEqual(
+      persisted.fulfillmentStuckAt,
+    );
+    // The raw hold status is snapshotted for the admin view (#161)...
+    expect(persisted.fulfillmentProviderStatus).toBe("onhold");
+    // ...but deliberately the inverse of markFulfillmentFailedAfterSubmission on the
+    // lifecycle: NOTHING else moves — a provider hold can still ship, so the order
+    // must keep being polled rather than being terminalized.
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("is idempotent — a duplicate poll stamps once, then no-ops (snapshot not overwritten)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    const first = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+      "onhold",
+    );
+    const firstStamp = (
+      await prisma.order.findUniqueOrThrow({ where: { id: order.id } })
+    ).fulfillmentStuckAt;
+    // A later poll reads a shifted hold status ("onhold" → "inreview"), but the
+    // `fulfillmentStuckAt: null` guard makes the whole write a no-op — the snapshot is
+    // one-shot at flag time, not refreshed each run (the #161 design decision).
+    const second = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+      "inreview",
+    );
+
+    expect(first).toBe(true);
+    // Already stamped → the guarded updateMany matches nothing on the second call.
+    expect(second).toBe(false);
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).toEqual(firstStamp);
+    // The shifted "inreview" was NOT written — the flag-time "onhold" snapshot stands.
+    expect(persisted.fulfillmentProviderStatus).toBe("onhold");
+  });
+
+  it("does not stamp a REFUNDED order (status guard) — no write", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after submission, leaving `fulfillmentStatus` at
+    // SUBMITTED. The status guard leaves it alone (it also drops from the poll via
+    // findSubmittedForPolling's own `status: PAID` filter).
+    const order = await seedSubmitted(tenant.id, { status: "REFUNDED" });
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+      "onhold",
+    );
+    expect(flagged).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.status).toBe("REFUNDED");
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentStuckAt).toBeNull();
+    // The guard blocks the whole write — no snapshot leaks onto a refunded order.
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
+  });
+
+  it("does not stamp an order that isn't SUBMITTED (fulfillmentStatus guard)", async () => {
+    const tenant = await freshTenant();
+    // Already reconciled to a shipment — a late stuck-check must never touch it.
+    const order = await seedSubmitted(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "SHIPPED",
+    });
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      tenant.id,
+      order.id,
+      "onhold",
+    );
+    expect(flagged).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStatus).toBe("SHIPPED");
+    expect(persisted.fulfillmentStuckAt).toBeNull();
+    // Guard blocks the write, so no stale hold status clobbers a shipped order.
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id);
+
+    const flagged = await orderRepository.markFulfillmentStuck(
+      other.id,
+      order.id,
+      "onhold",
+    );
+    expect(flagged).toBe(false);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).toBeNull();
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.fulfillmentProviderStatus).toBeNull();
+  });
+
+  it("stamps exactly once under a concurrent double-poll (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+
+    // Two poll runs land at once: row locking on the guarded updateMany must let
+    // exactly one make the transition.
+    const [a, b] = await Promise.all([
+      orderRepository.markFulfillmentStuck(tenant.id, order.id, "onhold"),
+      orderRepository.markFulfillmentStuck(tenant.id, order.id, "onhold"),
+    ]);
+
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckAt).not.toBeNull();
+    expect(persisted.fulfillmentProviderStatus).toBe("onhold");
+  });
+});
+
+/**
+ * `markStuckRepolled` — the poll cron's round-robin re-poll bump for the flagged-stuck tail
+ * (M4 #164). Stamps `fulfillmentStuckPolledAt = now()` on an ALREADY-flagged order so
+ * `findSubmittedForPolling` (which keys the tail on that column ascending) sorts it to the
+ * BACK of the tail, making re-polling rotate instead of the write-once `fulfillmentStuckAt`
+ * pinning the same oldest-flagged orders to the front forever (#158's residual). Guarded on
+ * `{status: PAID, fulfillmentStatus: SUBMITTED, fulfillmentStuckAt: { not: null }}`: money-
+ * safe (a refunded / hand-fulfilled order is untouched) AND invariant-safe (only a flagged
+ * order's key ever moves, so "the key is non-null IFF flagged" — on which the fresh-orders-
+ * first ordering depends — stays airtight). A mock can't exercise `updateMany`'s guard
+ * count, so these run against the same Postgres the app uses.
+ */
+describe("orderRepository.markStuckRepolled (integration)", () => {
+  /** Seed a flagged-stuck SUBMITTED+PAID order — `fulfillmentStuckAt` and the re-poll key
+   *  both stamped in the past (default an hour ago), the state the poll re-polls each run. */
+  async function seedFlaggedStuck(
+    tenantId: string,
+    opts: { status?: OrderStatus; stuckAt?: Date } = {},
+  ) {
+    const stuckAt = opts.stuckAt ?? new Date(Date.now() - 60 * 60_000);
+    const order = await seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+    return prisma.order.update({
+      where: { id: order.id },
+      data: { fulfillmentStuckAt: stuckAt, fulfillmentStuckPolledAt: stuckAt },
+    });
+  }
+
+  it("advances fulfillmentStuckPolledAt on a flagged order, touching nothing else", async () => {
+    const tenant = await freshTenant();
+    const order = await seedFlaggedStuck(tenant.id);
+    const before = order.fulfillmentStuckPolledAt!;
+
+    await orderRepository.markStuckRepolled(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    // The key moved strictly forward (now() > the seeded past stamp) → this order now sorts
+    // to the BACK of the flagged tail, so the next run re-polls a DIFFERENT flagged order.
+    expect(persisted.fulfillmentStuckPolledAt!.getTime()).toBeGreaterThan(
+      before.getTime(),
+    );
+    // Nothing else moves — this write only reorders the batch; it drives no state change or
+    // alert, so the flag time, the lifecycle, and the order status all stand untouched.
+    expect(persisted.fulfillmentStuckAt).toEqual(order.fulfillmentStuckAt);
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("does not touch a not-yet-flagged (fresh) order — preserves the null-iff-flagged invariant", async () => {
+    const tenant = await freshTenant();
+    // A fresh SUBMITTED order (never flagged): `fulfillmentStuckAt` is null, so the
+    // `fulfillmentStuckAt: { not: null }` guard blocks the write — its key must stay null so
+    // it keeps sorting as fresh. The poll never calls this for a fresh order; the guard is
+    // defence in depth against ever violating the null-iff-flagged invariant.
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+
+    await orderRepository.markStuckRepolled(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckPolledAt).toBeNull();
+  });
+
+  it("does not touch a no-longer-PAID (refunded) flagged order — the money-safety guard", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after the order was flagged. The `status: PAID` guard leaves
+    // the key frozen (the order also drops from the poll via the status filter anyway).
+    const order = await seedFlaggedStuck(tenant.id, { status: "REFUNDED" });
+    const before = order.fulfillmentStuckPolledAt;
+
+    await orderRepository.markStuckRepolled(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckPolledAt).toEqual(before);
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedFlaggedStuck(owner.id);
+    const before = order.fulfillmentStuckPolledAt;
+
+    await orderRepository.markStuckRepolled(other.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentStuckPolledAt).toEqual(before);
+  });
+});
+
+/**
+ * `recordFulfillmentPollError` — the poll cron's "record one failed getTracking poll"
+ * write (M4 #163), the erroring-open-shipment sibling of `markFulfillmentStuck`. Its
+ * guarantees live in the database: the `{status: PAID, fulfillmentStatus: SUBMITTED}`
+ * work-list guard is the money-safety filter (a refunded / hand-fulfilled order is never
+ * touched), and the atomic increment + same-transaction read-back is what makes the
+ * returned count authoritative under a racing double-poll — the property the service's
+ * `=== threshold` alert idempotency rests on. A mock can't exercise `updateMany` count
+ * semantics or row locking, so these run against the same Postgres the app uses.
+ */
+describe("orderRepository.recordFulfillmentPollError (integration)", () => {
+  /** Seed a PAID + SUBMITTED order with a real external id and an optional starting
+   *  error streak — the poll's reconcilable state (as `markSubmitted` leaves it). */
+  function seedSubmitted(
+    tenantId: string,
+    opts: {
+      status?: OrderStatus;
+      fulfillmentStatus?: FulfillmentStatus;
+      fulfillmentErrorCount?: number;
+      fulfillmentErrorPolledAt?: Date | null;
+    } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+      fulfillmentErrorCount: opts.fulfillmentErrorCount,
+      fulfillmentErrorPolledAt: opts.fulfillmentErrorPolledAt,
+    });
+  }
+
+  it("increments the error streak and returns the new count, leaving the lifecycle untouched", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { fulfillmentErrorCount: 4 });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBe(5);
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(5);
+    // Alert-only (the #155 posture, not #151's terminal exit): neither the fulfillment
+    // lifecycle nor the order status moves — the order keeps being polled.
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("stamps the erroring-tier re-poll key (fulfillmentErrorPolledAt) in the same write (#175)", async () => {
+    const tenant = await freshTenant();
+    // Seed an order carrying a stale re-poll key (as a still-erroring order would). The write
+    // must bump it to ~now() so `findSubmittedForPolling` rotates this order to the BACK of the
+    // erroring tier — the round-robin that stops a >POLL_BATCH_SIZE erroring backlog starving it.
+    const staleKey = new Date(Date.now() - 60 * 60_000);
+    const order = await seedSubmitted(tenant.id, {
+      fulfillmentErrorCount: 2,
+      fulfillmentErrorPolledAt: staleKey,
+    });
+    const before = Date.now();
+
+    await orderRepository.recordFulfillmentPollError(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    // Bumped forward (well past the stale key), keeping the "non-null IFF count > 0" invariant.
+    expect(persisted.fulfillmentErrorPolledAt).not.toBeNull();
+    expect(persisted.fulfillmentErrorPolledAt!.getTime()).toBeGreaterThan(
+      staleKey.getTime(),
+    );
+    expect(
+      persisted.fulfillmentErrorPolledAt!.getTime(),
+    ).toBeGreaterThanOrEqual(before);
+  });
+
+  it("returns 1 on the first error (up from the default 0)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id);
+    expect(order.fulfillmentErrorCount).toBe(0);
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBe(1);
+  });
+
+  it("returns null and writes nothing for a non-PAID order (status guard)", async () => {
+    const tenant = await freshTenant();
+    // A refund flipped `status` after submission; the guard leaves the streak alone (the
+    // order also drops from the poll via findSubmittedForPolling's own status filter).
+    const order = await seedSubmitted(tenant.id, {
+      status: "REFUNDED",
+      fulfillmentErrorCount: 2,
+    });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBeNull();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(2);
+  });
+
+  it("returns null for an order that isn't SUBMITTED (fulfillmentStatus guard)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "SHIPPED",
+      fulfillmentErrorCount: 3,
+    });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      tenant.id,
+      order.id,
+    );
+
+    expect(count).toBeNull();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(3);
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id, { fulfillmentErrorCount: 1 });
+
+    const count = await orderRepository.recordFulfillmentPollError(
+      other.id,
+      order.id,
+    );
+
+    expect(count).toBeNull();
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(1);
+  });
+
+  it("serializes a concurrent double-poll — distinct, gap-free counts (no lost update)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { fulfillmentErrorCount: 10 });
+
+    // Two poll runs land at once. Row locking on the guarded increment must serialize
+    // them so each reads back a DISTINCT value (11 then 12), never a lost update (both
+    // 11) — this is exactly what lets the service's `=== threshold` alert fire at most once.
+    const [a, b] = await Promise.all([
+      orderRepository.recordFulfillmentPollError(tenant.id, order.id),
+      orderRepository.recordFulfillmentPollError(tenant.id, order.id),
+    ]);
+
+    expect([a, b].sort((x, y) => (x ?? 0) - (y ?? 0))).toEqual([11, 12]);
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(12);
+  });
+});
+
+/**
+ * `resetFulfillmentPollErrors` — the poll cron's "a clean poll broke the error streak"
+ * write (M4 #163). Same `{status: PAID, fulfillmentStatus: SUBMITTED}` work-list guard as
+ * its siblings so it never touches an order that has left the poll, and tenant-scoped.
+ */
+describe("orderRepository.resetFulfillmentPollErrors (integration)", () => {
+  function seedSubmitted(
+    tenantId: string,
+    opts: {
+      status?: OrderStatus;
+      fulfillmentStatus?: FulfillmentStatus;
+      fulfillmentErrorCount?: number;
+      fulfillmentErrorPolledAt?: Date | null;
+    } = {},
+  ) {
+    return seedOrder(tenantId, {
+      status: opts.status ?? "PAID",
+      fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+      fulfillmentErrorCount: opts.fulfillmentErrorCount,
+      fulfillmentErrorPolledAt: opts.fulfillmentErrorPolledAt,
+    });
+  }
+
+  it("zeroes a non-zero streak on a SUBMITTED order, leaving the lifecycle untouched", async () => {
+    const tenant = await freshTenant();
+    const order = await seedSubmitted(tenant.id, { fulfillmentErrorCount: 7 });
+
+    await orderRepository.resetFulfillmentPollErrors(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(0);
+    expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
+    expect(persisted.status).toBe("PAID");
+  });
+
+  it("clears the erroring-tier re-poll key (fulfillmentErrorPolledAt) on reset — the recovery-return (#175)", async () => {
+    const tenant = await freshTenant();
+    // A still-erroring order carrying a re-poll key. A clean poll (this reset) is the recovery
+    // signal: it must null the key alongside the count so `findSubmittedForPolling` floats the
+    // order back to the FRESH tier (null key sorts first) rather than stranding it in the
+    // deprioritised erroring tail — the AC2 recovery-return, and the "non-null IFF count > 0"
+    // invariant restored.
+    const order = await seedSubmitted(tenant.id, {
+      fulfillmentErrorCount: 7,
+      fulfillmentErrorPolledAt: new Date(Date.now() - 30 * 60_000),
+    });
+
+    await orderRepository.resetFulfillmentPollErrors(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(0);
+    expect(persisted.fulfillmentErrorPolledAt).toBeNull();
+  });
+
+  it("does not touch an order that has left the work list (status guard)", async () => {
+    const tenant = await freshTenant();
+    // A refunded order carrying a residual streak — the guard leaves it exactly as it was.
+    const order = await seedSubmitted(tenant.id, {
+      status: "REFUNDED",
+      fulfillmentErrorCount: 5,
+    });
+
+    await orderRepository.resetFulfillmentPollErrors(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(5);
+  });
+
+  it("does not cross the tenant boundary — a foreign order is invisible", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedSubmitted(owner.id, { fulfillmentErrorCount: 3 });
+
+    await orderRepository.resetFulfillmentPollErrors(other.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(3);
+  });
+});
+
 describe("orderRepository.listByTenant (integration)", () => {
   it("returns a tenant's orders newest-first with a total", async () => {
     const tenant = await freshTenant();
@@ -1404,6 +2445,411 @@ describe("orderRepository.findStalePending (integration)", () => {
       id: o.id,
       tenantId: t.id,
       stripePaymentIntentId: "pi_shape",
+    });
+  });
+});
+
+/**
+ * `findSubmittedForPolling` — the poll-fulfillment cron's work list (#140). Like
+ * `findStalePending`, this is a platform-wide query (it spans tenants), so
+ * assertions filter to the ids each test created rather than asserting absolute
+ * counts. Both filters (`status: PAID` and `fulfillmentStatus: SUBMITTED`) are the
+ * ones the poll relies on to reconcile only genuinely open shipments.
+ */
+describe("orderRepository.findSubmittedForPolling (integration)", () => {
+  const minsAgo = (n: number) => new Date(Date.now() - n * 60_000);
+
+  /** Seed a SUBMITTED+PAID order (the reconcilable state), across tenants. An optional
+   *  `fulfillmentErrorCount` seeds a getTracking-error streak for the #170/#175 ordering tests;
+   *  `errorPolledAt` pins the erroring-tier re-poll key (#175) for the rotation tests. To keep
+   *  the production invariant (`fulfillmentErrorPolledAt` non-null IFF the streak > 0) in seeds,
+   *  an erroring order (count > 0) always gets a re-poll key — the explicit `errorPolledAt`, or
+   *  its `createdAt` when a test doesn't pin one — so it lands in the erroring tier, never
+   *  mis-sorts as fresh. */
+  function seedSubmitted(
+    tenantId: string,
+    opts: {
+      createdAt?: Date;
+      externalId?: string;
+      fulfillmentErrorCount?: number;
+      errorPolledAt?: Date;
+    } = {},
+  ) {
+    const count = opts.fulfillmentErrorCount;
+    return seedOrder(tenantId, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: opts.externalId ?? uniqueId("ext"),
+      ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
+      ...(count !== undefined ? { fulfillmentErrorCount: count } : {}),
+      ...(count !== undefined && count > 0
+        ? {
+            fulfillmentErrorPolledAt:
+              opts.errorPolledAt ?? opts.createdAt ?? new Date(),
+          }
+        : {}),
+    });
+  }
+
+  it("returns SUBMITTED+PAID orders across tenants, oldest first", async () => {
+    const a = await freshTenant();
+    const b = await freshTenant();
+    // Ages: a1 = 3h, b1 = 2h, a2 = 1h → oldest-first is [a1, b1, a2], spanning tenants.
+    const a1 = await seedSubmitted(a.id, { createdAt: minsAgo(180) });
+    const a2 = await seedSubmitted(a.id, { createdAt: minsAgo(60) });
+    const b1 = await seedSubmitted(b.id, { createdAt: minsAgo(120) });
+
+    const open = await orderRepository.findSubmittedForPolling(100);
+
+    const mineInOrder = open
+      .map((o) => o.id)
+      .filter((id) => [a1.id, a2.id, b1.id].includes(id));
+    expect(mineInOrder).toEqual([a1.id, b1.id, a2.id]);
+  });
+
+  it("deprioritises flagged-stuck orders to the tail — not-yet-flagged first, then by re-poll key (#158/#164)", async () => {
+    const t = await freshTenant();
+    // Two not-yet-flagged orders, and two flagged-stuck ones whose `createdAt` is OLDER than
+    // both fresh orders — pre-#158 (oldest-first only) the flagged pair would poll first
+    // every run and, if the hold never resolves, starve the fresh orders. The tail sorts by
+    // `fulfillmentStuckPolledAt` (#164's re-poll key), which `markFulfillmentStuck` seeds =
+    // `fulfillmentStuckAt` at flag time; here it's set the inverse of createdAt order (stuckA
+    // is oldest-created but flagged most recently) to prove the tail sorts by the re-poll
+    // key, not `createdAt`. A fresh order's key is null → `nulls: "first"` floats it ahead.
+    const freshOld = await seedSubmitted(t.id, { createdAt: minsAgo(200) });
+    const freshNew = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
+    const stuckA = await seedSubmitted(t.id, { createdAt: minsAgo(500) });
+    const stuckB = await seedSubmitted(t.id, { createdAt: minsAgo(400) });
+    await prisma.order.update({
+      where: { id: stuckA.id },
+      data: {
+        fulfillmentStuckAt: minsAgo(30),
+        fulfillmentStuckPolledAt: minsAgo(30),
+      },
+    });
+    await prisma.order.update({
+      where: { id: stuckB.id },
+      data: {
+        fulfillmentStuckAt: minsAgo(90),
+        fulfillmentStuckPolledAt: minsAgo(90),
+      },
+    });
+
+    const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
+      .map((o) => o.id)
+      .filter((id) =>
+        [freshOld.id, freshNew.id, stuckA.id, stuckB.id].includes(id),
+      );
+    // Not-yet-flagged first (oldest createdAt first), THEN flagged-stuck (least-recently-
+    // repolled first — stuckB's 90m-ago key before stuckA's 30m-ago), even though
+    // stuckA/stuckB were created first.
+    expect(mineInOrder).toEqual([
+      freshOld.id,
+      freshNew.id,
+      stuckB.id,
+      stuckA.id,
+    ]);
+  });
+
+  it("rotates the flagged-stuck tail by re-poll key so no flagged order is starved past the batch limit (#164)", async () => {
+    const t = await freshTenant();
+    // One fresh order + three flagged-stuck orders. Pre-#164 the tail keyed on the WRITE-ONCE
+    // `fulfillmentStuckAt`, so the same orders sat at its front every run and a backlog past
+    // POLL_BATCH_SIZE permanently starved the newest-flagged. Now the tail keys on
+    // `fulfillmentStuckPolledAt`, which each re-poll bumps — so re-polling ROTATES. Seed the
+    // three flagged orders with DISTINCT re-poll keys in a DIFFERENT order than createdAt to
+    // prove the key, not creation age, drives the tail.
+    const fresh = await seedSubmitted(t.id, { createdAt: minsAgo(50) });
+    const stuckA = await seedSubmitted(t.id, { createdAt: minsAgo(500) });
+    const stuckB = await seedSubmitted(t.id, { createdAt: minsAgo(400) });
+    const stuckC = await seedSubmitted(t.id, { createdAt: minsAgo(300) });
+    const flag = (id: string, polledAt: Date) =>
+      prisma.order.update({
+        where: { id },
+        data: {
+          fulfillmentStuckAt: minsAgo(200),
+          fulfillmentStuckPolledAt: polledAt,
+        },
+      });
+    // Re-poll keys: B oldest (30m ago), C (20m), A newest (10m) → tail order B, C, A.
+    await flag(stuckA.id, minsAgo(10));
+    await flag(stuckB.id, minsAgo(30));
+    await flag(stuckC.id, minsAgo(20));
+
+    const mine = (open: { id: string }[]) =>
+      open
+        .map((o) => o.id)
+        .filter((id) =>
+          [fresh.id, stuckA.id, stuckB.id, stuckC.id].includes(id),
+        );
+
+    // Run 1: fresh first, then the flagged tail by ascending re-poll key (B, C, A).
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      fresh.id,
+      stuckB.id,
+      stuckC.id,
+      stuckA.id,
+    ]);
+
+    // The poll re-polls the two least-recently-polled flagged orders (B then C):
+    // markStuckRepolled stamps now(), sending them to the BACK of the tail. A is untouched.
+    await orderRepository.markStuckRepolled(t.id, stuckB.id);
+    await orderRepository.markStuckRepolled(t.id, stuckC.id);
+
+    // Run 2: A (still 10m-ago key) now sorts BEFORE B and C (just re-polled → now) — the
+    // once-last flagged order is now first. No flagged order is pinned to the front across
+    // runs, so a >batch-size backlog can't permanently starve the newest-flagged. (B before
+    // C: B was re-polled first; the `createdAt` tiebreak — B older than C — settles any
+    // same-millisecond tie identically.)
+    expect(
+      mine(await orderRepository.findSubmittedForPolling(100)).filter(
+        (id) => id !== fresh.id,
+      ),
+    ).toEqual([stuckA.id, stuckB.id, stuckC.id]);
+  });
+
+  it("sinks erroring orders behind fresh ones, ordered by re-poll key not error streak (#170 tier split, #175 rotation)", async () => {
+    const t = await freshTenant();
+    // An order whose getTracking throws every poll returns via `recordPollError` BEFORE
+    // `flagIfStuck`, so it is never flagged-stuck: its `fulfillmentStuckPolledAt` stays null and
+    // it shares the not-yet-flagged group with the fresh orders. #170 sinks it behind fresh via
+    // the null-vs-non-null re-poll-key boundary; #175 orders the erroring tier itself by
+    // `fulfillmentErrorPolledAt` (the re-poll key), NOT the stable `fulfillmentErrorCount`. Proven
+    // by giving the HIGHER-count order the OLDER key: under #170's count sub-order errLow (3) would
+    // poll first, but the re-poll key puts errHigh (older key) first — count no longer drives it.
+    const freshOld = await seedSubmitted(t.id, { createdAt: minsAgo(200) });
+    const freshNew = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
+    const errHigh = await seedSubmitted(t.id, {
+      createdAt: minsAgo(500),
+      fulfillmentErrorCount: 80,
+      errorPolledAt: minsAgo(40), // older re-poll key → polls first within the erroring tier
+    });
+    const errLow = await seedSubmitted(t.id, {
+      createdAt: minsAgo(400),
+      fulfillmentErrorCount: 3,
+      errorPolledAt: minsAgo(20), // newer re-poll key → polls last
+    });
+
+    const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
+      .map((o) => o.id)
+      .filter((id) =>
+        [freshOld.id, freshNew.id, errHigh.id, errLow.id].includes(id),
+      );
+    // Fresh first (null re-poll key, oldest createdAt first), THEN erroring by ascending re-poll
+    // key (errHigh's older key before errLow's newer one) — even though errHigh has the FAR higher
+    // streak (80 vs 3) and both erroring orders were created before both fresh ones.
+    expect(mineInOrder).toEqual([
+      freshOld.id,
+      freshNew.id,
+      errHigh.id,
+      errLow.id,
+    ]);
+  });
+
+  it("rotates the erroring tier by re-poll key so no erroring order is starved past the batch limit (#175)", async () => {
+    const t = await freshTenant();
+    // The #164-analogue for the erroring tier. Pre-#175 the tier keyed on the STABLE
+    // `fulfillmentErrorCount`, so within a >POLL_BATCH_SIZE erroring backlog a high-count order sat
+    // behind lower-count ones every run and never reached the take() window. #175 keys the tier on
+    // `fulfillmentErrorPolledAt`, which each error poll bumps — so re-polling ROTATES. Seed one
+    // fresh order + three erroring ones with EQUAL counts (proving count is irrelevant) and
+    // DISTINCT re-poll keys, ordered differently from createdAt to prove the key drives the tier.
+    const fresh = await seedSubmitted(t.id, { createdAt: minsAgo(50) });
+    const errA = await seedSubmitted(t.id, {
+      createdAt: minsAgo(500),
+      fulfillmentErrorCount: 5,
+      errorPolledAt: minsAgo(10),
+    });
+    const errB = await seedSubmitted(t.id, {
+      createdAt: minsAgo(400),
+      fulfillmentErrorCount: 5,
+      errorPolledAt: minsAgo(30),
+    });
+    const errC = await seedSubmitted(t.id, {
+      createdAt: minsAgo(300),
+      fulfillmentErrorCount: 5,
+      errorPolledAt: minsAgo(20),
+    });
+    const mine = (open: { id: string }[]) =>
+      open
+        .map((o) => o.id)
+        .filter((id) => [fresh.id, errA.id, errB.id, errC.id].includes(id));
+
+    // Run 1: fresh first, then the erroring tier by ascending re-poll key (B 30m, C 20m, A 10m).
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      fresh.id,
+      errB.id,
+      errC.id,
+      errA.id,
+    ]);
+
+    // The poll re-polls the two least-recently-errored (B then C): each getTracking error runs
+    // `recordFulfillmentPollError`, bumping `fulfillmentErrorPolledAt` to now() → the BACK of the
+    // tier. A is untouched.
+    await orderRepository.recordFulfillmentPollError(t.id, errB.id);
+    await orderRepository.recordFulfillmentPollError(t.id, errC.id);
+
+    // Run 2: A (still 10m-ago key) now sorts BEFORE B and C (just bumped to ~now()) — the
+    // once-last erroring order is now first. No erroring order is pinned to the tier front across
+    // runs, so a >batch-size backlog can't permanently starve one. (B before C: B was re-polled
+    // first, so its key is fractionally older; the `createdAt` tiebreak — B older than C — settles
+    // any same-millisecond tie identically.)
+    expect(
+      mine(await orderRepository.findSubmittedForPolling(100)).filter(
+        (id) => id !== fresh.id,
+      ),
+    ).toEqual([errA.id, errB.id, errC.id]);
+  });
+
+  it("orders the batch fresh, then erroring, then flagged-stuck (#170/#175 three-tier order)", async () => {
+    const t = await freshTenant();
+    // The full deprioritisation order: a fresh order, an erroring one (null stuck key, count > 0
+    // → non-null re-poll key), and a flagged-stuck one (non-null `fulfillmentStuckPolledAt`). The
+    // PRIMARY stuck key's `nulls: "first"` floats the two null-stuck-key orders (fresh + erroring)
+    // ahead of the flagged one; within that group the SECONDARY `fulfillmentErrorPolledAt` (null
+    // for fresh, non-null for erroring since #175) puts fresh before erroring. Each later tier is
+    // created OLDER than the one before, so createdAt-ascending alone would sort them in the exact
+    // REVERSE order — proving the tier keys, not creation age, drive it.
+    const fresh = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
+    const erroring = await seedSubmitted(t.id, {
+      createdAt: minsAgo(300),
+      fulfillmentErrorCount: 20,
+    });
+    const stuck = await seedSubmitted(t.id, { createdAt: minsAgo(500) });
+    await prisma.order.update({
+      where: { id: stuck.id },
+      data: {
+        fulfillmentStuckAt: minsAgo(60),
+        fulfillmentStuckPolledAt: minsAgo(60),
+      },
+    });
+
+    const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
+      .map((o) => o.id)
+      .filter((id) => [fresh.id, erroring.id, stuck.id].includes(id));
+    expect(mineInOrder).toEqual([fresh.id, erroring.id, stuck.id]);
+  });
+
+  it("floats a recovered order back to the fresh tier when its streak resets — the recovery-return (#175 AC2)", async () => {
+    const t = await freshTenant();
+    // AC2: a deprioritised erroring order reconciles once its getTracking recovers. A clean poll
+    // resets the streak AND nulls `fulfillmentErrorPolledAt` (#163/#175) — the null key floats the
+    // order back to the FRESH tier so it polls (and can ship) at once, rather than lingering in the
+    // erroring tail. Give `recovered` the NEWER re-poll key (so it polls LAST in the tier before
+    // recovery) — its jump to the FRONT is then unambiguously the reset, not its prior position.
+    const recovered = await seedSubmitted(t.id, {
+      createdAt: minsAgo(100),
+      fulfillmentErrorCount: 50,
+      errorPolledAt: minsAgo(10),
+    });
+    const stillErroring = await seedSubmitted(t.id, {
+      createdAt: minsAgo(400),
+      fulfillmentErrorCount: 10,
+      errorPolledAt: minsAgo(30),
+    });
+    const mine = (open: { id: string }[]) =>
+      open
+        .map((o) => o.id)
+        .filter((id) => [recovered.id, stillErroring.id].includes(id));
+
+    // Before recovery: erroring tier ordered by re-poll key — stillErroring's older key (30m)
+    // before recovered's newer one (10m).
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      stillErroring.id,
+      recovered.id,
+    ]);
+
+    // A clean poll resets the streak AND nulls the re-poll key (what `resetFulfillmentPollErrors`
+    // does on recovery).
+    await orderRepository.resetFulfillmentPollErrors(t.id, recovered.id);
+
+    // Now recovered (null key → fresh tier) sorts ahead of the still-erroring order — even though
+    // it had the NEWER re-poll key a moment ago. The recovery-return is immediate.
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      recovered.id,
+      stillErroring.id,
+    ]);
+  });
+
+  it("excludes orders whose fulfillmentStatus isn't SUBMITTED", async () => {
+    const t = await freshTenant();
+    const submitted = await seedSubmitted(t.id);
+    const notSubmitted = await seedOrder(t.id, {
+      status: "PAID",
+      fulfillmentStatus: "NOT_SUBMITTED",
+    });
+    const shipped = await seedOrder(t.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "SHIPPED",
+    });
+    const failed = await seedOrder(t.id, {
+      status: "PAID",
+      fulfillmentStatus: "FAILED",
+    });
+
+    const ids = (await orderRepository.findSubmittedForPolling(100)).map(
+      (o) => o.id,
+    );
+    expect(ids).toContain(submitted.id);
+    expect(ids).not.toContain(notSubmitted.id);
+    expect(ids).not.toContain(shipped.id);
+    expect(ids).not.toContain(failed.id);
+  });
+
+  it("excludes a SUBMITTED order that is no longer PAID (refunded / cancelled)", async () => {
+    const t = await freshTenant();
+    // A refund flipped `status` after submission, leaving fulfillmentStatus at
+    // SUBMITTED. The `status: PAID` filter keeps it out of the poll's work list, so
+    // no provider call is wasted on an order `markShipped` would refuse.
+    const refunded = await seedOrder(t.id, {
+      status: "REFUNDED",
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: uniqueId("ext"),
+    });
+    const paid = await seedSubmitted(t.id);
+
+    const ids = (await orderRepository.findSubmittedForPolling(100)).map(
+      (o) => o.id,
+    );
+    expect(ids).toContain(paid.id);
+    expect(ids).not.toContain(refunded.id);
+  });
+
+  it("respects the batch limit", async () => {
+    const t = await freshTenant();
+    await seedSubmitted(t.id, { createdAt: minsAgo(180) });
+    await seedSubmitted(t.id, { createdAt: minsAgo(150) });
+    await seedSubmitted(t.id, { createdAt: minsAgo(120) });
+
+    // take=2 with ≥2 open rows in existence → exactly 2, whatever else is around.
+    const open = await orderRepository.findSubmittedForPolling(2);
+    expect(open).toHaveLength(2);
+  });
+
+  it("selects only the fields the poll needs (id, tenantId, fulfillmentExternalId)", async () => {
+    const t = await freshTenant();
+    const o = await seedSubmitted(t.id, { externalId: "ext_shape" });
+
+    const found = (await orderRepository.findSubmittedForPolling(100)).find(
+      (r) => r.id === o.id,
+    );
+    expect(found).toBeDefined();
+    // Widened for the stuck-open-shipment check (#155): `createdAt` (the age
+    // anchor) + `fulfillmentStuckAt` (the already-surfaced marker) joined the
+    // select alongside the original three fields; and for the erroring-open-shipment
+    // check (#163): `fulfillmentErrorCount` (the pre-read that gates the reset).
+    expect(Object.keys(found!).sort()).toEqual([
+      "createdAt",
+      "fulfillmentErrorCount",
+      "fulfillmentExternalId",
+      "fulfillmentStuckAt",
+      "id",
+      "tenantId",
+    ]);
+    expect(found).toMatchObject({
+      id: o.id,
+      tenantId: t.id,
+      fulfillmentExternalId: "ext_shape",
     });
   });
 });
@@ -1852,5 +3298,212 @@ describe("orderRepository.findByIdForTenantAndUser (integration)", () => {
       atB.id,
     );
     expect(found).toBeNull();
+  });
+});
+
+/**
+ * The order-level fulfillment-submission guards (M4 #139) — the SECOND idempotency
+ * layer behind provider submission. Their guarantees live in the database's row
+ * lock + status-guarded `updateMany`, not the code, so (like `markPaid`) they can
+ * only be proven against real Postgres: exactly one of two racing submissions
+ * claims the order, a lost worker's order stays stuck in SUBMITTING (never
+ * re-submitted), and the terminal writes are guarded against regression. A
+ * duplicate POD order is real money + a physical shipment, so this is the crux of
+ * #139.
+ */
+describe("orderRepository fulfillment submission guards (integration)", () => {
+  const readFulfillment = (id: string) =>
+    prisma.order.findUniqueOrThrow({ where: { id } });
+
+  it("claimForSubmission moves NOT_SUBMITTED → SUBMITTING and returns true", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" }); // NOT_SUBMITTED
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      true,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTING",
+    );
+  });
+
+  it("is won by exactly one of two racing claims — so exactly one createOrder (Promise.all)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" });
+
+    // Two submissions land at once (an immediate dispatch racing the cron, or two
+    // cron runs after a stale-claim recovery). Row locking on the guarded
+    // `updateMany({ fulfillmentStatus: NOT_SUBMITTED })` must let exactly one flip
+    // to SUBMITTING — only that winner would call provider.createOrder. Never both.
+    const [a, b] = await Promise.all([
+      orderRepository.claimForSubmission(tenant.id, order.id),
+      orderRepository.claimForSubmission(tenant.id, order.id),
+    ]);
+
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTING",
+    );
+  });
+
+  it("returns false for an order stuck in SUBMITTING — the lost-worker path is never re-submitted", async () => {
+    const tenant = await freshTenant();
+    // A lost worker left the order SUBMITTING: createOrder may have reached the
+    // provider, but the SUBMITTED write never landed. A re-drain must NOT resubmit.
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTING",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    // Untouched — stuck in SUBMITTING for a human to reconcile.
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTING",
+    );
+  });
+
+  it("returns false for an already-terminal (SUBMITTED) order", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTED",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTED",
+    );
+  });
+
+  it("returns false for a REFUNDED order — a refunded order is never submitted", async () => {
+    const tenant = await freshTenant();
+    // A refund landed after PAID: `markRefundedByPaymentIntent` flips only `status`,
+    // leaving fulfillmentStatus NOT_SUBMITTED and the queued fs_ message pending.
+    // The claim's `status: PAID` guard must refuse it — otherwise we'd ship an order
+    // the customer was already refunded (real money + a physical shipment).
+    const order = await seedOrder(tenant.id, {
+      status: "REFUNDED",
+      fulfillmentStatus: "NOT_SUBMITTED",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "NOT_SUBMITTED",
+    );
+  });
+
+  it("returns false for a manually-FULFILLED order — no provider double-fulfilment", async () => {
+    const tenant = await freshTenant();
+    // An admin hand-attested FULFILLED (`markFulfilled`) before the fs_ message
+    // drained. Auto-submitting to the provider now would double-fulfil the order.
+    const order = await seedOrder(tenant.id, {
+      status: "FULFILLED",
+      fulfillmentStatus: "NOT_SUBMITTED",
+    });
+
+    expect(await orderRepository.claimForSubmission(tenant.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "NOT_SUBMITTED",
+    );
+  });
+
+  it("claimForSubmission does not cross the tenant boundary — a foreign order is untouched", async () => {
+    const owner = await freshTenant();
+    const other = await freshTenant();
+    const order = await seedOrder(owner.id, { status: "PAID" });
+
+    expect(await orderRepository.claimForSubmission(other.id, order.id)).toBe(
+      false,
+    );
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "NOT_SUBMITTED",
+    );
+  });
+
+  it("markSubmitted moves SUBMITTING → SUBMITTED and persists the external id + provider", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTING",
+    });
+
+    expect(
+      await orderRepository.markSubmitted(
+        tenant.id,
+        order.id,
+        "pf_12345",
+        "printful",
+      ),
+    ).toBe(true);
+
+    expect(await readFulfillment(order.id)).toMatchObject({
+      fulfillmentStatus: "SUBMITTED",
+      fulfillmentExternalId: "pf_12345",
+      fulfillmentProvider: "printful",
+    });
+  });
+
+  it("markSubmitted no-ops on a non-SUBMITTING order (guarded — no external id leak)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" }); // NOT_SUBMITTED
+
+    expect(
+      await orderRepository.markSubmitted(
+        tenant.id,
+        order.id,
+        "pf_x",
+        "printful",
+      ),
+    ).toBe(false);
+
+    const persisted = await readFulfillment(order.id);
+    expect(persisted.fulfillmentStatus).toBe("NOT_SUBMITTED");
+    expect(persisted.fulfillmentExternalId).toBeNull();
+    expect(persisted.fulfillmentProvider).toBeNull();
+  });
+
+  it("markFulfillmentFailed moves NOT_SUBMITTED → FAILED (a pre-claim permanent failure)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, { status: "PAID" }); // NOT_SUBMITTED
+
+    await orderRepository.markFulfillmentFailed(tenant.id, order.id);
+
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe("FAILED");
+  });
+
+  it("markFulfillmentFailed moves SUBMITTING → FAILED (a soft rejection after the claim)", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTING",
+    });
+
+    await orderRepository.markFulfillmentFailed(tenant.id, order.id);
+
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe("FAILED");
+  });
+
+  it("markFulfillmentFailed does not regress an already-SUBMITTED order", async () => {
+    const tenant = await freshTenant();
+    const order = await seedOrder(tenant.id, {
+      status: "PAID",
+      fulfillmentStatus: "SUBMITTED",
+    });
+
+    await orderRepository.markFulfillmentFailed(tenant.id, order.id);
+
+    // The guard excludes SUBMITTED/SHIPPED — a stray late failure can't undo a
+    // recorded success.
+    expect((await readFulfillment(order.id)).fulfillmentStatus).toBe(
+      "SUBMITTED",
+    );
   });
 });

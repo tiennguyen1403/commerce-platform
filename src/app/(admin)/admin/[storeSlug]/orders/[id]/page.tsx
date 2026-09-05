@@ -1,14 +1,26 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, TriangleAlert } from "lucide-react";
+import {
+  ArrowLeft,
+  ExternalLink,
+  SearchX,
+  TriangleAlert,
+  type LucideIcon,
+} from "lucide-react";
 import { requireAdminContext } from "@/server/auth/admin-context";
 import { orderService } from "@/server/services/order.service";
 import { ROLES, hasAtLeast } from "@/config/roles";
 import { formatDate, formatMoney } from "@/lib/utils";
 import {
+  FULFILLMENT_STATUS_BADGE,
+  FULFILLMENT_STATUS_LABELS,
   ORDER_STATUS_BADGE,
   ORDER_STATUS_LABELS,
+  formatShippingAddressLines,
+  fulfillmentAttention,
+  fulfillmentErrorAttention,
+  trackingHref,
 } from "@/lib/validators/orders";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -23,6 +35,31 @@ import {
 import { OrderActions } from "../order-actions";
 
 export const metadata: Metadata = { title: "Order" };
+
+/** A needs-attention callout in the Fulfillment card. The icon distinguishes the
+ *  concern at a glance — a failed/stuck order (`TriangleAlert`) vs. unreadable tracking
+ *  (`SearchX`) — over a shared destructive treatment; the title/description come from a
+ *  pure `FulfillmentAttention` helper. Decorative icon (`aria-hidden`): the title carries
+ *  the meaning. */
+function FulfillmentAlert({
+  icon: Icon,
+  title,
+  description,
+}: {
+  icon: LucideIcon;
+  title: string;
+  description: string;
+}) {
+  return (
+    <div className="border-destructive/30 bg-destructive/10 flex gap-3 rounded-lg border p-4 text-sm">
+      <Icon className="text-destructive mt-0.5 size-5 shrink-0" aria-hidden />
+      <div className="flex flex-col gap-1">
+        <p className="text-foreground font-medium">{title}</p>
+        <p className="text-muted-foreground">{description}</p>
+      </div>
+    </div>
+  );
+}
 
 export default async function OrderDetailPage({
   params,
@@ -41,6 +78,24 @@ export default async function OrderDetailPage({
   // Refund is ADMIN+ (cancel/fulfil are STAFF+); the buttons re-check server-side.
   const canRefund = hasAtLeast(role, ROLES.ADMIN);
   const status = order.status;
+
+  // Fulfillment view (M4 #142): the internal state, any provider/tracking detail,
+  // the shipping address, and a "needs attention" callout for a failed / stuck
+  // order. All read off the order the service already returned — no extra query.
+  const fulfillmentStatus = order.fulfillmentStatus;
+  const attention = fulfillmentAttention(
+    fulfillmentStatus,
+    order.fulfillmentStuckAt,
+  );
+  // A separate, independent callout: the poll cron can't READ this order's tracking
+  // (the #163 error streak), distinct from `attention`'s stuck-hold (the provider is
+  // holding a readable order). Both can fire at once, so they render side by side.
+  const errorAttention = fulfillmentErrorAttention(
+    fulfillmentStatus,
+    order.fulfillmentErrorCount,
+  );
+  const addressLines = formatShippingAddressLines(order);
+  const trackingUrl = trackingHref(order.trackingUrl);
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-10">
@@ -131,6 +186,125 @@ export default async function OrderDetailPage({
             </TableRow>
           </TableBody>
         </Table>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Fulfillment</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-5">
+          {attention ? (
+            <FulfillmentAlert
+              icon={TriangleAlert}
+              title={attention.title}
+              description={attention.description}
+            />
+          ) : null}
+          {errorAttention ? (
+            <FulfillmentAlert
+              icon={SearchX}
+              title={errorAttention.title}
+              description={errorAttention.description}
+            />
+          ) : null}
+
+          <dl className="grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
+            <div className="flex flex-col gap-1">
+              <dt className="text-muted-foreground">Fulfillment status</dt>
+              <dd>
+                <Badge variant={FULFILLMENT_STATUS_BADGE[fulfillmentStatus]}>
+                  {FULFILLMENT_STATUS_LABELS[fulfillmentStatus]}
+                </Badge>
+              </dd>
+            </div>
+            {order.fulfillmentProvider ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Provider</dt>
+                <dd className="capitalize">{order.fulfillmentProvider}</dd>
+              </div>
+            ) : null}
+            {order.fulfillmentProviderStatus ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Provider status</dt>
+                <dd className="font-mono text-xs break-all">
+                  {order.fulfillmentProviderStatus}
+                </dd>
+              </div>
+            ) : null}
+            {order.fulfillmentExternalId ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Provider order ID</dt>
+                <dd className="text-muted-foreground font-mono text-xs break-all">
+                  {order.fulfillmentExternalId}
+                </dd>
+              </div>
+            ) : null}
+            {order.trackingCarrier ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Carrier</dt>
+                <dd>{order.trackingCarrier}</dd>
+              </div>
+            ) : null}
+            {order.trackingNumber ? (
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Tracking number</dt>
+                <dd className="break-all">
+                  {trackingUrl ? (
+                    <a
+                      href={trackingUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-primary inline-flex items-center gap-1 font-medium hover:underline"
+                    >
+                      {order.trackingNumber}
+                      <ExternalLink className="size-3.5" aria-hidden />
+                    </a>
+                  ) : (
+                    order.trackingNumber
+                  )}
+                </dd>
+              </div>
+            ) : null}
+            {order.fulfillmentStuckAt && fulfillmentStatus === "SUBMITTED" ? (
+              // Only while still open — `fulfillmentStuckAt` is write-once and lingers
+              // after a stuck shipment ships, so gate it (like the banner) on SUBMITTED
+              // to avoid a stale "Flagged stuck" row on an order that already shipped.
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">Flagged stuck</dt>
+                <dd>{formatDate(order.fulfillmentStuckAt, true)}</dd>
+              </div>
+            ) : null}
+            {errorAttention ? (
+              // The raw streak behind the erroring callout — gated on the same helper so
+              // the row and the callout can't drift. Unlike the write-once stuck marker
+              // above, the count resets on any clean poll, so this clears itself once
+              // tracking recovers (no stale-marker caveat to guard against).
+              <div className="flex flex-col gap-1">
+                <dt className="text-muted-foreground">
+                  Failed tracking lookups
+                </dt>
+                <dd className="tabular-nums">{order.fulfillmentErrorCount}</dd>
+              </div>
+            ) : null}
+          </dl>
+
+          <div className="flex flex-col gap-1 text-sm">
+            <p className="text-muted-foreground">Shipping address</p>
+            {addressLines.length > 0 ? (
+              <address className="text-foreground leading-relaxed not-italic">
+                {addressLines.map((line, i) => (
+                  <span key={i} className="block">
+                    {line}
+                  </span>
+                ))}
+              </address>
+            ) : (
+              <p className="text-muted-foreground">
+                No shipping address on this order.
+              </p>
+            )}
+          </div>
+        </CardContent>
       </Card>
 
       <Card>

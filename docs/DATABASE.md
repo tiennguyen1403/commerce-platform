@@ -28,6 +28,73 @@ migrations replay in order while the table is still empty; the failure only appe
 staging/production, not a clean local DB. The `single_currency_per_tenant` migration shows
 the safe form: `ADD COLUMN "currency" TEXT NOT NULL DEFAULT 'usd'`.
 
+### Adding columns & enum values (the M4 fulfillment migrations)
+
+M4 shipped in **six** forward-only migrations, not the one originally planned — a direct
+artifact of the milestone growing from 9 planned issues to 21 as the poll-fulfillment
+cron's failure taxonomy grew (see `docs/milestones/M4-fulfillment/handoff.md`, "Why the
+milestone grew from 9 to 21 issues"). Every one is additive by construction, so each
+applies cleanly to the non-empty `Order`/`ProductVariant` tables with no manual backfill
+_required_ — though two of the later ones carry an optional backfill `UPDATE` anyway, for
+a reason that isn't the `NOT NULL` guard (see below).
+
+`20260904042456_fulfillment` is the base migration — the canonical _additive_ change:
+
+- **Nullable columns** always backfill as `NULL`: `Order.shipName … shipCountry`,
+  `fulfillmentProvider`, `fulfillmentExternalId`, `fulfillmentProviderStatus`,
+  `trackingCarrier` / `trackingNumber` / `trackingUrl`, and
+  `ProductVariant.providerVariantId`.
+- **A `NOT NULL` column needs a `DEFAULT`.** The only one here, `fulfillmentStatus`, ships
+  `NOT NULL` with a `DEFAULT` of `'NOT_SUBMITTED'`, so `pnpm db:check-migrations` passes and
+  existing PAID/FULFILLED rows backfill to `NOT_SUBMITTED`.
+- **A new enum and new enum values are additive too:** creating `FulfillmentStatus` and
+  `ALTER TYPE "OutboxMessageType" ADD VALUE` (×2 — `FULFILLMENT_SUBMISSION` +
+  `SHIPPING_CONFIRMATION`) touch no rows. Prisma warns that PostgreSQL **11 and earlier**
+  can't add more than one enum value in a single migration; we run **16**, so both values
+  ship in one file. Removing or renaming an enum value **is** destructive — hand-author it
+  and follow `/db-change`, the same as a column drop.
+
+Five more migrations followed as the poll cron's failure taxonomy (terminal-fail,
+stuck-open-shipment, tracking-erroring) grew its own alerting and fairness columns, each
+landing exactly one additive change:
+
+| Migration                                     | Adds                                              | Safety                              |
+| --------------------------------------------- | ------------------------------------------------- | ----------------------------------- |
+| `20260904135354_order_fulfillment_stuck_at`   | `Order.fulfillmentStuckAt TIMESTAMP(3)`           | nullable, no default                |
+| `20260904155233_order_poll_fulfillment_index` | `@@index([fulfillmentStatus, status])` on `Order` | index only, no column — always safe |
+| `20260904180233_add_fulfillment_error_count`  | `Order.fulfillmentErrorCount INTEGER`             | `NOT NULL DEFAULT 0`                |
+| `20260904190335_fulfillment_stuck_repoll_key` | `Order.fulfillmentStuckPolledAt TIMESTAMP(3)`     | nullable, no default                |
+| `20260905065613_fulfillment_error_repoll_key` | `Order.fulfillmentErrorPolledAt TIMESTAMP(3)`     | nullable, no default                |
+
+**A nullable column can still need a backfill — for an invariant, not for `NOT NULL`.**
+The last two migrations above each ship an `UPDATE` alongside their nullable `ADD COLUMN`,
+because the column doubles as a **round-robin re-poll key** whose service-layer invariant
+is "non-null if and only if the order is in that state" (`fulfillmentStuckPolledAt`
+non-null iff flagged-stuck; `fulfillmentErrorPolledAt` non-null iff
+`fulfillmentErrorCount > 0`). Left at its default `NULL`, a pre-existing flagged/erroring
+row would sort into the poll's _not-yet-flagged_ group for one run after deploy — a brief
+reintroduction of the exact re-poll starvation the key exists to fix (#158/#170). The
+migration-safety guard doesn't require this backfill (it only checks for a missing
+`DEFAULT` on a `NOT NULL` add, and both columns here are nullable regardless) — it's the
+correct additive pattern for "keep a value the service logic depends on consistent from row
+one," not just "don't fail `migrate deploy`":
+
+```sql
+UPDATE "Order" SET "fulfillmentStuckPolledAt" = "fulfillmentStuckAt"
+  WHERE "fulfillmentStuckAt" IS NOT NULL;
+
+UPDATE "Order" SET "fulfillmentErrorPolledAt" = "updatedAt"
+  WHERE "fulfillmentErrorCount" > 0;
+```
+
+(The second backfill uses `updatedAt` as a stand-in for "last failed poll," since an
+erroring order's most recent write _is_ its most recent failed `getTracking` poll.) Both
+touch only rows already in that flagged/erroring state — typically zero on any real
+database, since the columns land before any order reaches those states in practice.
+
+Per-field intent lives in `prisma/schema.prisma`'s comments; the fulfillment behaviour these
+columns support is in `docs/ARCHITECTURE.md` §6 and `docs/milestones/M4-fulfillment/`.
+
 ## Deploying onto a database seeded before a migration
 
 If `prisma migrate deploy` aborts with `column "…" contains null values` (and blocks later

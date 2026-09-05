@@ -1,16 +1,20 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Truck } from "lucide-react";
 import { getShopperSession } from "@/server/auth/shopper-context";
 import { getStoreTenant } from "@/server/store-context";
 import { orderService } from "@/server/services/order.service";
-import { formatDate, formatMoney } from "@/lib/utils";
+import { cn, formatDate, formatMoney } from "@/lib/utils";
 import {
   ORDER_STATUS_BADGE,
   ORDER_STATUS_LABELS,
+  formatShippingAddressLines,
+  shopperShipmentView,
+  trackingHref,
 } from "@/lib/validators/orders";
 import { Badge } from "@/components/ui/badge";
+import { buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Table,
@@ -62,6 +66,18 @@ export default async function AccountOrderDetailPage({
   if (!order) notFound();
 
   const status = order.status;
+
+  // Shopper-friendly shipment view (M4 #142): a plain-language status, the
+  // tracking link, and the shipping address — never our internal fulfillment
+  // states or provider ids. All read off the order the service already returned.
+  const shipment = shopperShipmentView(status, order.fulfillmentStatus);
+  const addressLines = formatShippingAddressLines(order);
+  const trackingUrl = trackingHref(order.trackingUrl);
+  const hasTracking = Boolean(order.trackingCarrier || order.trackingNumber);
+  // Show the shipping card only when there's a shipment to speak of (on its way /
+  // shipped) or a tracking record — a pending/cancelled/refunded order's story is
+  // already told by the status badge above.
+  const showShipping = shipment !== null || hasTracking;
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-10">
@@ -126,6 +142,64 @@ export default async function AccountOrderDetailPage({
           </TableBody>
         </Table>
       </Card>
+
+      {showShipping ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Shipping</CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-5 text-sm">
+            {shipment ? (
+              <div className="flex flex-col gap-1">
+                <p className="font-medium">{shipment.label}</p>
+                <p className="text-muted-foreground">{shipment.description}</p>
+              </div>
+            ) : null}
+
+            {hasTracking ? (
+              <dl className="grid gap-x-6 gap-y-4 sm:grid-cols-2">
+                {order.trackingCarrier ? (
+                  <div className="flex flex-col gap-1">
+                    <dt className="text-muted-foreground">Carrier</dt>
+                    <dd>{order.trackingCarrier}</dd>
+                  </div>
+                ) : null}
+                {order.trackingNumber ? (
+                  <div className="flex flex-col gap-1">
+                    <dt className="text-muted-foreground">Tracking number</dt>
+                    <dd className="break-all">{order.trackingNumber}</dd>
+                  </div>
+                ) : null}
+              </dl>
+            ) : null}
+
+            {trackingUrl ? (
+              <a
+                href={trackingUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={cn(buttonVariants({ size: "sm" }), "w-fit")}
+              >
+                <Truck aria-hidden />
+                Track shipment
+              </a>
+            ) : null}
+
+            {addressLines.length > 0 ? (
+              <div className="flex flex-col gap-1">
+                <p className="text-muted-foreground">Shipping to</p>
+                <address className="text-foreground leading-relaxed not-italic">
+                  {addressLines.map((line, i) => (
+                    <span key={i} className="block">
+                      {line}
+                    </span>
+                  ))}
+                </address>
+              </div>
+            ) : null}
+          </CardContent>
+        </Card>
+      ) : null}
 
       <Card>
         <CardHeader>

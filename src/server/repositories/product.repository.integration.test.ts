@@ -289,6 +289,141 @@ describe("productRepository.updateWithVariants (integration)", () => {
 });
 
 /**
+ * Integration tests for the catalog-mapping write path (#136): `providerVariantId`
+ * persists through `createWithVariants` and `updateWithVariants`, an omitted/blank
+ * mapping stores `null` (the defined "unmapped" state), and an existing mapping can
+ * be both set and cleared on update — all scoped to the tenant's own product.
+ */
+describe("productRepository catalog mapping (integration)", () => {
+  it("persists providerVariantId on create/update and clears it when blanked", async () => {
+    const tenant = await freshTenant();
+
+    // Create: one mapped variant, one with the mapping omitted entirely.
+    const created = await productRepository.createWithVariants(
+      tenant.id,
+      productInput({
+        variants: [
+          {
+            sku: "MAP-A",
+            name: "A",
+            providerVariantId: "4012",
+            priceCents: 1000,
+            stock: 5,
+          },
+          { sku: "MAP-B", name: "B", priceCents: 2000, stock: 7 },
+        ],
+      }),
+    );
+
+    const a = created.variants.find((v) => v.sku === "MAP-A");
+    const b = created.variants.find((v) => v.sku === "MAP-B");
+    if (!a || !b) throw new Error("create produced unexpected variants");
+    // A mapped value round-trips; an omitted mapping is stored as null.
+    expect(a.providerVariantId).toBe("4012");
+    expect(b.providerVariantId).toBeNull();
+
+    // Update: clear A's mapping (omitted → null) and map B for the first time.
+    const updated = await productRepository.updateWithVariants(
+      tenant.id,
+      created.id,
+      productInput({
+        slug: created.slug,
+        variants: [
+          { id: a.id, sku: "MAP-A", name: "A", priceCents: 1000, stock: 5 },
+          {
+            id: b.id,
+            sku: "MAP-B",
+            name: "B",
+            providerVariantId: "5099",
+            priceCents: 2000,
+            stock: 7,
+          },
+        ],
+      }),
+    );
+    expect(updated).not.toBeNull();
+
+    const afterMapping = new Map(
+      (
+        await prisma.productVariant.findMany({
+          where: { productId: created.id },
+        })
+      ).map((v) => [v.id, v.providerVariantId]),
+    );
+    expect(afterMapping.get(a.id)).toBeNull();
+    expect(afterMapping.get(b.id)).toBe("5099");
+  });
+
+  it("collapses an empty-string mapping to null on create and update (the public-boundary case)", async () => {
+    const tenant = await freshTenant();
+
+    // The form pre-blanks an unmapped field to undefined, but the Server Action
+    // is a public boundary and the schema only *trims* providerVariantId — so a
+    // crafted-but-valid payload can send "". The repo must normalise that to the
+    // single "unmapped" representation (null), never store an empty string the
+    // M4 submission path could misread as a mapping.
+    const created = await productRepository.createWithVariants(
+      tenant.id,
+      productInput({
+        variants: [
+          {
+            sku: "EMPTY-A",
+            name: "A",
+            providerVariantId: "",
+            priceCents: 1000,
+            stock: 5,
+          },
+          {
+            sku: "MAP-B",
+            name: "B",
+            providerVariantId: "4012",
+            priceCents: 1000,
+            stock: 5,
+          },
+        ],
+      }),
+    );
+
+    const a = created.variants.find((v) => v.sku === "EMPTY-A");
+    const b = created.variants.find((v) => v.sku === "MAP-B");
+    if (!a || !b) throw new Error("create produced unexpected variants");
+    // "" collapses to null on create; a real value is untouched.
+    expect(a.providerVariantId).toBeNull();
+    expect(b.providerVariantId).toBe("4012");
+
+    // Blank B's mapping via "" on update (the kept-variant path) → null too.
+    await productRepository.updateWithVariants(
+      tenant.id,
+      created.id,
+      productInput({
+        slug: created.slug,
+        variants: [
+          { id: a.id, sku: "EMPTY-A", name: "A", priceCents: 1000, stock: 5 },
+          {
+            id: b.id,
+            sku: "MAP-B",
+            name: "B",
+            providerVariantId: "",
+            priceCents: 1000,
+            stock: 5,
+          },
+        ],
+      }),
+    );
+
+    const afterMapping = new Map(
+      (
+        await prisma.productVariant.findMany({
+          where: { productId: created.id },
+        })
+      ).map((v) => [v.id, v.providerVariantId]),
+    );
+    expect(afterMapping.get(a.id)).toBeNull();
+    expect(afterMapping.get(b.id)).toBeNull();
+  });
+});
+
+/**
  * Integration tests for `productRepository.searchActiveByTenant` against a real
  * Postgres — the behaviours only the database can prove: the generated
  * `searchVector` (title weight A over description weight B), tenant + ACTIVE

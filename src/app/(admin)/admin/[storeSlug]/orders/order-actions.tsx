@@ -89,7 +89,7 @@ export function OrderActions({
           triggerIcon={<PackageCheck />}
           triggerVariant="default"
           title="Mark this order fulfilled?"
-          description="Records that you've shipped or handed off this order. This is a manual status change — no carrier or provider is contacted."
+          description="Marks this order fulfilled by hand — a manual override. Orders sent to the fulfillment provider ship and get tracking automatically; use this only for an item you fulfill yourself, or when the provider can't. No carrier or provider is contacted."
           warning={
             oversold ? (
               <div className="border-destructive/30 bg-destructive/10 flex gap-3 rounded-lg border p-3 text-sm">

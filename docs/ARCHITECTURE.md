@@ -81,12 +81,47 @@ no per-variant currency, so a cart/order can never mix currencies.
 - Money is integer **cents** everywhere. Currency is the store's (`Tenant.currency`); each
   `Order` also snapshots it so a historical total stays correct if the store currency changes.
 
-## 6. Fulfillment
+## 6. Fulfillment (M4)
 
-`src/server/fulfillment/provider.ts` defines a `FulfillmentProvider` interface. Concrete
-adapters (starting with **Printful** / print-on-demand) implement it. The order flow
-depends only on the interface, so suppliers are swappable. POD is preferred over classic
-AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
+`src/server/fulfillment/provider.ts` defines the `FulfillmentProvider` interface
+(`createOrder`/`getTracking`). A deterministic `MockProvider` (the CI/test default and dev
+fallback, no network) and the real `PrintfulProvider` (v1 REST) both implement it;
+`getFulfillmentProvider()` (`src/server/fulfillment/index.ts`) selects between them purely
+by `PRINTFUL_API_KEY` presence, so nothing above the provider boundary changes when the
+real adapter turns on. POD is preferred over classic AliExpress dropshipping: real API,
+faster shipping, less payment-processor risk.
+
+- **Address.** A shopper's shipping address is collected at checkout (zod-validated
+  against a `SHIPPING_COUNTRIES` allowlist — US-only to start) and flattened onto `Order`
+  in the same create transaction — no separate `Address` model, matching the `OrderItem`
+  snapshot philosophy. The Stripe PaymentIntent itself carries no address.
+- **Submission.** A PAID order with a complete address enqueues a `FULFILLMENT_SUBMISSION`
+  outbox message in the same PENDING → PAID transaction. `fulfillmentService.submitOrder`
+  resolves each line's `sku → ProductVariant.providerVariantId`, then submits behind a
+  **two-layer** idempotency guard — the outbox message's own atomic claim, plus a
+  second, order-level `NOT_SUBMITTED → SUBMITTING` claim (`Order.fulfillmentStatus`) gated
+  on `status: "PAID"` — because a duplicate POD order is real money and a physical
+  shipment, not a re-sendable email.
+- **Reconciliation.** Tracking is polled, not webhook-driven: `/api/cron/poll-fulfillment`
+  asks the provider for every open (SUBMITTED, still PAID) order's tracking. A shipment —
+  signalled by a tracking **number**, never the raw status string — flips the order
+  `PAID → FULFILLED` and persists carrier/tracking; this poll is now the sole writer of
+  `FULFILLED`, mirroring how the verified Stripe webhook is the sole writer of `REFUNDED`.
+  The manual "Mark fulfilled" button stays as a documented override (non-POD items, a
+  provider outage, an unmapped SKU).
+- **Failure taxonomy.** A real polling loop against an external provider surfaces more than
+  "shipped": a provider-confirmed cancel/fail _after_ submission reconciles to a terminal
+  `FAILED`; a non-terminal hold (`onhold`/`inreview`) open past an env-tunable age
+  (`FULFILLMENT_STUCK_THRESHOLD_DAYS`) is flagged "stuck" once (`Order.fulfillmentStuckAt`);
+  a `getTracking` call failing on every poll past an env-tunable consecutive-error count
+  (`FULFILLMENT_ERROR_ALERT_THRESHOLD`) is flagged "erroring" once
+  (`Order.fulfillmentErrorCount`). Both flagged states are alert-only (the order stays
+  SUBMITTED and keeps being polled), surfaced in the admin UI, and deprioritised behind
+  fresh orders in the poll's batch ordering — each flagged tier is itself rotated fairly via
+  a nullable re-poll timestamp so a backlog can't starve the newest-flagged order. See the
+  M4 decision log entries below and `docs/milestones/M4-fulfillment/handoff.md`.
+- **Notification.** A `SHIPPING_CONFIRMATION` email is enqueued in the same transaction as
+  the `FULFILLED` reconcile and delivered by the existing outbox drain.
 
 ## 7. Environments & config
 
@@ -199,5 +234,62 @@ AliExpress dropshipping: real API, faster shipping, less payment-processor risk.
   protocol-relative _result_ (`"/..//evil.com"` → `"//evil.com"`); the guard now
   re-resolves the returned path the way the router will and rejects it if that no
   longer lands on the same origin.
+- **Provider seam: a `FulfillmentProvider` interface, mock-first** (M4) — a deterministic
+  `MockProvider` is the CI/test default and dev fallback; the real `PrintfulProvider` (v1
+  REST) is selected purely by `PRINTFUL_API_KEY` presence
+  (`getFulfillmentProvider`, `src/server/fulfillment/index.ts`). Nothing above the provider
+  boundary — checkout, the outbox, the poll cron — changes when the real adapter turns on.
+- **Tracking is polled, not webhook-driven** (M4) — a pull-shaped
+  `getTracking(externalId)` against a new authenticated `/api/cron/poll-fulfillment`,
+  copying the `sweep-orders`/`dispatch-outbox` house style (M2), because Printful v1's
+  webhook-signing story isn't clearly documented. Push-based tracking is a deliberately
+  deferred fast-follow.
+- **Shipping address flattened onto `Order`, not a separate `Address` model** (M4) —
+  matches the `OrderItem` snapshot philosophy and avoids a join on every order read; every
+  new column is nullable or carries a `DEFAULT`, so it's safe on the non-empty table by
+  construction (golden rule 6).
+- **Fulfillment submission reuses the transactional outbox, plus a second, order-level
+  `SUBMITTING` guard** (M4) — a new `FULFILLMENT_SUBMISSION` outbox message type is drained
+  by the existing claim/backoff/dead-letter machinery, but a duplicate POD order is real
+  money and a physical shipment (unlike a duplicate email a resend merely annoys), so a
+  second `NOT_SUBMITTED → SUBMITTING` claim on the order itself (gated on `status: "PAID"`
+  too) makes this two-layer idempotency. Any non-clean outcome after the claim fails toward
+  "stuck, a human reconciles," never toward a silent re-submit.
+- **`FULFILLED` redefined: from a manual admin attestation (M2) to provider-confirmed
+  shipped** (M4) — driven solely by the poll cron's guarded `PAID → FULFILLED` transition,
+  mirroring how the verified Stripe webhook is the sole writer of `REFUNDED`. The manual
+  "Mark fulfilled" button is kept as a documented override for non-POD items or a provider
+  outage; its copy says so.
+- **`ProductVariant.providerVariantId` + optional `PRINTFUL_API_KEY`** (M4) — a nullable,
+  provider-agnostic column maps our free-form `sku` to the provider's opaque catalog id;
+  the submission **service** resolves it via the repository so the adapter stays a thin
+  HTTP client. `PRINTFUL_API_KEY` follows the `RESEND_API_KEY` posture — optional,
+  validated at use, never at boot, server-only, never `NEXT_PUBLIC_*` — so a missing key
+  narrows what fulfillment can do without ever blocking checkout/boot.
+- **Emergent: the poll cron became a provider-state reconciliation state machine** (M4,
+  not planned at `/milestone-start`) — a real polling loop against an external POD provider
+  surfaces a taxonomy of never-resolving outcomes, not just "shipped": terminal cancel/fail
+  after submission (#151), a non-terminal hold that never resolves (#155), and tracking
+  that can't be read at all (#163). Each earns a proactive, alert-once, ERROR-level log (the
+  same money-at-risk severity convention as the oversell/refund-failed alerts), a durable
+  "alert once" marker, an admin surface, and a place in a 3-tier fair poll ordering (fresh <
+  erroring < flagged-stuck, each tier rotated by a nullable re-poll timestamp sorted NULLS
+  FIRST). Both alert thresholds are env-tunable
+  (`FULFILLMENT_STUCK_THRESHOLD_DAYS`, `FULFILLMENT_ERROR_ALERT_THRESHOLD`) and explicitly
+  provisional pending real Printful timing data. See
+  `docs/milestones/M4-fulfillment/handoff.md` for the full "why the milestone grew from 9
+  to 21 issues" account.
+- **Multi-currency fulfillment: send the packing-slip display currency; defer per-store
+  settlement** (M4, #157) — the per-item retail prices we print on the Printful slip (#148)
+  are framed in the order's own currency via Printful v1's `retail_costs.currency`, the
+  _only_ per-order currency lever the API exposes (there is no top-level order `currency`
+  field). Without it, a tenant whose `Tenant.currency` differs from the single platform
+  Printful store's default gets a numerically-correct but wrong-currency slip. We send
+  currency **only** — no `subtotal`/`shipping`/`tax`: it relabels the slip without
+  reintroducing the aggregate-cost breakdown #148 deferred (a partial one would misstate the
+  totals), and Printful still bills the store owner in the store's own currency (the
+  read-only `costs`). True per-currency _settlement_ — a Printful store per currency, or
+  Stripe Connect payouts — stays the deferred single-account upgrade (see §2, "Stripe
+  Connect remains a deliberately deferred upgrade").
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).

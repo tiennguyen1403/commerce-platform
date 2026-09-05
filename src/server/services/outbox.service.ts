@@ -5,7 +5,12 @@ import {
 } from "@/server/repositories/outbox.repository";
 import { orderRepository } from "@/server/repositories/order.repository";
 import { emailService } from "@/server/services/email.service";
+import { fulfillmentService } from "@/server/services/fulfillment.service";
 import { EmailNotConfiguredError } from "@/server/email.errors";
+import {
+  FulfillmentError,
+  FulfillmentNotConfiguredError,
+} from "@/server/fulfillment.errors";
 import { OutboxPermanentError } from "@/server/outbox.errors";
 import { reportError } from "@/server/observability/error-reporter";
 import { logger, type Logger } from "@/server/observability/logger";
@@ -98,33 +103,69 @@ type DispatchOutcome = "sent" | "failed" | "dead" | "skipped";
 /** Render and send one message by type. Throws on failure so `dispatchOne` can
  *  classify it (permanent → DEAD now, transient → backoff). */
 async function sendMessage(message: OutboxMessageSummary): Promise<void> {
-  // Re-read the order (its lines carry the snapshotted titles/prices the email
-  // renders from), tenant-scoped. A missing order is a permanent failure: orders
-  // are never deleted, and if one were the FK cascade would take this row with
-  // it, so an orphan here is a data-integrity anomaly, not a passing fault.
-  const order = await orderRepository.findByIdForTenant(
-    message.tenantId,
-    message.orderId,
-  );
-  if (!order) {
-    throw new OutboxPermanentError(
-      `outbox message ${message.id} references missing order ${message.orderId}`,
-    );
-  }
-
   switch (message.type) {
-    case "ORDER_CONFIRMATION":
+    case "ORDER_CONFIRMATION": {
+      // Re-read the order (its lines carry the snapshotted titles/prices the email
+      // renders from), tenant-scoped. A missing order is a permanent failure:
+      // orders are never deleted, and if one were the FK cascade would take this
+      // row with it, so an orphan here is a data-integrity anomaly, not a passing
+      // fault.
+      const order = await orderRepository.findByIdForTenant(
+        message.tenantId,
+        message.orderId,
+      );
+      if (!order) {
+        throw new OutboxPermanentError(
+          `outbox message ${message.id} references missing order ${message.orderId}`,
+        );
+      }
       await emailService.sendOrderConfirmation(order, {
         idempotencyKey: message.idempotencyKey,
       });
       return;
-    default:
-      // A message type with no send path — fail permanently (and visibly) rather
-      // than silently dropping it. `message.type` is `never` here: adding an enum
-      // value without a case is a compile error, not a runtime surprise.
-      throw new OutboxPermanentError(
-        `outbox message ${message.id} has unknown type ${String(message.type)}`,
+    }
+    case "FULFILLMENT_SUBMISSION":
+      // Submit the paid order to the POD provider. The service owns the two-layer
+      // idempotency (this message's atomic claim above is layer 1; an order-level
+      // NOT_SUBMITTED → SUBMITTING guard is layer 2) and all fulfillment-state
+      // persistence: it throws a permanent `FulfillmentError` (having recorded the
+      // order FAILED) on a non-retryable failure, and returns on success or an
+      // already-claimed order. It re-reads the fulfillment-shaped order itself, so
+      // there is no order re-read here. (A missing order — impossible, the FK
+      // cascade would take this row too — surfaces as its OrderNotFoundError:
+      // transient, retried then DEAD.)
+      await fulfillmentService.submitOrder(message.tenantId, message.orderId);
+      return;
+    case "SHIPPING_CONFIRMATION": {
+      // The shipped + tracking email (M4-08). The poll-fulfillment cron enqueues
+      // these on the SUBMITTED → SHIPPED reconcile (M4 #140); this sends them. Same
+      // shape as ORDER_CONFIRMATION: re-read the order tenant-scoped — its row now
+      // carries the trackingCarrier/Number/Url the reconcile persisted and the
+      // ship* address the email renders — and a missing order is a permanent
+      // failure for the same reason (orders are never deleted; the FK cascade would
+      // take this row with it, so an orphan is a data-integrity anomaly).
+      const order = await orderRepository.findByIdForTenant(
+        message.tenantId,
+        message.orderId,
       );
+      if (!order) {
+        throw new OutboxPermanentError(
+          `outbox message ${message.id} references missing order ${message.orderId}`,
+        );
+      }
+      await emailService.sendShippingConfirmation(order, {
+        idempotencyKey: message.idempotencyKey,
+      });
+      return;
+    }
+    default: {
+      // Exhaustive: `message.type` is `never` here, so adding a new enum value
+      // without a case above is a compile error, not a runtime surprise.
+      const _exhaustive: never = message.type;
+      throw new OutboxPermanentError(
+        `outbox message ${message.id} has unknown type ${String(_exhaustive)}`,
+      );
+    }
   }
 }
 
@@ -137,19 +178,30 @@ async function settleFailure(
   child: Logger,
 ): Promise<"failed" | "dead"> {
   const lastError = errorText(err);
+  // Permanent = never fixed by retrying: an unconfigured/undeliverable message
+  // (email or fulfillment) or a genuinely undeliverable one. Every typed
+  // `FulfillmentError` qualifies (unconfigured provider, unmapped variant, missing
+  // address, provider soft-rejection) — the fulfillment analogue of
+  // `EmailNotConfiguredError` — so the drain dies at once instead of burning the
+  // retry budget on a POD order that can never be submitted as-is.
   const permanent =
     err instanceof EmailNotConfiguredError ||
+    err instanceof FulfillmentError ||
     err instanceof OutboxPermanentError;
   const exhausted = attempt >= MAX_SEND_ATTEMPTS;
 
   if (permanent || exhausted) {
     await outboxRepository.markDead(message.id, lastError);
-    // A store that never configured Resend is an expected state, not an
-    // incident — warn and move on. Everything else that reaches DEAD is a paid
-    // order left unconfirmed: exactly the silent drop #30 exists to surface, so
-    // log at error and alert durably (the webhook outlives log retention).
+    // A store that never configured Resend or a fulfillment provider is an
+    // expected setup state, not an incident — warn and move on. Everything else
+    // that reaches DEAD is a paid order left unconfirmed or unfulfilled (an
+    // unmapped variant, a rejected submission, an exhausted retry budget): exactly
+    // the silent drop #30 exists to surface, so log at error and alert durably
+    // (the webhook outlives log retention).
     if (err instanceof EmailNotConfiguredError) {
       child.warn("outbox: dead — email not configured");
+    } else if (err instanceof FulfillmentNotConfiguredError) {
+      child.warn("outbox: dead — fulfillment not configured");
     } else {
       child.error(
         { err },

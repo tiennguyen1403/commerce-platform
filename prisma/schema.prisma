@@ -181,6 +181,13 @@ model ProductVariant {
   productId  String
   sku        String
   name       String
+  // Maps our free-form `sku` to the fulfillment provider's opaque catalog
+  // variant id (e.g. Printful's integer `variant_id`). Provider-agnostic name
+  // (not `printfulVariantId`) so the provider stays swappable behind the
+  // `FulfillmentProvider` interface. Nullable: an unmapped variant simply isn't
+  // submittable — the submission service treats an unmapped line as a defined,
+  // admin-visible failure, never a silent provider 4xx (M4 #134).
+  providerVariantId String?
   // Money is stored as integer minor units (cents) to avoid float errors. The
   // currency is the store's (`Tenant.currency`), never per-variant — that's what
   // keeps a cart/order total single-currency and soundly summable.
@@ -217,6 +224,24 @@ enum OrderStatus {
   REFUNDED
 }
 
+/// Lifecycle of an order's fulfillment — our own closed state machine, distinct
+/// from the raw provider status string (`Order.fulfillmentProviderStatus`, admin
+/// display only). Shape mirrors `OutboxStatus`: NOT_SUBMITTED is the initial
+/// state, SUBMITTING/SUBMITTED are the live states, SHIPPED and FAILED are
+/// terminal. SUBMITTING doubles as the order-level idempotency guard for
+/// provider submission — a duplicate POD order is real money + a physical
+/// shipment, so a lost worker leaves the order stuck in SUBMITTING for a human
+/// to reconcile rather than silently retrying (M4 research, "Idempotent
+/// submission"). Set only by the fulfillment service + poll cron in later M4
+/// issues; this migration only lays the column.
+enum FulfillmentStatus {
+  NOT_SUBMITTED // PAID with no address yet, or not yet claimed by the outbox
+  SUBMITTING // claimed for submission — the order-level idempotency guard
+  SUBMITTED // provider accepted the order; no tracking yet
+  SHIPPED // provider reports shipped — drives Order.status → FULFILLED
+  FAILED // provider rejected it (soft failure) or submit attempts exhausted
+}
+
 model Order {
   id                    String      @id @default(cuid())
   tenantId              String
@@ -240,6 +265,115 @@ model Order {
   // copy (#40). The payment still stands PAID; only inventory fell short. One-way:
   // nothing clears it. Set by `markPaidByPaymentIntent`.
   oversold              Boolean     @default(false)
+  // Shipping address, flattened onto the order (not a separate Address model) to
+  // match the OrderItem snapshot philosophy — a point-in-time fact later catalog
+  // or account edits must never rewrite — and to avoid a join on every order read
+  // (admin detail, shopper history, the fulfillment-outbox re-read). All
+  // nullable: a guest/legacy order, or one placed before M4, simply has none.
+  // Written in the SAME transaction as order creation at checkout (M4 #134).
+  shipName              String?
+  shipLine1             String?
+  shipLine2             String?     // optional second line (apt/suite/unit)
+  shipCity              String?
+  shipState             String?     // state/province/region — requiredness varies by country
+  shipPostalCode        String?
+  shipCountry           String?     // ISO-3166 alpha-2, from the SHIPPING_COUNTRIES allowlist
+  // Fulfillment + tracking, written as a PAID order moves through the provider
+  // (POD) lifecycle; all nullable or defaulted so existing PAID/FULFILLED rows
+  // backfill safely (golden rule 6). Populated by the submission service and the
+  // poll-fulfillment cron in later M4 issues — this migration only lays them.
+  // Which provider handled the order ("printful" | "mock"); provider-agnostic so
+  // a swap is a data change, not a schema change. Null until first submitted.
+  fulfillmentProvider   String?
+  // The provider's own order id (FulfillmentResult.externalId), persisted on a
+  // successful submission so the poll cron can reconcile tracking against it.
+  fulfillmentExternalId String?
+  // Our own closed fulfillment state (see FulfillmentStatus). NOT NULL with a
+  // DEFAULT so existing rows backfill to NOT_SUBMITTED (migration-safe).
+  fulfillmentStatus     FulfillmentStatus @default(NOT_SUBMITTED)
+  // The raw, free-form status string from the provider (Printful: "draft",
+  // "pending", "inprocess", "fulfilled", …) — admin display only, never a
+  // control-flow input (that role belongs to fulfillmentStatus, our closed enum).
+  fulfillmentProviderStatus String?
+  // Shipment tracking, persisted by the poll cron once the provider reports a
+  // shipment (null until then): carrier + number identify the parcel; url is the
+  // provider-supplied tracking link surfaced in the account UI + shipping email.
+  trackingCarrier       String?
+  trackingNumber        String?
+  trackingUrl           String?
+  // When the poll-fulfillment cron first surfaced this order as a STUCK open
+  // shipment — SUBMITTED + un-shipped past the age threshold (a provider hold like
+  // Printful `onhold`/`inreview` that isn't resolving; M4 #155). Its job is
+  // idempotency: the operator alert fires only while this is null, so a stuck order
+  // is surfaced ONCE, not on every ~10-minute cron tick. Deliberately the inverse of
+  // #151's terminal-fail exit — setting it does NOT change `fulfillmentStatus`: the
+  // order stays SUBMITTED and keeps being polled, because an onhold order can still
+  // ship. Null for every normally-progressing order (SHIPPED long before the
+  // threshold). Nullable, no default → safe to add on non-empty tables (golden rule 6).
+  fulfillmentStuckAt    DateTime?
+  // Round-robin re-poll key for the deprioritised flagged-stuck poll tail (M4 #164).
+  // #158 sorts flagged-stuck orders (a never-resolving provider hold) to the TAIL of
+  // `findSubmittedForPolling` so they can't starve fresh orders; but it keyed that tail
+  // on the write-once `fulfillmentStuckAt`, so the tail order was stable across runs and
+  // a backlog past `POLL_BATCH_SIZE` could permanently starve the newest-flagged orders
+  // WITHIN the tail (a hold that later ships would never reconcile). This key fixes that:
+  // the poll stamps it `now()` on every re-poll of a flagged order (`markStuckRepolled`),
+  // and the tail sorts by it ascending — least-recently-repolled first — so re-polling
+  // ROTATES fairly and every flagged order is eventually reached. Set == `fulfillmentStuckAt`
+  // the instant an order is flagged (`markFulfillmentStuck`) and bumped thereafter, so it
+  // is non-null IFF the order is flagged-stuck — which is exactly why it (not the group
+  // discriminator `fulfillmentStuckAt`) is now the poll's primary `orderBy` key: `nulls:
+  // "first"` floats every not-yet-flagged order ahead of every flagged one, unchanged for
+  // fresh orders. Nullable, no default → safe on non-empty tables (golden rule 6); the #164
+  // migration backfills it = `fulfillmentStuckAt` for already-flagged rows so the invariant
+  // holds from the first post-deploy poll. Written only by the poll cron.
+  fulfillmentStuckPolledAt DateTime?
+  // Consecutive failed `getTracking` polls for this SUBMITTED order (M4 #163). The
+  // poll increments it each run `getTracking` throws (a persistent 4xx/5xx, a
+  // bad/stale external id, a provider data problem) and resets it to 0 on any poll
+  // that reads tracking cleanly, so it measures the length of the CURRENT error
+  // streak, not lifetime errors. When the increment brings it to exactly the alert
+  // threshold the poll surfaces the order ONCE to an operator (money captured,
+  // tracking unreadable, no reconciliation possible) — the erroring-streak sibling of
+  // #155's age-based stuck-hold alert and #151's terminal-fail exit. Like #155 the
+  // order is left SUBMITTED and keeps being polled: a getTracking error proves only
+  // that we can't READ the status, not that the order won't ship (a long provider
+  // outage still recovers), so terminalizing it (→ FAILED) would prematurely give up
+  // on an order that may already have shipped. `@default(0)` NOT NULL → safe on
+  // non-empty tables (golden rule 6); 0 means both "never errored" and "recovered", so
+  // no nullable tri-state is needed. Written only by the poll cron
+  // (`fulfillment.service.ts` via `recordFulfillmentPollError`/`resetFulfillmentPollErrors`).
+  // Its ordering role moved to `fulfillmentErrorPolledAt` in M4 #175: #170 first sub-ordered
+  // the not-yet-flagged poll group by this count ascending (sinking a perpetually-erroring
+  // order — which bypasses the #155 stuck-flag and would otherwise sit at the front of the
+  // oldest-first batch — behind fresh count-0 orders: the erroring-mode analogue of #158). But
+  // a STABLE count let a high-count order starve within a `> POLL_BATCH_SIZE` erroring backlog
+  // (the write-once-tail problem #164 fixed for the flagged tail), so #175 rotates the tier by
+  // re-poll time instead (see `fulfillmentErrorPolledAt`). This count now drives only the alert
+  // threshold, no longer the batch order — the tier split it implied (0 vs > 0) is preserved
+  // exactly by that key's null-vs-non-null boundary (the two are written together, never apart).
+  fulfillmentErrorCount Int         @default(0)
+  // Round-robin re-poll key for the deprioritised ERRORING poll tier (M4 #175) — the erroring-
+  // tier analogue of `fulfillmentStuckPolledAt` (#164). #170 sank a perpetually-erroring order
+  // (getTracking throws every poll) behind fresh ones by sorting the not-yet-flagged group on
+  // `fulfillmentErrorCount` ascending; but that count is a STABLE key, so within a
+  // `> POLL_BATCH_SIZE` erroring backlog a high-count order could wait behind a churn of
+  // lower-count ones and never reach the `take(POLL_BATCH_SIZE)` window — the write-once-tail
+  // starvation #164 fixed for the flagged tail, now for the erroring tier. This key fixes it the
+  // same way: `recordFulfillmentPollError` stamps it `now()` on every erroring poll (in the same
+  // write as the count increment), and `findSubmittedForPolling` sorts the not-yet-flagged group
+  // by it ascending, nulls first — so a fresh order (null) still polls first, and within the
+  // erroring tier re-polling ROTATES least-recently-errored first, reaching every erroring order
+  // within a bounded number of runs (so one whose getTracking recovers reconciles). Written
+  // together with `fulfillmentErrorCount` and never apart, so it is non-null IFF that count > 0:
+  // the clean-poll `resetFulfillmentPollErrors` nulls it as it zeroes the count, returning a
+  // recovered order to the fresh tier (#175 AC2). That perfect correlation is why it REPLACES the
+  // count as the erroring-tier `orderBy` key rather than joining it — identical tier split (null
+  // vs non-null == 0 vs > 0), plus rotation. Nullable, no default → safe on non-empty tables
+  // (golden rule 6); the #175 migration backfills it = `updatedAt` (an erroring order's last
+  // write is its last error poll) for already-erroring rows so the invariant holds from the
+  // first post-deploy poll. Written only by the poll cron.
+  fulfillmentErrorPolledAt DateTime?
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
@@ -267,6 +401,22 @@ model Order {
   // createdAt] serves the `status = 'PENDING'` filter + `createdAt` ordering
   // directly (mirrors the outbox's [status, nextAttemptAt] drain index).
   @@index([status, createdAt])
+  // Poll-fulfillment cron work list (`findSubmittedForPolling`, #140/#158): the
+  // platform-wide `{fulfillmentStatus: 'SUBMITTED', status: 'PAID'}` scan. Serves the
+  // two-equality filter — the dominant cost as the SUBMITTED set grows with
+  // accumulating provider holds, the exact scenario #158 addresses (the method's own
+  // doc comment had flagged this as the natural follow-up "if that set ever grows").
+  // `fulfillmentStatus` leads both because SUBMITTED is transient and low-cardinality
+  // (a selective first term) and — the stronger reason — for non-redundancy with the
+  // `[status, createdAt]` index above: a `status`-leading composite would overlap it,
+  // whereas for this two-equality predicate the index seek localises equally whichever
+  // term leads. The residual `fulfillmentStuckPolledAt NULLS FIRST, fulfillmentErrorPolledAt
+  // NULLS FIRST, createdAt` ordering (#158 deprioritises flagged-stuck rows to the tail; #164
+  // rotates that tail by re-poll time; #170 sinks a perpetually-erroring order behind fresh ones
+  // and #175 rotates that erroring tier by re-poll time too) runs as a cheap sort over the small
+  // filtered set — Prisma can't express NULLS FIRST in an index (only the runtime
+  // `orderBy` can), and the filtered set is small, so covering the sort isn't worth it.
+  @@index([fulfillmentStatus, status])
 }
 
 model OrderItem {
@@ -299,11 +449,14 @@ enum OutboxStatus {
   DEAD // permanently failed: retries exhausted or a permanent error — terminal
 }
 
-/// What kind of message this row renders to. One kind today (the order
-/// confirmation); the discriminator lets the drain dispatch by type and keeps
-/// the table a genuine outbox rather than a single-purpose queue.
+/// What kind of message this row renders to. The discriminator lets the drain
+/// dispatch by type — its `sendMessage` switch is exhaustive, so adding a value
+/// here without a matching case is a compile error — and keeps the table a
+/// genuine outbox rather than a single-purpose queue.
 enum OutboxMessageType {
-  ORDER_CONFIRMATION
+  ORDER_CONFIRMATION // a paid order's confirmation email (#30)
+  FULFILLMENT_SUBMISSION // submit a PAID order to the POD provider (M4 #134)
+  SHIPPING_CONFIRMATION // the shipped + tracking email once fulfillment ships (M4 #134)
 }
 
 /// A durable "please send this" record, written **in the same transaction** as
