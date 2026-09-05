@@ -42,13 +42,15 @@ export type SearchProductsParams = {
   pageSize: number;
 };
 
-/** A single ranked hit: a product with its variants — the same shape the
- *  storefront listing (`listActiveByTenant`) returns, so results reuse the same
- *  card and `availableUnits`. Typed via `Prisma.ProductGetPayload` (a static
- *  helper), never `ReturnType<typeof productRepository.…>`, which would collapse
- *  the whole repo object to `any` (TS7022/TS2456 — see the analytics repo note). */
+/** A single ranked hit: a product with its variants and its gallery images — the
+ *  same shape the storefront listing (`listActiveByTenant`) returns, so results
+ *  reuse the same card, `availableUnits`, and image rendering. Typed via
+ *  `Prisma.ProductGetPayload` (a static helper), never `ReturnType<typeof
+ *  productRepository.…>`, which would collapse the whole repo object to `any`
+ *  (TS7022/TS2456 — see the analytics repo note). The `images` order is set by the
+ *  query's `orderBy`, which doesn't affect the payload type. */
 export type ProductSearchHit = Prisma.ProductGetPayload<{
-  include: { variants: true };
+  include: { variants: true; images: true };
 }>;
 
 /** One page of ranked search hits (rank order preserved) plus `total` — the count
@@ -62,7 +64,7 @@ export const productRepository = {
   listActiveByTenant(tenantId: string) {
     return prisma.product.findMany({
       where: { tenantId, status: "ACTIVE" },
-      include: { variants: true },
+      include: { variants: true, images: { orderBy: { position: "asc" } } },
       orderBy: { createdAt: "desc" },
     });
   },
@@ -132,7 +134,7 @@ export const productRepository = {
     // already this tenant's) so no catalog read escapes the tenant boundary.
     const rows = await prisma.product.findMany({
       where: { id: { in: rankedIds }, tenantId },
-      include: { variants: true },
+      include: { variants: true, images: { orderBy: { position: "asc" } } },
     });
 
     // `IN (…)` returns rows in an arbitrary order; restore the rank sequence.
@@ -156,7 +158,7 @@ export const productRepository = {
   findBySlug(tenantId: string, slug: string) {
     return prisma.product.findUnique({
       where: { tenantId_slug: { tenantId, slug } },
-      include: { variants: true },
+      include: { variants: true, images: { orderBy: { position: "asc" } } },
     });
   },
 
@@ -176,6 +178,9 @@ export const productRepository = {
           // form disables its Remove button up front instead of failing on save.
           include: { _count: { select: { orderItems: true } } },
         },
+        // Gallery order, so the admin editor's image manager (M5-04) shows images
+        // in the same sequence the storefront renders them.
+        images: { orderBy: { position: "asc" } },
       },
     });
   },
