@@ -51,6 +51,16 @@ const schema = z.object({
   // `EmailNotConfiguredError`). Never a `NEXT_PUBLIC_*`; read only inside
   // `src/server/fulfillment/**` (the provider selector, `index.ts`).
   PRINTFUL_API_KEY: optionalEnvString,
+  // Vercel Blob storage token — OPTIONAL, validated at use, not boot, exactly like
+  // RESEND_API_KEY / PRINTFUL_API_KEY above (M5 #185). Product-image storage is not
+  // on the checkout/storefront-boot path, so a missing/blank token must never take
+  // down boot: it only makes the storage selector fall back to the local-disk mock
+  // in dev/test, or — in production with no token — surface a
+  // `StorageNotConfiguredError` at the upload/delete boundary (the exact analogue of
+  // `FulfillmentNotConfiguredError`). Never a `NEXT_PUBLIC_*` — a read-write blob
+  // token is a secret; read only inside `src/server/storage/**` (the selector,
+  // `index.ts`). The real Vercel Blob adapter that consumes it lands in M5-06.
+  BLOB_READ_WRITE_TOKEN: optionalEnvString,
   // Stuck-open-shipment age threshold, in DAYS (M4 #162). How long an order may sit
   // SUBMITTED but un-shipped before the fulfillment poll surfaces it as a STUCK open
   // shipment for an operator to chase (M4 #155) — a provider hold (`onhold`/`inreview`)

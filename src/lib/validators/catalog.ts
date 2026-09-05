@@ -149,3 +149,50 @@ export const searchProductsParamsSchema = z.object({
 export type SearchProductsParamsInput = z.infer<
   typeof searchProductsParamsSchema
 >;
+
+// --- Image uploads (#185, M5) ------------------------------------------------
+
+/**
+ * Content types a product image may be uploaded as. Business-rule allowlist (like
+ * `MAX_PRICE_CENTS`/`MAX_STOCK` above) — a constant, deliberately NOT env: it
+ * shapes validation, not deployment. Shared by the upload form (pre-check the
+ * picked file) and the sign step (authoritative re-check) — one list, both sides.
+ * JPEG/PNG/WebP cover what a browser file picker reliably produces; HEIC/AVIF are
+ * omitted (patchy browser support, and v1 does no transcode — no `sharp`).
+ */
+export const ALLOWED_IMAGE_CONTENT_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+] as const;
+export type AllowedImageContentType =
+  (typeof ALLOWED_IMAGE_CONTENT_TYPES)[number];
+
+/**
+ * The stored file extension per allowed content type — one source of truth for the
+ * "which image formats" fact. `satisfies` keeps it exhaustive (adding a content type
+ * to the allowlist without an extension here fails to compile). Consumers: the
+ * storage mock derives an object's extension from its content type, and the local
+ * upload sink allows exactly these extensions to be written (so a direct caller
+ * can't drop a `.html` into the web-served uploads dir).
+ */
+export const IMAGE_CONTENT_TYPE_EXTENSIONS = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+} satisfies Record<AllowedImageContentType, string>;
+
+/**
+ * Hard ceiling on a single uploaded product image, in bytes (5 MB). Enforced at
+ * sign time (server, authoritative) and mirrored by the local sink as defence in
+ * depth. Generous for a web product photo, small enough to keep a tampered/runaway
+ * upload off the storage bill — the analogue of `MAX_PRICE_CENTS` for uploads.
+ */
+export const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Max images one product may hold. The gallery is a small hero + thumbnails, so
+ * this is a UX/cost guard, not a technical limit; the create/count-cap service
+ * enforces it and the admin form surfaces it.
+ */
+export const MAX_IMAGES_PER_PRODUCT = 8;
