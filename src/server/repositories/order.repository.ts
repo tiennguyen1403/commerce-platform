@@ -55,10 +55,12 @@ export type StalePendingOrder = {
  *  reads it so it can tell "this order has never errored / just recovered" (0) from an
  *  ongoing streak, and reset it to 0 only when it was non-zero — keeping a clean poll of a
  *  never-errored order write-free. The alert idempotency itself lives in the DB, on the
- *  post-increment count returned by `recordFulfillmentPollError`, not on this pre-read. It
- *  also orders the batch (M4 #170): `findSubmittedForPolling` sub-orders the not-yet-flagged
- *  group by this count ascending, sinking a perpetually-erroring order behind fresh ones so
- *  it can't starve them (the ordering happens in the DB — the poll never sorts on it here). */
+ *  post-increment count returned by `recordFulfillmentPollError`, not on this pre-read. The
+ *  batch ordering that once rode on this count moved to `fulfillmentErrorPolledAt` in #175:
+ *  #170 sub-ordered the not-yet-flagged group by this count to sink a perpetually-erroring order
+ *  behind fresh ones, but a stable count could starve a high-count order within a large erroring
+ *  backlog, so #175 rotates the tier by re-poll time instead. This field now feeds only the
+ *  streak read above, never the sort (neither key is selected — the ordering happens in the DB). */
 export type SubmittedOrderForPolling = {
   id: string;
   tenantId: string;
@@ -513,11 +515,11 @@ export const orderRepository = {
    * Ordering runs in three tiers so a never-resolving open shipment can never starve fresh
    * orders (the liveness problem #151's terminal exit was built to avoid), whatever its
    * failure mode: (1) fresh — not flagged-stuck, not erroring — first; (2) then orders whose
-   * `getTracking` throws every poll (M4 #163/#170); (3) then flagged-stuck holds last (M4
-   * #158), that tail rotating fairly (M4 #164). Every tier stays in the work list — the
-   * predicate is unchanged (the #155 invariant: deprioritise, don't drop) — so a
-   * deprioritised order keeps polling and reconciles the moment its hold ships or its
-   * getTracking recovers.
+   * `getTracking` throws every poll (M4 #163/#170), that erroring tier rotating fairly (M4 #175);
+   * (3) then flagged-stuck holds last (M4 #158), that tail rotating fairly (M4 #164). Every tier
+   * stays in the work list — the predicate is unchanged (the #155 invariant: deprioritise, don't
+   * drop) — so a deprioritised order keeps polling and reconciles the moment its hold ships or
+   * its getTracking recovers.
    *
    * The PRIMARY key `fulfillmentStuckPolledAt` is non-null IFF the order is flagged-stuck, so
    * `nulls: "first"` floats every not-yet-flagged order (tiers 1–2) ahead of every flagged one
@@ -529,23 +531,28 @@ export const orderRepository = {
    * each run re-polls a different slice and every flagged order is reached within
    * ~⌈flaggedCount / freeSlots⌉ runs.
    *
-   * The SECONDARY key `fulfillmentErrorCount ASC` splits tiers 1 and 2 (M4 #170). An order
-   * whose `getTracking` THROWS every run returns via `recordPollError` BEFORE `flagIfStuck`,
-   * so it is never flagged-stuck and its `fulfillmentStuckPolledAt` stays null — leaving it,
-   * pre-#170, in the tier-1 null-key group and (being old, having errored a while) at the
-   * FRONT of the oldest-first batch every run, re-creating #158's starvation for erroring
-   * orders. Sub-ordering the null-key group by the error streak sinks a perpetually-erroring
-   * order (count > 0) behind every fresh order (count 0), so fresh orders always poll first; a
-   * clean poll resets the streak to 0 (#163), floating a recovered order straight back to the
-   * front so it reconciles at once. `createdAt` is the final tiebreak — oldest-first within a
-   * tier. (Bounded, self-healing residuals, all one shape: because fresh always polls first and
-   * each group drains in sort order, any order with >`POLL_BATCH_SIZE` rows sorting ahead of it
-   * for many runs waits until that backlog drains, so it won't detect a recovery until then. That
-   * now includes an erroring order behind a large FRESH backlog — #170 sinks it behind fresh,
-   * where pre-#170 it sat at the front — plus the erroring tier's stable-key ordering, its sitting
-   * ahead of the flagged tail, and a flagged-AND-erroring order's frozen re-poll key. A #164-style
-   * re-poll rotation for the erroring tier is the natural follow-up if real data warrants it — full
-   * note on `recordPollError`.)
+   * The SECONDARY key `fulfillmentErrorPolledAt` splits tiers 1 and 2 and, since #175, rotates
+   * tier 2. An order whose `getTracking` THROWS every run returns via `recordPollError` BEFORE
+   * `flagIfStuck`, so it is never flagged-stuck and its `fulfillmentStuckPolledAt` stays null —
+   * leaving it, pre-#170, in the tier-1 null-key group and (being old, having errored a while) at
+   * the FRONT of the oldest-first batch every run, re-creating #158's starvation for erroring
+   * orders. #170 first fixed this by sub-ordering the null-key group on the error STREAK
+   * (`fulfillmentErrorCount ASC`), sinking a perpetually-erroring order behind every fresh one;
+   * but a stable count let a high-count order starve WITHIN a >`POLL_BATCH_SIZE` erroring backlog
+   * (the write-once-tail problem #164 solved for the flagged tail). #175 keys tier 2 on
+   * `fulfillmentErrorPolledAt` instead — non-null IFF the streak > 0 (written together with it) —
+   * so `nulls: "first"` still floats fresh (null) ahead of erroring, AND, bumped `now()` on each
+   * erroring poll, it makes the tier rotate least-recently-errored first, reaching every erroring
+   * order within ~⌈erroringCount / freeSlots⌉ runs. A clean poll nulls the key as it resets the
+   * streak (#163), floating a recovered order straight back to the fresh tier so it reconciles at
+   * once. `createdAt` is the final tiebreak — oldest-first within a tier. (Bounded, self-healing
+   * residuals, all one shape: because fresh always polls first and each group drains in sort
+   * order, any order with >`POLL_BATCH_SIZE` rows sorting ahead of it for many runs waits until
+   * that backlog drains, so it won't detect a recovery until then — an erroring order behind a
+   * large FRESH backlog (#170 sinks it behind fresh, by design, not this issue), and a
+   * flagged-AND-erroring order whose `fulfillmentStuckPolledAt` freezes while it errors (the error
+   * path bypasses `markStuckRepolled`), pinning it at the flagged-tail front rather than rotating
+   * — still strictly better than the pre-#164 fully-frozen tail. Full note on `recordPollError`.)
    */
   findSubmittedForPolling(limit: number): Promise<SubmittedOrderForPolling[]> {
     return prisma.order.findMany({
@@ -559,12 +566,19 @@ export const orderRepository = {
         // (`markStuckRepolled`), so the flagged tail rotates least-recently-repolled first —
         // a >POLL_BATCH_SIZE flagged backlog can't permanently starve the newest-flagged.
         { fulfillmentStuckPolledAt: { sort: "asc", nulls: "first" } },
-        // SECONDARY (#170): within the not-yet-flagged group, sink an order that errors on
-        // every poll (count > 0) behind every fresh one (count 0). Such an order returns via
+        // SECONDARY (#170 tier split, #175 rotation): within the not-yet-flagged group, sink an
+        // order that errors on every poll behind every fresh one. Such an order returns via
         // `recordPollError` BEFORE `flagIfStuck`, so it never joins the flagged tail; without
         // this it sat at the FRONT of the oldest-first batch every run, re-creating #158's
-        // starvation for erroring orders. A clean poll resets the streak (#163) → back to fresh.
-        { fulfillmentErrorCount: "asc" },
+        // starvation for erroring orders. Keyed on `fulfillmentErrorPolledAt` (not the #170
+        // stable `fulfillmentErrorCount`) since #175: it is non-null IFF the streak > 0 — the
+        // two are written together — so `nulls: "first"` floats every fresh order (null) ahead
+        // of every erroring one exactly as the count did, AND, bumped `now()` on each erroring
+        // poll (`recordFulfillmentPollError`), it makes the erroring tier ROTATE least-recently-
+        // errored first — so a >POLL_BATCH_SIZE erroring backlog can't permanently starve a
+        // high-count order (the #164 fix, for the erroring tier). A clean poll nulls it as it
+        // resets the streak (#163) → the order floats back to the fresh tier.
+        { fulfillmentErrorPolledAt: { sort: "asc", nulls: "first" } },
         // TIEBREAK: oldest-first within a tier.
         { createdAt: "asc" },
       ],
@@ -1306,12 +1320,13 @@ export const orderRepository = {
   /**
    * Record one failed `getTracking` poll for a SUBMITTED order and return the new
    * consecutive-error count (M4 #163) — the erroring-open-shipment sibling of
-   * `markFulfillmentStuck`. Atomically increments `fulfillmentErrorCount` under the
-   * same `{status: PAID, fulfillmentStatus: SUBMITTED}` work-list guard its poll
-   * siblings use, then reads the incremented value back **in the same transaction** so
-   * the caller can surface the order exactly once — on the single poll that brings the
-   * streak to the alert threshold (`count === THRESHOLD`, never `>=`, so later ticks
-   * past it don't re-alert). Deliberately leaves `fulfillmentStatus` at SUBMITTED (the
+   * `markFulfillmentStuck`. Atomically increments `fulfillmentErrorCount` — and stamps
+   * `fulfillmentErrorPolledAt = now()`, the erroring-tier round-robin re-poll key (M4 #175),
+   * in the SAME write — under the same `{status: PAID, fulfillmentStatus: SUBMITTED}`
+   * work-list guard its poll siblings use, then reads the incremented value back **in the
+   * same transaction** so the caller can surface the order exactly once — on the single poll
+   * that brings the streak to the alert threshold (`count === THRESHOLD`, never `>=`, so later
+   * ticks past it don't re-alert). Deliberately leaves `fulfillmentStatus` at SUBMITTED (the
    * #155 posture, not #151's terminal exit): a getTracking error proves only that we
    * can't READ the order's status, not that it won't ship, so the order keeps being
    * polled and a `resetFulfillmentPollErrors` on the next clean poll zeroes the streak.
@@ -1322,6 +1337,17 @@ export const orderRepository = {
    * distinct value — exactly one can ever observe the threshold. `updateMany` can't
    * return the updated row, hence the paired read; both are keyed by `{id, tenantId}`,
    * and the tiny two-statement transaction stays well within Prisma's default timeout.
+   *
+   * The `fulfillmentErrorPolledAt = now()` stamp (M4 #175) is why this write drives the
+   * erroring tier's fair rotation: `findSubmittedForPolling` keys that tier on the column
+   * ascending, so bumping it each error poll sends this order to the tier's BACK — the
+   * least-recently-errored order sorts first — and no erroring order is starved within a
+   * >`POLL_BATCH_SIZE` backlog (the #164 fix, for the erroring tier rather than the flagged
+   * tail). It rides this existing write for free (the erroring path always increments), so
+   * unlike #164's flagged tail — whose re-poll bump needed a dedicated `markStuckRepolled`
+   * because its already-flagged branch otherwise writes nothing — the erroring tier needs no
+   * separate writer. Bumped together with the count and never apart, so the "non-null IFF
+   * count > 0" invariant the sort relies on holds after every write here.
    *
    * Returns the new count for the poll that incremented it, or `null` when the guard
    * matched nothing — the order left PAID+SUBMITTED (refunded / manually fulfilled)
@@ -1341,7 +1367,16 @@ export const orderRepository = {
           status: "PAID",
           fulfillmentStatus: "SUBMITTED",
         },
-        data: { fulfillmentErrorCount: { increment: 1 } },
+        // Bump the erroring-tier round-robin re-poll key (M4 #175) in the SAME write as the
+        // increment: `fulfillmentErrorPolledAt = now()` sends this order to the BACK of the
+        // erroring tier so `findSubmittedForPolling` rotates it (that query keys the tier on
+        // this column ascending — least-recently-errored first). Written together with the
+        // count and never apart, so `fulfillmentErrorPolledAt` is non-null IFF the count > 0 —
+        // the invariant `resetFulfillmentPollErrors` restores by nulling both on recovery.
+        data: {
+          fulfillmentErrorCount: { increment: 1 },
+          fulfillmentErrorPolledAt: new Date(),
+        },
       });
       // Guard matched nothing — the order left PAID+SUBMITTED underneath us (refunded /
       // manually fulfilled). A benign no-op: the caller skips the alert, mirroring the
@@ -1358,13 +1393,18 @@ export const orderRepository = {
   },
 
   /**
-   * Zero a SUBMITTED order's consecutive-getTracking-error streak (M4 #163) — called on
-   * any poll that reads tracking cleanly, so a few transient errors followed by a
-   * success can never accumulate to the alert threshold (the "transient blips recover
-   * silently" invariant). Guarded on the same `{status: PAID, fulfillmentStatus:
+   * Zero a SUBMITTED order's consecutive-getTracking-error streak AND null its
+   * `fulfillmentErrorPolledAt` re-poll key (M4 #163/#175) — called on any poll that reads
+   * tracking cleanly, so a few transient errors followed by a success can never accumulate to
+   * the alert threshold (the "transient blips recover silently" invariant). Nulling the re-poll
+   * key alongside the count is the recovery-return: a null key sorts into the FRESH tier of
+   * `findSubmittedForPolling`, so a recovered order polls promptly again instead of lingering in
+   * the deprioritised erroring tier — and it keeps the "non-null IFF count > 0" invariant the
+   * sort relies on (the two fields are only ever written together, here and in
+   * `recordFulfillmentPollError`). Guarded on the same `{status: PAID, fulfillmentStatus:
    * SUBMITTED}` work-list predicate as its siblings, so it never touches an order that
    * has left the poll's work list, and tenant-scoped (golden rule #1). Best-effort and
-   * idempotent — a re-run just re-zeroes an already-zero counter. The caller only
+   * idempotent — a re-run just re-clears an already-clear streak + key. The caller only
    * invokes it when the pre-read `fulfillmentErrorCount` was non-zero, so a clean poll of
    * a never-errored order stays write-free (the poll's "a not-shipped poll writes
    * nothing" invariant); this method is nonetheless safe to call unconditionally.
@@ -1380,7 +1420,13 @@ export const orderRepository = {
         status: "PAID",
         fulfillmentStatus: "SUBMITTED",
       },
-      data: { fulfillmentErrorCount: 0 },
+      // Zero the streak AND null the erroring-tier re-poll key together (M4 #163/#175): a clean
+      // poll is the recovery signal, so clearing `fulfillmentErrorPolledAt` returns the order to
+      // the FRESH tier of `findSubmittedForPolling` (a null key sorts first) rather than leaving
+      // it stranded in the deprioritised erroring tier — and keeps the "non-null IFF count > 0"
+      // invariant the sort relies on. The two are always written together (here and in
+      // `recordFulfillmentPollError`), never apart.
+      data: { fulfillmentErrorCount: 0, fulfillmentErrorPolledAt: null },
     });
   },
 
