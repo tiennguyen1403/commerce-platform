@@ -6,11 +6,46 @@ style. Versions tag milestone releases (`vM<n>`), not semver — see
 [`docs/milestones/M1-commerce-slice/handoff.md`](docs/milestones/M1-commerce-slice/handoff.md)
 for the full M1 writeup,
 [`docs/milestones/M2-production-grade/handoff.md`](docs/milestones/M2-production-grade/handoff.md)
-for the full M2 writeup, and
+for the full M2 writeup,
 [`docs/milestones/M3-platform/handoff.md`](docs/milestones/M3-platform/handoff.md)
-for the full M3 writeup.
+for the full M3 writeup, and
+[`docs/milestones/M4-fulfillment/handoff.md`](docs/milestones/M4-fulfillment/handoff.md)
+for the full M4 writeup.
 
 ## [Unreleased]
+
+## [vM4] — fulfillment — 2026-09-05
+
+Turns the admin's manual "mark as fulfilled" button into real fulfillment: a shopper now
+enters a shipping address at checkout, a paid order is automatically submitted to a
+print-on-demand supplier, its shipment and tracking flow back on their own, and the
+shopper gets a shipping-confirmation email once it's on its way.
+
+### Added
+
+- Checkout now collects a shipping address (US only, for now), saved on the order
+  alongside the rest of its details.
+- Every product variant can be mapped to the fulfillment supplier's own catalog item,
+  right from the same admin form used to manage its stock and price.
+- A paid order with a shipping address is now submitted automatically to the fulfillment
+  supplier (Printful) — no manual step required, and it can't accidentally be submitted
+  twice.
+- A background job checks in on every submitted order's shipment status. Once the
+  supplier reports it shipped, the order is marked fulfilled automatically, with its
+  carrier and tracking number attached.
+- A shipping-confirmation email, with a tracking link, now goes out automatically once an
+  order ships.
+- The admin order page and the shopper's own order history both now show the shipping
+  address, fulfillment status, and tracking link.
+- If a submitted order gets stuck with the supplier, or its shipment status can't be read
+  for too long, it's now automatically flagged on the admin order page for an operator to
+  look into.
+
+### Changed
+
+- "Mark fulfilled" in the admin is now a manual override rather than the usual way an
+  order becomes fulfilled — most orders now fulfil themselves once the supplier ships
+  them.
 
 ## [vM3] — platform — 2026-09-03
 
@@ -134,7 +169,8 @@ Stripe test-mode purchase; an admin manages the catalog behind auth.
   details — it verifies against the live Stripe payment first, closing an
   information-disclosure gap.
 
-[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM3...HEAD
+[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM4...HEAD
+[vm4]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM4
 [vm3]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM3
 [vm2]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM2
 [vm1]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM1
