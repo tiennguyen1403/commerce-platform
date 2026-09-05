@@ -55,6 +55,39 @@ export class ImageTooLargeError extends Error {
 }
 
 /**
+ * The `key` submitted with a persist request isn't inside the tenant's own object
+ * namespace (`tenants/<tenantId>/…`). The client echoes back the key the sign step
+ * minted, and that key is later handed to `provider.delete(key)` — and a store's
+ * keys are visible in its public image URLs — so persisting a forged key that
+ * points at another tenant's object would let a delete cross the tenant boundary
+ * (golden rule 1). The seam guarantees tenant-namespaced keys (`storage/provider.ts`),
+ * so anything else is a tampered payload, refused at the write edge. A well-behaved
+ * admin client never triggers this.
+ */
+export class InvalidImageKeyError extends Error {
+  constructor() {
+    super("That image couldn't be saved.");
+    this.name = "InvalidImageKeyError";
+  }
+}
+
+/**
+ * No image with that id exists for this tenant's product — it was deleted (perhaps
+ * in another tab) between the admin loading the manager and acting on it. Thrown by
+ * the alt-text update path, where a no-op on a vanished row would otherwise leave
+ * the manager showing a caption the store no longer has. Distinct from
+ * `ProductNotFoundError` so the boundary can word it about the image, not the
+ * product. (Delete stays idempotent — an already-gone image is success there — so
+ * it never raises this.)
+ */
+export class ImageNotFoundError extends Error {
+  constructor() {
+    super("That image no longer exists.");
+    this.name = "ImageNotFoundError";
+  }
+}
+
+/**
  * A reorder request didn't list exactly the product's current images (a missing,
  * extra, duplicated, or foreign id). Refusing it keeps the gallery's `position`
  * sequence contiguous and collision-free rather than letting a malformed payload

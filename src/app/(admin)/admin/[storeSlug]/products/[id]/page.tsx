@@ -20,6 +20,16 @@ export default async function EditProductPage({
   const product = await catalogService.getAdminProduct(tenantId, id);
   if (!product) notFound();
 
+  const initialImages = product.images.map((image) => ({
+    id: image.id,
+    url: image.url,
+    key: image.key,
+    altText: image.altText,
+    width: image.width,
+    height: image.height,
+    position: image.position,
+  }));
+
   const initialValues: ProductFormValues = {
     title: product.title,
     slug: product.slug,
@@ -66,8 +76,10 @@ export default async function EditProductPage({
         mode="edit"
         storeSlug={storeSlug}
         productId={product.id}
+        productSlug={product.slug}
         initialValues={initialValues}
         storeCurrency={currency}
+        initialImages={initialImages}
       />
     </div>
   );
