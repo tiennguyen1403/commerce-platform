@@ -13,6 +13,7 @@ import { getStoreTenant } from "@/server/store-context";
 import { catalogService } from "@/server/services/catalog.service";
 import { availableUnits } from "@/lib/inventory";
 import { PurchasePanel } from "./purchase-panel";
+import { ProductGallery } from "./product-gallery";
 
 /**
  * Resolve an ACTIVE product for the public store. A missing slug, or a product
@@ -72,16 +73,27 @@ export default async function ProductDetailPage({
       </nav>
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2 md:gap-12">
-        {/* Gallery. No product images exist yet, so this is a placeholder frame;
-            it becomes a real gallery once images ship (Product-images milestone). */}
-        <div className="flex flex-col gap-4">
-          <div className="border-border bg-muted flex aspect-square items-center justify-center rounded-xl border">
-            <ImageIcon
-              className="text-muted-foreground/40 size-16"
-              aria-hidden
-            />
+        {/* Gallery: a real main image + thumbnail rail when the product has images,
+            else the placeholder frame (image-less products stay fully server-rendered). */}
+        {product.images.length > 0 ? (
+          <ProductGallery
+            images={product.images.map((image) => ({
+              id: image.id,
+              url: image.url,
+              altText: image.altText,
+            }))}
+            productTitle={product.title}
+          />
+        ) : (
+          <div className="flex flex-col gap-4">
+            <div className="border-border bg-muted flex aspect-square items-center justify-center rounded-xl border">
+              <ImageIcon
+                className="text-muted-foreground/40 size-16"
+                aria-hidden
+              />
+            </div>
           </div>
-        </div>
+        )}
 
         {/* Info column. */}
         <div className="flex flex-col gap-6">

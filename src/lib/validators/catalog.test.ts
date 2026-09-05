@@ -4,6 +4,7 @@ import {
   variantInputSchema,
   PRODUCT_STATUSES,
   isSafeImageUrl,
+  isUnoptimizedImageSrc,
   addImageSchema,
 } from "@/lib/validators/catalog";
 
@@ -229,6 +230,37 @@ describe("isSafeImageUrl", () => {
     ]) {
       expect(isSafeImageUrl(url), JSON.stringify(url)).toBe(false);
     }
+  });
+});
+
+describe("isUnoptimizedImageSrc", () => {
+  it("marks same-origin (root-relative) sources unoptimized — the seed/mock/CI path", () => {
+    // These render without hitting the sharp-requiring optimizer, so `next start`
+    // in dev/CI never throws for a demo seed or a locally-uploaded image.
+    for (const url of [
+      "/seed/classic-tee-front.png",
+      "/uploads/tenants/t/products/p/a.png",
+      "/some-other-root-relative.png",
+    ]) {
+      expect(isUnoptimizedImageSrc(url), url).toBe(true);
+    }
+  });
+
+  it("classifies a data: URI as unoptimized too (defensive — never actually stored)", () => {
+    // isSafeImageUrl rejects data:, so no stored url is ever a data: URI; the helper
+    // still classifies it (staying a total function, matching next/image's own
+    // data:-handling) rather than accidentally routing it to the sharp optimizer.
+    expect(isUnoptimizedImageSrc("data:image/png;base64,AAAA")).toBe(true);
+  });
+
+  it("optimizes only remote https URLs (Vercel Blob, no sharp in our bundle)", () => {
+    expect(
+      isUnoptimizedImageSrc(
+        "https://host.public.blob.vercel-storage.com/x.png",
+      ),
+    ).toBe(false);
+    // Scheme match is case-insensitive, mirroring isSafeImageUrl.
+    expect(isUnoptimizedImageSrc("HTTPS://host/x.png")).toBe(false);
   });
 });
 

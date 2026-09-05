@@ -1,13 +1,13 @@
 import Link from "next/link";
 import type { Prisma } from "@prisma/client";
-import { ImageIcon } from "lucide-react";
 import { formatMoney } from "@/lib/utils";
 import { availableUnits } from "@/lib/inventory";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { ProductImageFrame } from "./product-image";
 
 type StorefrontProduct = Prisma.ProductGetPayload<{
-  include: { variants: true };
+  include: { variants: true; images: true };
 }>;
 
 /** Entry price for a card: a flat price when every variant matches, otherwise
@@ -27,9 +27,12 @@ function priceLabel(
 export function ProductCard({
   product,
   currency,
+  preload = false,
 }: {
   product: StorefrontProduct;
   currency: string;
+  /** Mark this card's image as an LCP preload — set on the first card in a grid. */
+  preload?: boolean;
 }) {
   const inStock = product.variants.some((v) => availableUnits(v) > 0);
 
@@ -40,7 +43,13 @@ export function ProductCard({
     >
       <Card className="group-hover:ring-foreground/25 h-full gap-0 py-0 transition-all group-hover:shadow-sm motion-safe:group-hover:-translate-y-0.5">
         <div className="bg-muted relative flex aspect-square items-center justify-center">
-          <ImageIcon className="text-muted-foreground/40 size-10" />
+          <ProductImageFrame
+            image={product.images[0]}
+            productTitle={product.title}
+            sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
+            preload={preload}
+            iconClassName="size-10"
+          />
           {!inStock ? (
             <Badge variant="secondary" className="absolute top-3 left-3">
               Sold out
