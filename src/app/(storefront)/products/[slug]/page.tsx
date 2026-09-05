@@ -2,7 +2,13 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { cache } from "react";
-import { ArrowLeft, ImageIcon } from "lucide-react";
+import {
+  ChevronRight,
+  Globe,
+  ImageIcon,
+  ShieldCheck,
+  Truck,
+} from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
 import { catalogService } from "@/server/services/catalog.service";
 import { availableUnits } from "@/lib/inventory";
@@ -50,31 +56,38 @@ export default async function ProductDetailPage({
   const { currency } = await getStoreTenant();
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-10">
-      <Link
-        href="/products"
-        className="text-muted-foreground hover:text-foreground inline-flex w-fit items-center gap-1 text-sm font-medium"
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 px-6 py-10">
+      {/* Breadcrumb (replaces the old back link). */}
+      <nav
+        aria-label="Breadcrumb"
+        className="text-muted-foreground flex items-center gap-2 text-sm"
       >
-        <ArrowLeft className="size-4" />
-        All products
-      </Link>
+        <Link href="/products" className="hover:text-foreground font-medium">
+          All products
+        </Link>
+        <ChevronRight className="size-4 shrink-0" aria-hidden />
+        <span className="text-foreground min-w-0 truncate font-medium">
+          {product.title}
+        </span>
+      </nav>
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2 md:gap-12">
-        <div className="bg-muted ring-foreground/10 flex aspect-square items-center justify-center rounded-xl ring-1">
-          <ImageIcon className="text-muted-foreground/40 size-16" />
+        {/* Gallery. No product images exist yet, so this is a placeholder frame;
+            it becomes a real gallery once images ship (Product-images milestone). */}
+        <div className="flex flex-col gap-4">
+          <div className="border-border bg-muted flex aspect-square items-center justify-center rounded-xl border">
+            <ImageIcon
+              className="text-muted-foreground/40 size-16"
+              aria-hidden
+            />
+          </div>
         </div>
 
+        {/* Info column. */}
         <div className="flex flex-col gap-6">
-          <div className="flex flex-col gap-3">
-            <h1 className="text-3xl font-semibold tracking-tight">
-              {product.title}
-            </h1>
-            {product.description ? (
-              <p className="text-muted-foreground max-w-prose leading-7">
-                {product.description}
-              </p>
-            ) : null}
-          </div>
+          <h1 className="text-3xl font-semibold tracking-tight">
+            {product.title}
+          </h1>
 
           <PurchasePanel
             currency={currency}
@@ -85,6 +98,34 @@ export default async function ProductDetailPage({
               available: availableUnits(v),
             }))}
           />
+
+          {/* Honest, store-level info — static copy, no per-product data. */}
+          <ul className="text-muted-foreground flex flex-col gap-2.5 text-sm">
+            <li className="flex items-center gap-2.5">
+              <Truck className="size-4 shrink-0" aria-hidden />
+              Made to order by our print partner
+            </li>
+            <li className="flex items-center gap-2.5">
+              <Globe className="size-4 shrink-0" aria-hidden />
+              Ships to the US
+            </li>
+            <li className="flex items-center gap-2.5">
+              <ShieldCheck className="size-4 shrink-0" aria-hidden />
+              Secure checkout with Stripe
+            </li>
+          </ul>
+
+          {product.description ? (
+            <>
+              <div className="bg-border h-px" />
+              <div className="flex flex-col gap-2">
+                <h2 className="text-sm font-medium">Details</h2>
+                <p className="text-muted-foreground max-w-prose text-sm leading-7">
+                  {product.description}
+                </p>
+              </div>
+            </>
+          ) : null}
         </div>
       </div>
     </div>
