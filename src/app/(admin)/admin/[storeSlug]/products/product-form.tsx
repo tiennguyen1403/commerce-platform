@@ -11,6 +11,7 @@ import {
   productInputSchema,
   type ActionResult,
   type CurrencyValue,
+  type ProductImageDto,
   type ProductStatusValue,
 } from "@/lib/validators/catalog";
 import { slugify } from "@/lib/utils";
@@ -38,6 +39,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { createProductAction, updateProductAction } from "./actions";
+import { ProductImageManager } from "./product-image-manager";
 
 /** A single variant row as the form holds it — money/stock kept as raw strings
  *  so the inputs stay controlled; converted to integers only on submit. */
@@ -79,9 +81,16 @@ type ProductFormProps = {
   /** The active store's slug — scopes the action calls and post-save redirect. */
   storeSlug: string;
   productId?: string;
+  /** The product's *persisted* slug — passed to the image actions for storefront
+   *  revalidation. Only present in edit mode (a create-mode product has no saved
+   *  slug yet); the image manager is gated to edit mode anyway. */
+  productSlug?: string;
   initialValues: ProductFormValues;
   /** The store's currency (`Tenant.currency`); every variant price is in it. */
   storeCurrency: string;
+  /** The product's current gallery images, in order — seeds the image manager
+   *  (edit mode only; empty otherwise). */
+  initialImages?: ProductImageDto[];
 };
 
 type VariantFieldErrors = Partial<
@@ -120,8 +129,10 @@ export function ProductForm({
   mode,
   storeSlug,
   productId,
+  productSlug,
   initialValues,
   storeCurrency,
+  initialImages = [],
 }: ProductFormProps) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -357,6 +368,25 @@ export function ProductForm({
           </Field>
         </CardContent>
       </Card>
+
+      {mode === "edit" && productId && productSlug ? (
+        <ProductImageManager
+          storeSlug={storeSlug}
+          productId={productId}
+          productSlug={productSlug}
+          initialImages={initialImages}
+        />
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle>Images</CardTitle>
+            <CardDescription>
+              Save the product first — then add, reorder, caption, and remove
+              images here.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>

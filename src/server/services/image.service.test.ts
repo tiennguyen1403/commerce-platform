@@ -6,8 +6,10 @@ import type { GetUploadUrlInput, GetUploadUrlResult } from "@/server/storage";
 import {
   imageService,
   ImageLimitReachedError,
+  ImageNotFoundError,
   ImageReorderMismatchError,
   ImageTooLargeError,
+  InvalidImageKeyError,
   ProductNotFoundError,
   StorageNotConfiguredError,
   UnsupportedImageTypeError,
@@ -33,6 +35,7 @@ vi.mock("@/server/repositories/image.repository", () => ({
     getImageCountForOwnedProduct: vi.fn(),
     createImage: vi.fn(),
     reorderImages: vi.fn(),
+    updateAltText: vi.fn(),
     deleteImage: vi.fn(),
   },
 }));
@@ -44,6 +47,7 @@ const getImageCountForOwnedProduct = vi.mocked(
 );
 const createImage = vi.mocked(imageRepository.createImage);
 const reorderImages = vi.mocked(imageRepository.reorderImages);
+const updateAltText = vi.mocked(imageRepository.updateAltText);
 const deleteImage = vi.mocked(imageRepository.deleteImage);
 const getProvider = vi.mocked(getStorageProvider);
 
@@ -68,8 +72,8 @@ function imageRow(o: Partial<ProductImage> = {}): ProductImage {
     id: o.id ?? "img_1",
     tenantId: TENANT,
     productId: PRODUCT,
-    url: o.url ?? "/uploads/tenants/t/products/p/abc.png",
-    key: o.key ?? "tenants/t/products/p/abc.png",
+    url: o.url ?? `/uploads/tenants/${TENANT}/products/${PRODUCT}/abc.png`,
+    key: o.key ?? `tenants/${TENANT}/products/${PRODUCT}/abc.png`,
     altText: o.altText ?? null,
     position: o.position ?? 0,
     width: o.width ?? null,
@@ -197,10 +201,45 @@ describe("imageService.addImage", () => {
 
     await expect(
       imageService.addImage(TENANT, PRODUCT, {
-        url: "/u/x.png",
-        key: "k/x.png",
+        url: `/uploads/tenants/${TENANT}/products/${PRODUCT}/x.png`,
+        key: `tenants/${TENANT}/products/${PRODUCT}/x.png`,
       }),
     ).rejects.toBeInstanceOf(ProductNotFoundError);
+  });
+
+  it("rejects a key outside the tenant's namespace before any DB write (cross-tenant delete guard)", async () => {
+    // The client echoes the signed `key`; a forged one pointing at another tenant's
+    // object (keys are visible in a store's public image URLs) must not be stored,
+    // or a later `provider.delete(key)` would cross the tenant boundary.
+    await expect(
+      imageService.addImage(TENANT, PRODUCT, {
+        url: "/uploads/tenants/tenant_2/products/prod_9/x.png",
+        key: "tenants/tenant_2/products/prod_9/x.png",
+      }),
+    ).rejects.toBeInstanceOf(InvalidImageKeyError);
+    expect(createImage).not.toHaveBeenCalled();
+  });
+
+  it("forwards altText to the repository unmodified — including a blank string (no trim/null normalisation on this path)", async () => {
+    // `addImage` does no blank→null normalisation of its own: it forwards whatever
+    // the caller passed to the repository (`input.altText ?? null` there maps only
+    // `null`/`undefined` → `null`, not `""`). The ACTION path never reaches here
+    // with `""` — `addImageSchema` collapses a blank caption to `undefined` at the
+    // boundary — so this documents the service's raw contract for a direct caller.
+    const created = imageRow({ altText: "" });
+    createImage.mockResolvedValue(created);
+
+    await imageService.addImage(TENANT, PRODUCT, {
+      url: created.url,
+      key: created.key,
+      altText: "",
+    });
+
+    expect(createImage).toHaveBeenCalledWith(TENANT, PRODUCT, {
+      url: created.url,
+      key: created.key,
+      altText: "",
+    });
   });
 });
 
@@ -257,6 +296,44 @@ describe("imageService.reorderImages", () => {
       imageService.reorderImages(TENANT, PRODUCT, ["a", "a"]),
     ).rejects.toBeInstanceOf(ImageReorderMismatchError);
     expect(reorderImages).not.toHaveBeenCalled();
+  });
+});
+
+describe("imageService.updateAltText", () => {
+  it("trims the caption and delegates the trimmed value to the repository", async () => {
+    updateAltText.mockResolvedValue(true);
+
+    await expect(
+      imageService.updateAltText(TENANT, PRODUCT, "img_1", "  A cozy tee  "),
+    ).resolves.toBeUndefined();
+    expect(updateAltText).toHaveBeenCalledWith(
+      TENANT,
+      PRODUCT,
+      "img_1",
+      "A cozy tee",
+    );
+  });
+
+  it("normalises a whitespace-only caption to null before calling the repository", async () => {
+    updateAltText.mockResolvedValue(true);
+
+    await imageService.updateAltText(TENANT, PRODUCT, "img_1", "   ");
+    expect(updateAltText).toHaveBeenCalledWith(TENANT, PRODUCT, "img_1", null);
+  });
+
+  it("normalises an undefined caption to null before calling the repository", async () => {
+    updateAltText.mockResolvedValue(true);
+
+    await imageService.updateAltText(TENANT, PRODUCT, "img_1", undefined);
+    expect(updateAltText).toHaveBeenCalledWith(TENANT, PRODUCT, "img_1", null);
+  });
+
+  it("throws ImageNotFoundError when the repository matches no row", async () => {
+    updateAltText.mockResolvedValue(false);
+
+    await expect(
+      imageService.updateAltText(TENANT, PRODUCT, "ghost", "caption"),
+    ).rejects.toBeInstanceOf(ImageNotFoundError);
   });
 });
 

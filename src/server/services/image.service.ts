@@ -13,8 +13,10 @@ import { ProductNotFoundError } from "@/server/catalog.errors";
 import { StorageNotConfiguredError } from "@/server/storage.errors";
 import {
   ImageLimitReachedError,
+  ImageNotFoundError,
   ImageReorderMismatchError,
   ImageTooLargeError,
+  InvalidImageKeyError,
   UnsupportedImageTypeError,
 } from "@/server/media.errors";
 import { logger } from "@/server/observability/logger";
@@ -39,8 +41,10 @@ export { ProductNotFoundError } from "@/server/catalog.errors";
 export { StorageNotConfiguredError } from "@/server/storage.errors";
 export {
   ImageLimitReachedError,
+  ImageNotFoundError,
   ImageReorderMismatchError,
   ImageTooLargeError,
+  InvalidImageKeyError,
   UnsupportedImageTypeError,
 } from "@/server/media.errors";
 
@@ -126,8 +130,19 @@ export const imageService = {
    * appends it (computing `position`) and re-verifies tenant ownership atomically;
    * `null` from it means the product isn't the tenant's (or was deleted between the
    * sign and now), surfaced as `ProductNotFoundError`.
+   *
+   * The client echoes back the `url`/`key` the sign step minted, so before storing
+   * the `key` — which later drives `provider.delete(key)`, and whose value is
+   * visible in a store's public image URLs — we re-pin it to THIS tenant's object
+   * namespace. The storage seam guarantees keys are `tenants/<tenantId>/…`
+   * (`storage/provider.ts`), so a key outside it is a tampered payload that could
+   * otherwise let a later delete reach another tenant's object; refuse it up front
+   * (golden rule 1). `url` is separately allowlist-checked at the schema boundary.
    */
   async addImage(tenantId: string, productId: string, input: AddImageInput) {
+    if (!input.key.startsWith(`tenants/${tenantId}/`)) {
+      throw new InvalidImageKeyError();
+    }
     const image = await imageRepository.createImage(tenantId, productId, input);
     if (!image) {
       throw new ProductNotFoundError();
@@ -160,6 +175,31 @@ export const imageService = {
     }
 
     await imageRepository.reorderImages(tenantId, productId, orderedIds);
+  },
+
+  /**
+   * Set one image's alt text (caption). A blank caption (`undefined`/`""` from the
+   * boundary) is normalised to `null` so "no caption" is a single stored value.
+   * The repository write is tenant + product scoped; if it matches no row (the
+   * image was deleted meanwhile, or never belonged to this tenant's product) we
+   * throw `ImageNotFoundError` rather than silently succeeding, so the manager can
+   * tell the admin the image is gone instead of showing a caption that never landed.
+   */
+  async updateAltText(
+    tenantId: string,
+    productId: string,
+    imageId: string,
+    altText: string | null | undefined,
+  ): Promise<void> {
+    const updated = await imageRepository.updateAltText(
+      tenantId,
+      productId,
+      imageId,
+      altText?.trim() ? altText.trim() : null,
+    );
+    if (!updated) {
+      throw new ImageNotFoundError();
+    }
   },
 
   /**

@@ -136,6 +136,62 @@ describe("imageRepository lifecycle (integration)", () => {
     expect(listed.map((image) => image.position)).toEqual([0, 1, 2]);
   });
 
+  it("sets an image's alt text and persists a null to clear it", async () => {
+    const tenant = await freshTenant();
+    const product = await seedProduct(tenant.id);
+    const image = expectImage(
+      await imageRepository.createImage(
+        tenant.id,
+        product.id,
+        imageInput({ altText: "original" }),
+      ),
+    );
+
+    expect(
+      await imageRepository.updateAltText(
+        tenant.id,
+        product.id,
+        image.id,
+        "A cozy tee",
+      ),
+    ).toBe(true);
+    const [captioned] = await imageRepository.listImages(tenant.id, product.id);
+    expect(captioned.altText).toBe("A cozy tee");
+
+    expect(
+      await imageRepository.updateAltText(
+        tenant.id,
+        product.id,
+        image.id,
+        null,
+      ),
+    ).toBe(true);
+    const [cleared] = await imageRepository.listImages(tenant.id, product.id);
+    expect(cleared.altText).toBeNull();
+  });
+
+  it("updateAltText returns false and changes nothing for an unknown image id", async () => {
+    const tenant = await freshTenant();
+    const product = await seedProduct(tenant.id);
+    await imageRepository.createImage(
+      tenant.id,
+      product.id,
+      imageInput({ altText: "original" }),
+    );
+
+    expect(
+      await imageRepository.updateAltText(
+        tenant.id,
+        product.id,
+        "ghost",
+        "hijacked",
+      ),
+    ).toBe(false);
+
+    const [unchanged] = await imageRepository.listImages(tenant.id, product.id);
+    expect(unchanged.altText).toBe("original");
+  });
+
   it("deletes a row, returns it (with key) for the object delete, and no-ops on a foreign id", async () => {
     const tenant = await freshTenant();
     const product = await seedProduct(tenant.id);
@@ -286,5 +342,31 @@ describe("imageRepository tenant isolation (integration)", () => {
     expect(ownerImages).toHaveLength(1);
     expect(ownerImages[0].id).toBe(image.id);
     expect(ownerImages[0].position).toBe(0);
+  });
+
+  it("never lets a foreign tenant update another store's alt text", async () => {
+    const owner = await freshTenant();
+    const intruder = await freshTenant();
+    const product = await seedProduct(owner.id);
+    const image = expectImage(
+      await imageRepository.createImage(
+        owner.id,
+        product.id,
+        imageInput({ altText: "original" }),
+      ),
+    );
+
+    expect(
+      await imageRepository.updateAltText(
+        intruder.id,
+        product.id,
+        image.id,
+        "hijacked",
+      ),
+    ).toBe(false);
+
+    // The owner's caption is entirely untouched.
+    const [unchanged] = await imageRepository.listImages(owner.id, product.id);
+    expect(unchanged.altText).toBe("original");
   });
 });

@@ -136,6 +136,27 @@ export const imageRepository = {
   },
 
   /**
+   * Set one image's alt text (caption), tenant + product scoped. Returns whether a
+   * row was updated — `false` for a foreign/unknown/already-deleted id, which
+   * `updateMany`'s scoped `where` matches zero rows for (never throwing `P2025`),
+   * so the service can surface it as `ImageNotFoundError`. A blank caption is
+   * stored as `null` (the caller passes `null`, not `""`), keeping "no caption" a
+   * single canonical value.
+   */
+  async updateAltText(
+    tenantId: string,
+    productId: string,
+    imageId: string,
+    altText: string | null,
+  ): Promise<boolean> {
+    const result = await prisma.productImage.updateMany({
+      where: { id: imageId, tenantId, productId },
+      data: { altText },
+    });
+    return result.count > 0;
+  },
+
+  /**
    * Delete one image and return the removed row (so the service can best-effort
    * delete its object by `key`), or `null` if nothing matched. The lookup and the
    * delete are both scoped to `{ tenantId, productId }` and run in one transaction,
