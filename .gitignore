@@ -24,6 +24,10 @@
 # production
 /build
 
+# local-disk storage mock — dev/test upload sink (M5 #185). Real uploads go to the
+# storage provider (Vercel Blob) in prod; these are throwaway local bytes.
+/public/uploads/
+
 # misc
 .DS_Store
 *.pem
