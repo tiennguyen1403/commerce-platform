@@ -343,11 +343,37 @@ model Order {
   // non-empty tables (golden rule 6); 0 means both "never errored" and "recovered", so
   // no nullable tri-state is needed. Written only by the poll cron
   // (`fulfillment.service.ts` via `recordFulfillmentPollError`/`resetFulfillmentPollErrors`).
-  // Also an ordering key (M4 #170): `findSubmittedForPolling` sub-orders the not-yet-flagged
-  // poll group by this count ascending, so a perpetually-erroring order (which bypasses the
-  // #155 stuck-flag and would otherwise sit at the front of the oldest-first batch) sinks
-  // behind fresh (count-0) orders and can't starve them — the erroring-mode analogue of #158.
+  // Its ordering role moved to `fulfillmentErrorPolledAt` in M4 #175: #170 first sub-ordered
+  // the not-yet-flagged poll group by this count ascending (sinking a perpetually-erroring
+  // order — which bypasses the #155 stuck-flag and would otherwise sit at the front of the
+  // oldest-first batch — behind fresh count-0 orders: the erroring-mode analogue of #158). But
+  // a STABLE count let a high-count order starve within a `> POLL_BATCH_SIZE` erroring backlog
+  // (the write-once-tail problem #164 fixed for the flagged tail), so #175 rotates the tier by
+  // re-poll time instead (see `fulfillmentErrorPolledAt`). This count now drives only the alert
+  // threshold, no longer the batch order — the tier split it implied (0 vs > 0) is preserved
+  // exactly by that key's null-vs-non-null boundary (the two are written together, never apart).
   fulfillmentErrorCount Int         @default(0)
+  // Round-robin re-poll key for the deprioritised ERRORING poll tier (M4 #175) — the erroring-
+  // tier analogue of `fulfillmentStuckPolledAt` (#164). #170 sank a perpetually-erroring order
+  // (getTracking throws every poll) behind fresh ones by sorting the not-yet-flagged group on
+  // `fulfillmentErrorCount` ascending; but that count is a STABLE key, so within a
+  // `> POLL_BATCH_SIZE` erroring backlog a high-count order could wait behind a churn of
+  // lower-count ones and never reach the `take(POLL_BATCH_SIZE)` window — the write-once-tail
+  // starvation #164 fixed for the flagged tail, now for the erroring tier. This key fixes it the
+  // same way: `recordFulfillmentPollError` stamps it `now()` on every erroring poll (in the same
+  // write as the count increment), and `findSubmittedForPolling` sorts the not-yet-flagged group
+  // by it ascending, nulls first — so a fresh order (null) still polls first, and within the
+  // erroring tier re-polling ROTATES least-recently-errored first, reaching every erroring order
+  // within a bounded number of runs (so one whose getTracking recovers reconciles). Written
+  // together with `fulfillmentErrorCount` and never apart, so it is non-null IFF that count > 0:
+  // the clean-poll `resetFulfillmentPollErrors` nulls it as it zeroes the count, returning a
+  // recovered order to the fresh tier (#175 AC2). That perfect correlation is why it REPLACES the
+  // count as the erroring-tier `orderBy` key rather than joining it — identical tier split (null
+  // vs non-null == 0 vs > 0), plus rotation. Nullable, no default → safe on non-empty tables
+  // (golden rule 6); the #175 migration backfills it = `updatedAt` (an erroring order's last
+  // write is its last error poll) for already-erroring rows so the invariant holds from the
+  // first post-deploy poll. Written only by the poll cron.
+  fulfillmentErrorPolledAt DateTime?
   createdAt             DateTime    @default(now())
   updatedAt             DateTime    @updatedAt
 
@@ -384,10 +410,10 @@ model Order {
   // (a selective first term) and — the stronger reason — for non-redundancy with the
   // `[status, createdAt]` index above: a `status`-leading composite would overlap it,
   // whereas for this two-equality predicate the index seek localises equally whichever
-  // term leads. The residual `fulfillmentStuckPolledAt NULLS FIRST, fulfillmentErrorCount,
-  // createdAt` ordering (#158 deprioritises flagged-stuck rows to the tail; #164 rotates that
-  // tail by re-poll time; #170 sub-orders the not-yet-flagged rows by error streak so a
-  // perpetually-erroring order sinks behind fresh ones) runs as a cheap sort over the small
+  // term leads. The residual `fulfillmentStuckPolledAt NULLS FIRST, fulfillmentErrorPolledAt
+  // NULLS FIRST, createdAt` ordering (#158 deprioritises flagged-stuck rows to the tail; #164
+  // rotates that tail by re-poll time; #170 sinks a perpetually-erroring order behind fresh ones
+  // and #175 rotates that erroring tier by re-poll time too) runs as a cheap sort over the small
   // filtered set — Prisma can't express NULLS FIRST in an index (only the runtime
   // `orderBy` can), and the filtered set is small, so covering the sort isn't worth it.
   @@index([fulfillmentStatus, status])

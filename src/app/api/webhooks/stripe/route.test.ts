@@ -103,6 +103,7 @@ function order(o: Partial<Order> = {}): Order {
     fulfillmentStuckAt: null,
     fulfillmentStuckPolledAt: null,
     fulfillmentErrorCount: 0,
+    fulfillmentErrorPolledAt: null,
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     ...o,

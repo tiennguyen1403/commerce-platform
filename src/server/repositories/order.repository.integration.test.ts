@@ -162,6 +162,7 @@ async function seedOrder(
     fulfillmentStatus?: FulfillmentStatus;
     fulfillmentExternalId?: string;
     fulfillmentErrorCount?: number;
+    fulfillmentErrorPolledAt?: Date | null;
   } = {},
 ) {
   const lines = opts.lines ?? [];
@@ -185,6 +186,9 @@ async function seedOrder(
         : {}),
       ...(opts.fulfillmentErrorCount !== undefined
         ? { fulfillmentErrorCount: opts.fulfillmentErrorCount }
+        : {}),
+      ...(opts.fulfillmentErrorPolledAt !== undefined
+        ? { fulfillmentErrorPolledAt: opts.fulfillmentErrorPolledAt }
         : {}),
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
       items: {
@@ -2007,6 +2011,7 @@ describe("orderRepository.recordFulfillmentPollError (integration)", () => {
       status?: OrderStatus;
       fulfillmentStatus?: FulfillmentStatus;
       fulfillmentErrorCount?: number;
+      fulfillmentErrorPolledAt?: Date | null;
     } = {},
   ) {
     return seedOrder(tenantId, {
@@ -2014,6 +2019,7 @@ describe("orderRepository.recordFulfillmentPollError (integration)", () => {
       fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
       fulfillmentExternalId: uniqueId("ext"),
       fulfillmentErrorCount: opts.fulfillmentErrorCount,
+      fulfillmentErrorPolledAt: opts.fulfillmentErrorPolledAt,
     });
   }
 
@@ -2035,6 +2041,33 @@ describe("orderRepository.recordFulfillmentPollError (integration)", () => {
     // lifecycle nor the order status moves — the order keeps being polled.
     expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
     expect(persisted.status).toBe("PAID");
+  });
+
+  it("stamps the erroring-tier re-poll key (fulfillmentErrorPolledAt) in the same write (#175)", async () => {
+    const tenant = await freshTenant();
+    // Seed an order carrying a stale re-poll key (as a still-erroring order would). The write
+    // must bump it to ~now() so `findSubmittedForPolling` rotates this order to the BACK of the
+    // erroring tier — the round-robin that stops a >POLL_BATCH_SIZE erroring backlog starving it.
+    const staleKey = new Date(Date.now() - 60 * 60_000);
+    const order = await seedSubmitted(tenant.id, {
+      fulfillmentErrorCount: 2,
+      fulfillmentErrorPolledAt: staleKey,
+    });
+    const before = Date.now();
+
+    await orderRepository.recordFulfillmentPollError(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    // Bumped forward (well past the stale key), keeping the "non-null IFF count > 0" invariant.
+    expect(persisted.fulfillmentErrorPolledAt).not.toBeNull();
+    expect(persisted.fulfillmentErrorPolledAt!.getTime()).toBeGreaterThan(
+      staleKey.getTime(),
+    );
+    expect(
+      persisted.fulfillmentErrorPolledAt!.getTime(),
+    ).toBeGreaterThanOrEqual(before);
   });
 
   it("returns 1 on the first error (up from the default 0)", async () => {
@@ -2140,6 +2173,7 @@ describe("orderRepository.resetFulfillmentPollErrors (integration)", () => {
       status?: OrderStatus;
       fulfillmentStatus?: FulfillmentStatus;
       fulfillmentErrorCount?: number;
+      fulfillmentErrorPolledAt?: Date | null;
     } = {},
   ) {
     return seedOrder(tenantId, {
@@ -2147,6 +2181,7 @@ describe("orderRepository.resetFulfillmentPollErrors (integration)", () => {
       fulfillmentStatus: opts.fulfillmentStatus ?? "SUBMITTED",
       fulfillmentExternalId: uniqueId("ext"),
       fulfillmentErrorCount: opts.fulfillmentErrorCount,
+      fulfillmentErrorPolledAt: opts.fulfillmentErrorPolledAt,
     });
   }
 
@@ -2162,6 +2197,27 @@ describe("orderRepository.resetFulfillmentPollErrors (integration)", () => {
     expect(persisted.fulfillmentErrorCount).toBe(0);
     expect(persisted.fulfillmentStatus).toBe("SUBMITTED");
     expect(persisted.status).toBe("PAID");
+  });
+
+  it("clears the erroring-tier re-poll key (fulfillmentErrorPolledAt) on reset — the recovery-return (#175)", async () => {
+    const tenant = await freshTenant();
+    // A still-erroring order carrying a re-poll key. A clean poll (this reset) is the recovery
+    // signal: it must null the key alongside the count so `findSubmittedForPolling` floats the
+    // order back to the FRESH tier (null key sorts first) rather than stranding it in the
+    // deprioritised erroring tail — the AC2 recovery-return, and the "non-null IFF count > 0"
+    // invariant restored.
+    const order = await seedSubmitted(tenant.id, {
+      fulfillmentErrorCount: 7,
+      fulfillmentErrorPolledAt: new Date(Date.now() - 30 * 60_000),
+    });
+
+    await orderRepository.resetFulfillmentPollErrors(tenant.id, order.id);
+
+    const persisted = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+    });
+    expect(persisted.fulfillmentErrorCount).toBe(0);
+    expect(persisted.fulfillmentErrorPolledAt).toBeNull();
   });
 
   it("does not touch an order that has left the work list (status guard)", async () => {
@@ -2404,22 +2460,33 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
   const minsAgo = (n: number) => new Date(Date.now() - n * 60_000);
 
   /** Seed a SUBMITTED+PAID order (the reconcilable state), across tenants. An optional
-   *  `fulfillmentErrorCount` seeds a getTracking-error streak for the #170 ordering tests. */
+   *  `fulfillmentErrorCount` seeds a getTracking-error streak for the #170/#175 ordering tests;
+   *  `errorPolledAt` pins the erroring-tier re-poll key (#175) for the rotation tests. To keep
+   *  the production invariant (`fulfillmentErrorPolledAt` non-null IFF the streak > 0) in seeds,
+   *  an erroring order (count > 0) always gets a re-poll key — the explicit `errorPolledAt`, or
+   *  its `createdAt` when a test doesn't pin one — so it lands in the erroring tier, never
+   *  mis-sorts as fresh. */
   function seedSubmitted(
     tenantId: string,
     opts: {
       createdAt?: Date;
       externalId?: string;
       fulfillmentErrorCount?: number;
+      errorPolledAt?: Date;
     } = {},
   ) {
+    const count = opts.fulfillmentErrorCount;
     return seedOrder(tenantId, {
       status: "PAID",
       fulfillmentStatus: "SUBMITTED",
       fulfillmentExternalId: opts.externalId ?? uniqueId("ext"),
       ...(opts.createdAt ? { createdAt: opts.createdAt } : {}),
-      ...(opts.fulfillmentErrorCount !== undefined
-        ? { fulfillmentErrorCount: opts.fulfillmentErrorCount }
+      ...(count !== undefined ? { fulfillmentErrorCount: count } : {}),
+      ...(count !== undefined && count > 0
+        ? {
+            fulfillmentErrorPolledAt:
+              opts.errorPolledAt ?? opts.createdAt ?? new Date(),
+          }
         : {}),
     });
   }
@@ -2541,50 +2608,108 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
     ).toEqual([stuckA.id, stuckB.id, stuckC.id]);
   });
 
-  it("deprioritises an erroring order behind fresh ones, ordered by error streak, even when it is older (#170/#163)", async () => {
+  it("sinks erroring orders behind fresh ones, ordered by re-poll key not error streak (#170 tier split, #175 rotation)", async () => {
     const t = await freshTenant();
     // An order whose getTracking throws every poll returns via `recordPollError` BEFORE
-    // `flagIfStuck`, so it is never flagged-stuck: its `fulfillmentStuckPolledAt` stays null
-    // and it shares the not-yet-flagged group with the fresh orders. Pre-#170, oldest-first
-    // ordering pinned such an order (old, having errored a while) to the FRONT of the batch
-    // every run, starving fresh orders. #170 sub-orders the null-key group by
-    // `fulfillmentErrorCount`, so fresh (count 0) polls before erroring (count > 0) — proven
-    // here by making the erroring orders the OLDEST-created (they'd win under createdAt alone).
+    // `flagIfStuck`, so it is never flagged-stuck: its `fulfillmentStuckPolledAt` stays null and
+    // it shares the not-yet-flagged group with the fresh orders. #170 sinks it behind fresh via
+    // the null-vs-non-null re-poll-key boundary; #175 orders the erroring tier itself by
+    // `fulfillmentErrorPolledAt` (the re-poll key), NOT the stable `fulfillmentErrorCount`. Proven
+    // by giving the HIGHER-count order the OLDER key: under #170's count sub-order errLow (3) would
+    // poll first, but the re-poll key puts errHigh (older key) first — count no longer drives it.
     const freshOld = await seedSubmitted(t.id, { createdAt: minsAgo(200) });
     const freshNew = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
-    const errLow = await seedSubmitted(t.id, {
-      createdAt: minsAgo(500),
-      fulfillmentErrorCount: 3,
-    });
     const errHigh = await seedSubmitted(t.id, {
-      createdAt: minsAgo(400),
+      createdAt: minsAgo(500),
       fulfillmentErrorCount: 80,
+      errorPolledAt: minsAgo(40), // older re-poll key → polls first within the erroring tier
+    });
+    const errLow = await seedSubmitted(t.id, {
+      createdAt: minsAgo(400),
+      fulfillmentErrorCount: 3,
+      errorPolledAt: minsAgo(20), // newer re-poll key → polls last
     });
 
     const mineInOrder = (await orderRepository.findSubmittedForPolling(100))
       .map((o) => o.id)
       .filter((id) =>
-        [freshOld.id, freshNew.id, errLow.id, errHigh.id].includes(id),
+        [freshOld.id, freshNew.id, errHigh.id, errLow.id].includes(id),
       );
-    // Fresh first (count 0, oldest createdAt first), THEN erroring by ascending streak
-    // (errLow's 3 before errHigh's 80) — even though BOTH erroring orders were created before
-    // both fresh ones, so createdAt alone would have polled the erroring pair first.
+    // Fresh first (null re-poll key, oldest createdAt first), THEN erroring by ascending re-poll
+    // key (errHigh's older key before errLow's newer one) — even though errHigh has the FAR higher
+    // streak (80 vs 3) and both erroring orders were created before both fresh ones.
     expect(mineInOrder).toEqual([
       freshOld.id,
       freshNew.id,
-      errLow.id,
       errHigh.id,
+      errLow.id,
     ]);
   });
 
-  it("orders the batch fresh, then erroring, then flagged-stuck (#170 three-tier order)", async () => {
+  it("rotates the erroring tier by re-poll key so no erroring order is starved past the batch limit (#175)", async () => {
     const t = await freshTenant();
-    // The full deprioritisation order: a fresh order, an erroring one (null stuck key,
-    // count > 0), and a flagged-stuck one (non-null `fulfillmentStuckPolledAt`). `nulls:
-    // "first"` floats the two null-key orders (fresh + erroring) ahead of the flagged one;
-    // within that null-key group #170's error-count sub-order puts fresh before erroring. Each
-    // later tier is created OLDER than the one before, so createdAt-ascending alone would sort
-    // them in the exact REVERSE order — proving the tier keys, not creation age, drive it.
+    // The #164-analogue for the erroring tier. Pre-#175 the tier keyed on the STABLE
+    // `fulfillmentErrorCount`, so within a >POLL_BATCH_SIZE erroring backlog a high-count order sat
+    // behind lower-count ones every run and never reached the take() window. #175 keys the tier on
+    // `fulfillmentErrorPolledAt`, which each error poll bumps — so re-polling ROTATES. Seed one
+    // fresh order + three erroring ones with EQUAL counts (proving count is irrelevant) and
+    // DISTINCT re-poll keys, ordered differently from createdAt to prove the key drives the tier.
+    const fresh = await seedSubmitted(t.id, { createdAt: minsAgo(50) });
+    const errA = await seedSubmitted(t.id, {
+      createdAt: minsAgo(500),
+      fulfillmentErrorCount: 5,
+      errorPolledAt: minsAgo(10),
+    });
+    const errB = await seedSubmitted(t.id, {
+      createdAt: minsAgo(400),
+      fulfillmentErrorCount: 5,
+      errorPolledAt: minsAgo(30),
+    });
+    const errC = await seedSubmitted(t.id, {
+      createdAt: minsAgo(300),
+      fulfillmentErrorCount: 5,
+      errorPolledAt: minsAgo(20),
+    });
+    const mine = (open: { id: string }[]) =>
+      open
+        .map((o) => o.id)
+        .filter((id) => [fresh.id, errA.id, errB.id, errC.id].includes(id));
+
+    // Run 1: fresh first, then the erroring tier by ascending re-poll key (B 30m, C 20m, A 10m).
+    expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
+      fresh.id,
+      errB.id,
+      errC.id,
+      errA.id,
+    ]);
+
+    // The poll re-polls the two least-recently-errored (B then C): each getTracking error runs
+    // `recordFulfillmentPollError`, bumping `fulfillmentErrorPolledAt` to now() → the BACK of the
+    // tier. A is untouched.
+    await orderRepository.recordFulfillmentPollError(t.id, errB.id);
+    await orderRepository.recordFulfillmentPollError(t.id, errC.id);
+
+    // Run 2: A (still 10m-ago key) now sorts BEFORE B and C (just bumped to ~now()) — the
+    // once-last erroring order is now first. No erroring order is pinned to the tier front across
+    // runs, so a >batch-size backlog can't permanently starve one. (B before C: B was re-polled
+    // first, so its key is fractionally older; the `createdAt` tiebreak — B older than C — settles
+    // any same-millisecond tie identically.)
+    expect(
+      mine(await orderRepository.findSubmittedForPolling(100)).filter(
+        (id) => id !== fresh.id,
+      ),
+    ).toEqual([errA.id, errB.id, errC.id]);
+  });
+
+  it("orders the batch fresh, then erroring, then flagged-stuck (#170/#175 three-tier order)", async () => {
+    const t = await freshTenant();
+    // The full deprioritisation order: a fresh order, an erroring one (null stuck key, count > 0
+    // → non-null re-poll key), and a flagged-stuck one (non-null `fulfillmentStuckPolledAt`). The
+    // PRIMARY stuck key's `nulls: "first"` floats the two null-stuck-key orders (fresh + erroring)
+    // ahead of the flagged one; within that group the SECONDARY `fulfillmentErrorPolledAt` (null
+    // for fresh, non-null for erroring since #175) puts fresh before erroring. Each later tier is
+    // created OLDER than the one before, so createdAt-ascending alone would sort them in the exact
+    // REVERSE order — proving the tier keys, not creation age, drive it.
     const fresh = await seedSubmitted(t.id, { createdAt: minsAgo(100) });
     const erroring = await seedSubmitted(t.id, {
       createdAt: minsAgo(300),
@@ -2605,35 +2730,41 @@ describe("orderRepository.findSubmittedForPolling (integration)", () => {
     expect(mineInOrder).toEqual([fresh.id, erroring.id, stuck.id]);
   });
 
-  it("floats a recovered order (streak reset to 0) back ahead of a still-erroring one (#170 AC2)", async () => {
+  it("floats a recovered order back to the fresh tier when its streak resets — the recovery-return (#175 AC2)", async () => {
     const t = await freshTenant();
-    // AC2: a deprioritised erroring order reconciles once its getTracking recovers. A clean
-    // poll resets `fulfillmentErrorCount` to 0 (#163), which — being the #170 sub-order key —
-    // floats the order straight back to the front of the not-yet-flagged group, so it polls
-    // (and can ship) at once rather than staying stuck behind other erroring orders.
+    // AC2: a deprioritised erroring order reconciles once its getTracking recovers. A clean poll
+    // resets the streak AND nulls `fulfillmentErrorPolledAt` (#163/#175) — the null key floats the
+    // order back to the FRESH tier so it polls (and can ship) at once, rather than lingering in the
+    // erroring tail. Give `recovered` the NEWER re-poll key (so it polls LAST in the tier before
+    // recovery) — its jump to the FRONT is then unambiguously the reset, not its prior position.
     const recovered = await seedSubmitted(t.id, {
       createdAt: minsAgo(100),
       fulfillmentErrorCount: 50,
+      errorPolledAt: minsAgo(10),
     });
     const stillErroring = await seedSubmitted(t.id, {
       createdAt: minsAgo(400),
       fulfillmentErrorCount: 10,
+      errorPolledAt: minsAgo(30),
     });
     const mine = (open: { id: string }[]) =>
       open
         .map((o) => o.id)
         .filter((id) => [recovered.id, stillErroring.id].includes(id));
 
-    // Before recovery: lower streak first (stillErroring's 10 before recovered's 50).
+    // Before recovery: erroring tier ordered by re-poll key — stillErroring's older key (30m)
+    // before recovered's newer one (10m).
     expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
       stillErroring.id,
       recovered.id,
     ]);
 
-    // A clean poll zeroes the streak (what `resetFulfillmentPollErrors` does on recovery).
+    // A clean poll resets the streak AND nulls the re-poll key (what `resetFulfillmentPollErrors`
+    // does on recovery).
     await orderRepository.resetFulfillmentPollErrors(t.id, recovered.id);
 
-    // Now recovered (count 0 = fresh) sorts ahead of the still-erroring order (count 10).
+    // Now recovered (null key → fresh tier) sorts ahead of the still-erroring order — even though
+    // it had the NEWER re-poll key a moment ago. The recovery-return is immediate.
     expect(mine(await orderRepository.findSubmittedForPolling(100))).toEqual([
       recovered.id,
       stillErroring.id,
