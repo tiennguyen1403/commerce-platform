@@ -51,6 +51,9 @@ function productRow(
     createdAt: new Date("2025-01-01T00:00:00.000Z"),
     updatedAt: new Date("2025-01-01T00:00:00.000Z"),
     variants: [],
+    // `findBySlug` now includes the gallery images (M5 #186); an image-less
+    // product is the empty set, so the fixture carries one to match the type.
+    images: [],
   };
 }
 
