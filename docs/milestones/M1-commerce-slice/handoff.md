@@ -90,7 +90,7 @@ a real Stripe test-mode purchase; an admin manages the catalog behind auth.
 
 ## Key decisions
 
-Also appended to the `docs/ARCHITECTURE.md` §8 decision log.
+Also appended to the `docs/ARCHITECTURE.md` §9 decision log.
 
 - **Embedded Stripe PaymentIntent + Payment Element**, not hosted Checkout Sessions — full
   control over the success-page verification and the order-write timing; costs more

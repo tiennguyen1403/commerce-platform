@@ -196,7 +196,7 @@ evidence.
 
 ## Key decisions
 
-Also appended to the `docs/ARCHITECTURE.md` §8 decision log.
+Also appended to the `docs/ARCHITECTURE.md` §9 decision log.
 
 - **Subdomain tenant resolution — "Model A"** — the tenant is resolved from the request
   `Host` in the proxy, which strips any inbound `x-tenant-slug` before injecting the

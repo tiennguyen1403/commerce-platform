@@ -185,7 +185,7 @@ evidence.
 
 ## Key decisions
 
-Also appended to the `docs/ARCHITECTURE.md` §8 decision log.
+Also appended to the `docs/ARCHITECTURE.md` §9 decision log.
 
 - **Provider seam: a `FulfillmentProvider` interface, mock-first** — a deterministic
   `MockProvider` is the CI/test default and dev fallback; the real `PrintfulProvider` (v1

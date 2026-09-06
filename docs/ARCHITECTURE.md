@@ -123,7 +123,55 @@ faster shipping, less payment-processor risk.
 - **Notification.** A `SHIPPING_CONFIRMATION` email is enqueued in the same transaction as
   the `FULFILLED` reconcile and delivered by the existing outbox drain.
 
-## 7. Environments & config
+## 7. Media (M5)
+
+`src/server/storage/provider.ts` defines the `StorageProvider` interface
+(`getUploadUrl`/`delete`). A local-disk `MockStorageProvider` (the CI/test default and dev
+fallback, no network) and the real `VercelBlobStorageProvider` (presigned-URL) both
+implement it; `getStorageProvider()` (`src/server/storage/index.ts`) selects between them
+purely by `BLOB_READ_WRITE_TOKEN` presence — the exact mirror of §6's fulfillment seam — so
+nothing above the boundary (the admin image manager, the catalog reads, `next/image`)
+changes when the real bucket turns on. With no token, dev/test falls back to the mock and
+production returns `null` → `StorageNotConfiguredError` at the upload boundary (the analogue
+of `FulfillmentNotConfiguredError`).
+
+- **Upload.** Image bytes never pass through a Server Action (whose ~1 MB body cap would
+  defeat CDN offload). The admin image manager (`product-image-manager.tsx`, edit-mode only)
+  runs a three-step, client-orchestrated flow: a first Server Action returns a direct-`PUT`
+  upload target (`imageService.requestUpload` — a short-lived presigned URL from the real
+  Blob provider, or the same-origin sink URL from the local mock — with the per-product count
+  cap and content-type/size validated up front), the browser `PUT`s the raw bytes straight to
+  storage, then a second Server Action persists the `ProductImage` row from the returned
+  `{ url, key, width, height }`. This keeps the write on the same
+  `requireAdminContext → zod → service → repository` path as every other mutation, with **no
+  webhook** (Vercel Blob's `onUploadCompleted` never fires on localhost/CI). Pixel dimensions
+  are measured client-side (`new Image()`), because a remote `next/image` needs them supplied.
+- **Isolation.** `ProductImage` carries its own `tenantId` (a deliberate divergence from
+  `ProductVariant`, which has none), so every image read/write is tenant-scoped like any other
+  business table. The storage key is namespaced
+  `tenants/<tenantId>/products/<productId>/<random>-<slug>.<ext>` (`buildObjectKey`,
+  `src/server/storage/object-key.ts`) — the same shape both providers mint, so the sink, the
+  delete, and the public URL all agree on one object identity, and `imageService.addImage`
+  refuses a key outside the caller's tenant prefix (the cross-tenant-injection gate).
+- **Rendering.** The storefront renders through one shared `ProductImageFrame`
+  (`src/app/(storefront)/products/product-image.tsx`), used by both the card and the PDP
+  gallery: `next/image` with `fill` + `object-cover` when an image exists, the lucide
+  placeholder icon when the product has none. A same-origin/root-relative `src` (the mock's
+  `/uploads/…`, or seed images) is rendered `unoptimized` (`isUnoptimizedImageSrc`), so the
+  `sharp`-requiring optimizer is never hit in dev/CI; only remote `https` (real Blob) is
+  optimized — by Vercel's infrastructure in production, via an `images.remotePatterns` entry.
+  The LCP image (the first card, the PDP main image) uses Next 16's `preload`, not the
+  deprecated `priority`.
+- **Local mock sink.** The mock's `uploadUrl` points at a dev/test-only route
+  (`PUT /api/uploads/local/[...key]`) that writes the `PUT`ed bytes under `public/uploads/**`
+  for Next to serve static at `/uploads/<key>` (the `publicUrl`). It is disabled in production
+  (404) — the exact mirror of the selector returning `null` there — and treats the
+  URL-supplied key as hostile: a traversal-safe path resolver, an image-extension allowlist,
+  and the same size cap as the sign step (`resolveLocalUploadPath`, defence in depth). So the
+  whole upload→render flow stays exercisable end to end with no bucket, token, or `sharp`; the
+  E2E (`e2e/product-images.spec.ts`) drives exactly that. See the M5 decision log entry below.
+
+## 8. Environments & config
 
 - `src/lib/env.ts` validates server env once at startup (zod) and is `server-only`.
 - Local Postgres via `docker-compose.yml` on host port **55432**.
@@ -132,7 +180,7 @@ faster shipping, less payment-processor risk.
 - Migration safety (the `NOT NULL`/`DEFAULT` convention, the CI guard, and how to deploy
   onto a pre-seeded database) lives in [`docs/DATABASE.md`](DATABASE.md).
 
-## 8. Decision log
+## 9. Decision log
 
 - **Next fullstack (not a separate API) for now** — velocity; the clean service/repository
   split lets us extract a NestJS API later if a backend-heavy role calls for it.
@@ -291,5 +339,21 @@ faster shipping, less payment-processor risk.
   read-only `costs`). True per-currency _settlement_ — a Printful store per currency, or
   Stripe Connect payouts — stays the deferred single-account upgrade (see §2, "Stripe
   Connect remains a deliberately deferred upgrade").
+- **Storage provider seam: a `StorageProvider` interface, mock-first** (M5) — a local-disk
+  `MockStorageProvider` is the CI/test default and dev fallback (no bucket, no network,
+  images rendered `unoptimized` so `sharp` is never needed); the real
+  `VercelBlobStorageProvider` (presigned-URL `PUT`) is selected purely by
+  `BLOB_READ_WRITE_TOKEN` presence (`getStorageProvider`, `src/server/storage/index.ts`) —
+  the exact mirror of the fulfillment seam. Nothing above the boundary (the admin manager,
+  catalog reads, `next/image`) changes when the real bucket turns on.
+- **Vercel Blob over Cloudflare R2** (M5) — the app already deploys on Vercel, so Blob adds
+  no new account or DNS; its presigned-URL primitives (`issueSignedToken` + `presignUrl`) are
+  callable from a plain Server Action, so image writes stay on the repo's all-Server-Action
+  mutation path with **zero new route handlers and no webhook** (Blob's `onUploadCompleted`
+  never fires on localhost/CI); and its free tier has a hard, non-billing cap. R2 (the
+  runner-up, reachable behind the same seam) is the stronger portable-S3 CV signal but needs
+  a Cloudflare account, a custom domain for public reads, and the heaviest SDK — so the seam
+  makes swapping to it a one-adapter change rather than the default. See
+  `docs/milestones/M5-product-images/research.md`.
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).
