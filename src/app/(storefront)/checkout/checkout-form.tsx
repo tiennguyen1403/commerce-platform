@@ -6,6 +6,7 @@ import {
   useState,
   type ComponentProps,
   type FormEvent,
+  type ReactNode,
 } from "react";
 import { loadStripe } from "@stripe/stripe-js";
 import {
@@ -14,7 +15,15 @@ import {
   useElements,
   useStripe,
 } from "@stripe/react-stripe-js";
-import { Check, Loader2, Lock } from "lucide-react";
+import {
+  Check,
+  CreditCard,
+  Loader2,
+  Lock,
+  Mail,
+  Truck,
+  type LucideIcon,
+} from "lucide-react";
 import {
   checkoutInputSchema,
   SHIPPING_COUNTRIES,
@@ -23,6 +32,7 @@ import {
 } from "@/lib/validators/checkout";
 import { cn, formatMoney } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -164,25 +174,29 @@ export function CheckoutForm() {
   // Phase 2: the PaymentIntent exists — mount the Payment Element for it.
   if (started) {
     return (
-      <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-4">
         <CheckoutSteps current={2} />
-        <div className="flex flex-col gap-4">
-          {/* A read-back of what was collected in step one, before the card. */}
-          <dl className="border-border bg-muted/40 flex flex-col gap-2 rounded-lg border px-4 py-3 text-sm">
-            <div className="flex items-start justify-between gap-4">
-              <dt className="text-muted-foreground shrink-0">Contact</dt>
-              <dd className="text-right font-medium">{email}</dd>
-            </div>
-            <div className="flex items-start justify-between gap-4">
-              <dt className="text-muted-foreground shrink-0">Ship to</dt>
-              <dd className="text-right font-medium">
-                {address.name} ·{" "}
-                {[address.city, address.state, address.postalCode]
-                  .filter(Boolean)
-                  .join(", ")}
-              </dd>
-            </div>
-          </dl>
+        {/* A read-back of what was collected in step one, before the card. */}
+        <dl className="border-border bg-muted/40 flex flex-col gap-2 rounded-lg border px-4 py-3 text-sm">
+          <div className="flex items-start justify-between gap-4">
+            <dt className="text-muted-foreground shrink-0">Contact</dt>
+            <dd className="text-right font-medium">{email}</dd>
+          </div>
+          <div className="flex items-start justify-between gap-4">
+            <dt className="text-muted-foreground shrink-0">Ship to</dt>
+            <dd className="text-right font-medium">
+              {address.name} ·{" "}
+              {[address.city, address.state, address.postalCode]
+                .filter(Boolean)
+                .join(", ")}
+            </dd>
+          </div>
+        </dl>
+        <SectionPanel
+          icon={CreditCard}
+          title="Payment"
+          description="Enter your card details to place the order."
+        >
           <Elements
             stripe={stripePromise}
             options={{
@@ -195,7 +209,7 @@ export function CheckoutForm() {
               currency={started.currency}
             />
           </Elements>
-        </div>
+        </SectionPanel>
       </div>
     );
   }
@@ -203,159 +217,200 @@ export function CheckoutForm() {
   // Phase 1: collect the email + shipping address; submitting validates them and
   // creates the intent + PENDING order (with the address) server-side.
   return (
-    <form onSubmit={onStart} className="flex flex-col gap-6" noValidate>
+    <div className="flex flex-col gap-4">
       <CheckoutSteps current={1} />
-
-      <fieldset className="flex flex-col gap-4">
-        <legend className="text-base font-semibold tracking-tight">
-          Contact
-        </legend>
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor="email">Email</Label>
-          <Input
-            id="email"
-            name="email"
-            type="email"
-            autoComplete="email"
-            placeholder="you@example.com"
-            aria-invalid={fieldErrors.email ? true : undefined}
-            aria-describedby={fieldErrors.email ? "email-error" : undefined}
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-            required
-          />
-          {fieldErrors.email ? (
-            <p
-              id="email-error"
-              role="alert"
-              className="text-destructive text-sm"
-            >
-              {fieldErrors.email}
-            </p>
-          ) : (
-            <p className="text-muted-foreground text-xs">
-              Your receipt and order updates go here.
-            </p>
-          )}
-        </div>
-      </fieldset>
-
-      <fieldset className="flex flex-col gap-4">
-        <legend className="text-base font-semibold tracking-tight">
-          Shipping address
-        </legend>
-
-        <TextField
-          id="ship-name"
-          label="Full name"
-          autoComplete="name"
-          value={address.name}
-          onValueChange={setField("name")}
-          error={fieldErrors.name}
-        />
-        <TextField
-          id="ship-line1"
-          label="Address"
-          autoComplete="address-line1"
-          placeholder="123 Main St"
-          value={address.line1}
-          onValueChange={setField("line1")}
-          error={fieldErrors.line1}
-        />
-        <TextField
-          id="ship-line2"
-          label="Apartment, suite, etc."
-          optional
-          autoComplete="address-line2"
-          value={address.line2}
-          onValueChange={setField("line2")}
-          error={fieldErrors.line2}
-        />
-        <div className="grid gap-4 sm:grid-cols-2">
-          <TextField
-            id="ship-city"
-            label="City"
-            autoComplete="address-level2"
-            value={address.city}
-            onValueChange={setField("city")}
-            error={fieldErrors.city}
-          />
-          <TextField
-            id="ship-state"
-            label="State"
-            autoComplete="address-level1"
-            value={address.state}
-            onValueChange={setField("state")}
-            error={fieldErrors.state}
-          />
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <TextField
-            id="ship-postal"
-            label="ZIP code"
-            inputMode="numeric"
-            autoComplete="postal-code"
-            placeholder="94103"
-            value={address.postalCode}
-            onValueChange={setField("postalCode")}
-            error={fieldErrors.postalCode}
-          />
+      <form onSubmit={onStart} className="flex flex-col gap-4" noValidate>
+        <SectionPanel
+          icon={Mail}
+          title="Contact"
+          description="Where your receipt and order updates are sent."
+        >
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="ship-country">Country</Label>
-            <Select
-              value={address.country}
-              onValueChange={(next) => {
-                if (next) setField("country")(next);
-              }}
-            >
-              <SelectTrigger
-                id="ship-country"
-                className="w-full"
-                aria-invalid={fieldErrors.country ? true : undefined}
-                aria-describedby={
-                  fieldErrors.country ? "ship-country-error" : undefined
-                }
-              >
-                <SelectValue>
-                  {(value) => countryLabel(value as string)}
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {SHIPPING_COUNTRIES.map((code) => (
-                  <SelectItem key={code} value={code}>
-                    {SHIPPING_COUNTRY_LABELS[code]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {fieldErrors.country ? (
+            <Label htmlFor="email">Email</Label>
+            <Input
+              id="email"
+              name="email"
+              type="email"
+              autoComplete="email"
+              placeholder="you@example.com"
+              aria-invalid={fieldErrors.email ? true : undefined}
+              aria-describedby={fieldErrors.email ? "email-error" : undefined}
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              required
+            />
+            {fieldErrors.email ? (
               <p
-                id="ship-country-error"
+                id="email-error"
                 role="alert"
                 className="text-destructive text-sm"
               >
-                {fieldErrors.country}
+                {fieldErrors.email}
               </p>
             ) : null}
           </div>
-        </div>
-      </fieldset>
+        </SectionPanel>
 
-      {error ? (
-        <p role="alert" className="text-destructive text-sm">
-          {error}
-        </p>
-      ) : null}
-      <div className="flex flex-col gap-2">
-        <Button type="submit" size="lg" disabled={pending} className="w-full">
-          {pending ? <Loader2 className="animate-spin" /> : null}
-          Continue to payment
-        </Button>
-        <p className="text-muted-foreground text-center text-xs">
-          You won&apos;t be charged until you confirm payment.
-        </p>
-      </div>
-    </form>
+        <SectionPanel
+          icon={Truck}
+          title="Shipping address"
+          description="Where we'll ship your order."
+        >
+          <div className="flex flex-col gap-4">
+            <TextField
+              id="ship-name"
+              label="Full name"
+              autoComplete="name"
+              value={address.name}
+              onValueChange={setField("name")}
+              error={fieldErrors.name}
+            />
+            <TextField
+              id="ship-line1"
+              label="Address"
+              autoComplete="address-line1"
+              placeholder="123 Main St"
+              value={address.line1}
+              onValueChange={setField("line1")}
+              error={fieldErrors.line1}
+            />
+            <TextField
+              id="ship-line2"
+              label="Apartment, suite, etc."
+              optional
+              autoComplete="address-line2"
+              value={address.line2}
+              onValueChange={setField("line2")}
+              error={fieldErrors.line2}
+            />
+            <TextField
+              id="ship-city"
+              label="City"
+              autoComplete="address-level2"
+              value={address.city}
+              onValueChange={setField("city")}
+              error={fieldErrors.city}
+            />
+            <div className="grid gap-4 sm:grid-cols-2">
+              <TextField
+                id="ship-state"
+                label="State"
+                autoComplete="address-level1"
+                value={address.state}
+                onValueChange={setField("state")}
+                error={fieldErrors.state}
+              />
+              <TextField
+                id="ship-postal"
+                label="ZIP code"
+                inputMode="numeric"
+                autoComplete="postal-code"
+                placeholder="94103"
+                value={address.postalCode}
+                onValueChange={setField("postalCode")}
+                error={fieldErrors.postalCode}
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="ship-country">Country</Label>
+              <Select
+                value={address.country}
+                onValueChange={(next) => {
+                  if (next) setField("country")(next);
+                }}
+              >
+                <SelectTrigger
+                  id="ship-country"
+                  className="w-full"
+                  aria-invalid={fieldErrors.country ? true : undefined}
+                  aria-describedby={
+                    fieldErrors.country ? "ship-country-error" : undefined
+                  }
+                >
+                  <SelectValue>
+                    {(value) => countryLabel(value as string)}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {SHIPPING_COUNTRIES.map((code) => (
+                    <SelectItem key={code} value={code}>
+                      {SHIPPING_COUNTRY_LABELS[code]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {fieldErrors.country ? (
+                <p
+                  id="ship-country-error"
+                  role="alert"
+                  className="text-destructive text-sm"
+                >
+                  {fieldErrors.country}
+                </p>
+              ) : null}
+            </div>
+          </div>
+        </SectionPanel>
+
+        {error ? (
+          <p role="alert" className="text-destructive text-sm">
+            {error}
+          </p>
+        ) : null}
+        <div className="flex flex-col gap-2">
+          <Button type="submit" size="lg" disabled={pending} className="w-full">
+            {pending ? <Loader2 className="animate-spin" /> : null}
+            Continue to payment
+          </Button>
+          <p className="text-muted-foreground text-center text-xs">
+            You won&apos;t be charged until you confirm payment.
+          </p>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/** A titled section card — an icon chip, a heading + one-line description, then
+ *  the section's fields. Checkout's three sections (Contact, Shipping address,
+ *  Payment) share this shell so their headers, spacing and grouping stay
+ *  identical. `role="group"` + the heading name the group for assistive tech. */
+function SectionPanel({
+  icon: Icon,
+  title,
+  description,
+  children,
+}: {
+  icon: LucideIcon;
+  title: string;
+  description: string;
+  children: ReactNode;
+}) {
+  const headingId = `checkout-${title.toLowerCase().replace(/\s+/g, "-")}`;
+  return (
+    <Card>
+      <CardContent
+        role="group"
+        aria-labelledby={headingId}
+        className="flex flex-col gap-4"
+      >
+        <div className="flex items-start gap-3">
+          <span className="bg-accent text-primary flex size-9 shrink-0 items-center justify-center rounded-lg">
+            <Icon className="size-5" aria-hidden />
+          </span>
+          <div className="flex flex-col gap-0.5">
+            <h2
+              id={headingId}
+              className="text-base font-semibold tracking-tight"
+            >
+              {title}
+            </h2>
+            <p className="text-muted-foreground text-sm">{description}</p>
+          </div>
+        </div>
+        {children}
+      </CardContent>
+    </Card>
   );
 }
 

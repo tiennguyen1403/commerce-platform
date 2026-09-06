@@ -92,11 +92,7 @@ export default async function CheckoutPage() {
             </div>
           ) : null}
 
-          <Card>
-            <CardContent className="py-6">
-              <CheckoutForm />
-            </CardContent>
-          </Card>
+          <CheckoutForm />
 
           <Button
             variant="ghost"
