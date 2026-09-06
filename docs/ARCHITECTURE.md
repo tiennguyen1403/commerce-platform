@@ -152,7 +152,10 @@ of `FulfillmentNotConfiguredError`).
   `tenants/<tenantId>/products/<productId>/<random>-<slug>.<ext>` (`buildObjectKey`,
   `src/server/storage/object-key.ts`) — the same shape both providers mint, so the sink, the
   delete, and the public URL all agree on one object identity, and `imageService.addImage`
-  refuses a key outside the caller's tenant prefix (the cross-tenant-injection gate).
+  refuses a key outside the caller's tenant prefix OR carrying an interior traversal
+  segment (`isSafeObjectKey`, same file — a prefix check alone would pass
+  `tenants/<me>/../<victim>/…`; hardened post-launch as #201/PR #202) — the
+  cross-tenant-injection gate.
 - **Rendering.** The storefront renders through one shared `ProductImageFrame`
   (`src/app/(storefront)/products/product-image.tsx`), used by both the card and the PDP
   gallery: `next/image` with `fill` + `object-cover` when an image exists, the lucide
