@@ -87,6 +87,9 @@ export const cartService = {
         qty,
         lineTotalCents: variant.priceCents * qty,
         available,
+        // Primary image (repo reads it with `take: 1`) for the cart-row
+        // thumbnail; `null` when the product has no images. Display-only.
+        image: variant.product.images[0] ?? null,
       });
     }
 

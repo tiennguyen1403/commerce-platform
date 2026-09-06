@@ -35,6 +35,9 @@ function variantRow(
     status?: ProductStatus;
     slug?: string;
     title?: string;
+    // Primary image the repo returns (`take: 1`). Omit for a product with no
+    // images (the common case); `images` then reads as an empty array.
+    image?: { url: string; altText: string | null };
   } = {},
 ): VariantRow {
   const id = o.id ?? "var_1";
@@ -54,6 +57,7 @@ function variantRow(
       title: o.title ?? "Default product",
       slug: o.slug ?? "default-product",
       status: o.status ?? "ACTIVE",
+      images: o.image ? [o.image] : [],
     },
   };
 }
@@ -114,6 +118,28 @@ describe("cartService.getCartView", () => {
     expect(view.itemCount).toBe(2);
     expect(view.removedCount).toBe(0);
     expect(view.adjusted).toBe(false);
+  });
+
+  it("threads the product's primary image onto the line, or null when it has none", async () => {
+    findVariants.mockResolvedValue([
+      variantRow({
+        id: "withImg",
+        image: { url: "/seed/tee.jpg", altText: "A blue tee" },
+      }),
+      variantRow({ id: "noImg" }),
+    ]);
+
+    const view = await cartService.getCartView(
+      TENANT,
+      [line("withImg", 1), line("noImg", 1)],
+      "usd",
+    );
+
+    expect(view.items[0].image).toEqual({
+      url: "/seed/tee.jpg",
+      altText: "A blue tee",
+    });
+    expect(view.items[1].image).toBeNull();
   });
 
   it("clamps a line down to available stock and flags the adjustment", async () => {
