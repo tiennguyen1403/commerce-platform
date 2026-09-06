@@ -8,6 +8,7 @@ import { TENANT_THEME_PORTAL_ATTR } from "@/lib/theme";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuLinkItem,
@@ -69,12 +70,17 @@ export function AccountMenu({
         // marker to keep the store's accent (single source of truth in @/lib/theme).
         {...{ [TENANT_THEME_PORTAL_ATTR]: "" }}
       >
-        <DropdownMenuLabel className="flex flex-col gap-0.5">
-          <span className="text-foreground truncate font-medium">
-            {name || "Your account"}
-          </span>
-          <span className="truncate font-normal">{email}</span>
-        </DropdownMenuLabel>
+        {/* Base UI's Menu.GroupLabel (our DropdownMenuLabel) requires a
+            Menu.Group ancestor for its context — rendering it bare throws at
+            runtime (Base UI error #31). Wrap the identity header in a group. */}
+        <DropdownMenuGroup>
+          <DropdownMenuLabel className="flex flex-col gap-0.5">
+            <span className="text-foreground truncate font-medium">
+              {name || "Your account"}
+            </span>
+            <span className="truncate font-normal">{email}</span>
+          </DropdownMenuLabel>
+        </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuLinkItem
           closeOnClick

@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuLabel,
   DropdownMenuLinkItem,
   DropdownMenuSeparator,
@@ -51,29 +52,34 @@ export function StoreSwitcher({
         <ChevronsUpDown className="size-4" aria-hidden />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" sideOffset={8} className="min-w-60">
-        <DropdownMenuLabel>Switch store</DropdownMenuLabel>
-        {stores.map((store) => {
-          const isCurrent = store.slug === currentSlug;
-          return (
-            <DropdownMenuLinkItem
-              key={store.slug}
-              closeOnClick
-              aria-current={isCurrent ? "page" : undefined}
-              render={<Link href={`/admin/${store.slug}`} />}
-              className={cn(isCurrent && "bg-accent/40")}
-            >
-              <Store className="text-muted-foreground" aria-hidden />
-              <span className="min-w-0 flex-1 truncate">{store.name}</span>
-              <span className="text-muted-foreground shrink-0 text-xs">
-                {ROLE_LABELS[store.role]}
-              </span>
-              <Check
-                className={cn("text-primary", !isCurrent && "invisible")}
-                aria-hidden
-              />
-            </DropdownMenuLinkItem>
-          );
-        })}
+        {/* Base UI's Menu.GroupLabel (DropdownMenuLabel) requires a Menu.Group
+            ancestor or it throws at runtime (Base UI error #31); the label heads
+            the store list, so group them together. */}
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Switch store</DropdownMenuLabel>
+          {stores.map((store) => {
+            const isCurrent = store.slug === currentSlug;
+            return (
+              <DropdownMenuLinkItem
+                key={store.slug}
+                closeOnClick
+                aria-current={isCurrent ? "page" : undefined}
+                render={<Link href={`/admin/${store.slug}`} />}
+                className={cn(isCurrent && "bg-accent/40")}
+              >
+                <Store className="text-muted-foreground" aria-hidden />
+                <span className="min-w-0 flex-1 truncate">{store.name}</span>
+                <span className="text-muted-foreground shrink-0 text-xs">
+                  {ROLE_LABELS[store.role]}
+                </span>
+                <Check
+                  className={cn("text-primary", !isCurrent && "invisible")}
+                  aria-hidden
+                />
+              </DropdownMenuLinkItem>
+            );
+          })}
+        </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuLinkItem closeOnClick render={<Link href="/new" />}>
           <Plus className="text-muted-foreground" aria-hidden />
