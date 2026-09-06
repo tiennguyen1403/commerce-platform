@@ -68,3 +68,32 @@ export function buildObjectKey(input: GetUploadUrlInput): string {
   const slug = safeFileNameSlug(input.fileName);
   return `tenants/${input.tenantId}/products/${input.productId}/${randomUUID()}-${slug}.${extension}`;
 }
+
+/**
+ * True iff `key` is a **traversal-free** object key: every `/`-separated segment is
+ * non-empty and is not `.`/`..` and carries no `\` or NUL byte — so the key can never
+ * step out of its `tenants/<tenantId>/…` namespace on ANY provider. This is the same
+ * per-segment rule `resolveLocalUploadPath` (`local-path.ts`) enforces at the local
+ * sink's filesystem boundary; keeping it here too means the invariant is shared rather
+ * than living only in the mock's resolver.
+ *
+ * `buildObjectKey` always produces a key that satisfies this (cuid tenant/product ids,
+ * a UUID, and a `[a-z0-9-]` slug — no traversal segment can occur), so it is a no-op
+ * for a well-formed key. It exists for the ONE untrusted entry point: `addImage`
+ * re-checks a client-echoed key against it (alongside the `tenants/<tenantId>/` prefix
+ * pin) before the key can be stored and later reach `provider.delete(key)`. A
+ * prefix-only check would pass a key like `tenants/<me>/../<victim>/…` — starts with
+ * the right prefix, yet an interior `..` names another tenant's namespace — which the
+ * Vercel Blob adapter's `del` would forward verbatim (golden rule 1).
+ */
+export function isSafeObjectKey(key: string): boolean {
+  const segments = key.split("/");
+  return segments.every(
+    (segment) =>
+      segment.length > 0 &&
+      segment !== "." &&
+      segment !== ".." &&
+      !segment.includes("\\") &&
+      !segment.includes("\0"),
+  );
+}

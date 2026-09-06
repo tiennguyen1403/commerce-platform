@@ -3,7 +3,11 @@ import {
   imageRepository,
   type CreateImageInput,
 } from "@/server/repositories/image.repository";
-import { getStorageProvider, type GetUploadUrlResult } from "@/server/storage";
+import {
+  getStorageProvider,
+  isSafeObjectKey,
+  type GetUploadUrlResult,
+} from "@/server/storage";
 import {
   ALLOWED_IMAGE_CONTENT_TYPES,
   MAX_IMAGE_SIZE_BYTES,
@@ -135,12 +139,20 @@ export const imageService = {
    * the `key` — which later drives `provider.delete(key)`, and whose value is
    * visible in a store's public image URLs — we re-pin it to THIS tenant's object
    * namespace. The storage seam guarantees keys are `tenants/<tenantId>/…`
-   * (`storage/provider.ts`), so a key outside it is a tampered payload that could
-   * otherwise let a later delete reach another tenant's object; refuse it up front
-   * (golden rule 1). `url` is separately allowlist-checked at the schema boundary.
+   * (`storage/provider.ts`), so a key outside it — a wrong prefix, OR the right
+   * prefix with an interior `..`/traversal segment that still resolves into another
+   * tenant (`isSafeObjectKey`) — is a tampered payload that could otherwise let a
+   * later delete reach another tenant's object; refuse it up front (golden rule 1).
+   * A prefix check alone is insufficient (the open-redirect lesson, #103/#128): a
+   * key `tenants/<me>/../<victim>/…` starts with the pinned prefix yet escapes it,
+   * and the Blob adapter forwards the key verbatim to `del`. `url` is separately
+   * allowlist-checked at the schema boundary.
    */
   async addImage(tenantId: string, productId: string, input: AddImageInput) {
-    if (!input.key.startsWith(`tenants/${tenantId}/`)) {
+    if (
+      !input.key.startsWith(`tenants/${tenantId}/`) ||
+      !isSafeObjectKey(input.key)
+    ) {
       throw new InvalidImageKeyError();
     }
     const image = await imageRepository.createImage(tenantId, productId, input);
