@@ -69,6 +69,30 @@ Server Action, query, and tenant scope untouched.
 - The **admin dashboard** redesign — its own later track (denser context).
 - A real per-tenant storefront landing page (a product/content decision, not a restyle).
 
+## Exceptions to UI-only (explicitly noted)
+
+_The one place this milestone's "restyle presentation, never touch data" rule was
+deliberately crossed, per the escape hatch in Out of scope above._
+
+- **M6-05 · cart-row thumbnail read (#210).** The cart read
+  (`cartService.getCartView` → `productRepository.findVariantsForTenant`) carried **no
+  image data**, so the per-row thumbnail the issue calls for needed a **minimal read
+  addition** — taken here rather than deferred (the issue's guardrail allowed either).
+  Scope of the exception, kept as small as possible:
+  - `findVariantsForTenant` now also selects the product's **primary image only**
+    (`images` ordered by `position`, `take: 1`, `url`/`altText` fields) — never the whole
+    gallery.
+  - `CartItem` gains a **display-only** `image` field; `getCartView` maps
+    `variant.product.images[0] ?? null` onto it.
+  - No pricing/reconciliation logic, tenant scope, or Server Action contract changed.
+    `CartItems` still takes `CartItem[]` and calls `updateQtyAction` /
+    `removeFromCartAction` unchanged, so the E2E selectors (incl. "Checkout") are intact.
+  - The same widened read already backs the **checkout** summary (it shares
+    `getCartView`), so M6-06 can add its thumbnails with **no further query change**.
+    `cartService.resolveLine` (the add/update mutation path) also calls
+    `findVariantsForTenant` and simply ignores the extra image field — a one-row
+    over-fetch, the accepted cost of keeping a single tenant-scoped repo method.
+
 ## Exit criteria
 
 _Finalized at `/milestone-start`. Adjust only with a note here if building forces a change._

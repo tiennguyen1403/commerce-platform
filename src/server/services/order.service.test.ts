@@ -106,6 +106,7 @@ function cartItem(o: Partial<CartItem> = {}): CartItem {
     qty: 2,
     lineTotalCents: 3000,
     available: 10,
+    image: null,
     ...o,
   };
 }
