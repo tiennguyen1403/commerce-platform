@@ -207,7 +207,9 @@ export function CheckoutForm() {
       <CheckoutSteps current={1} />
 
       <fieldset className="flex flex-col gap-4">
-        <legend className="text-sm font-medium">Contact</legend>
+        <legend className="text-base font-semibold tracking-tight">
+          Contact
+        </legend>
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="email">Email</Label>
           <Input
@@ -239,7 +241,9 @@ export function CheckoutForm() {
       </fieldset>
 
       <fieldset className="flex flex-col gap-4">
-        <legend className="text-sm font-medium">Shipping address</legend>
+        <legend className="text-base font-semibold tracking-tight">
+          Shipping address
+        </legend>
 
         <TextField
           id="ship-name"
