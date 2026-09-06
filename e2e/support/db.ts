@@ -125,3 +125,29 @@ export async function deleteOnboardingArtifacts(prefix: string): Promise<void> {
   await db().tenant.deleteMany({ where: { slug: { startsWith: prefix } } });
   await db().user.deleteMany({ where: { email: { startsWith: prefix } } });
 }
+
+// --- Product images (upload→render E2E) -------------------------------------
+
+/**
+ * Delete every `ProductImage` on a seeded demo product, scoped to the demo
+ * tenant. The image-upload spec uploads to a normally image-less seeded product
+ * (`enamel-mug`), which — unlike the onboarding spec's throwaway tenant — is a
+ * persistent seed row, so a local rerun would otherwise start with the image a
+ * prior run left behind. Called from the spec's `beforeAll` (start clean, self-
+ * healing an interrupted run) and `afterAll` (leave the seed as found). CI is
+ * unaffected either way: it reseeds a throwaway database every run.
+ *
+ * `deleteMany` is a no-op when nothing matches. Only the DB rows are removed; the
+ * on-disk bytes under `public/uploads/**` (the local mock's sink target) are
+ * gitignored, dev/test-only throwaways and need no cleanup — the row is what the
+ * storefront renders.
+ */
+export async function deleteProductImagesBySlug(
+  productSlug: string,
+): Promise<void> {
+  await db().productImage.deleteMany({
+    where: {
+      product: { slug: productSlug, tenant: { slug: DEMO_TENANT_SLUG } },
+    },
+  });
+}

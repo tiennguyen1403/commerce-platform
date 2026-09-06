@@ -38,6 +38,7 @@ model Tenant {
   products       Product[]
   orders         Order[]
   outboxMessages OutboxMessage[]
+  productImages  ProductImage[]
 }
 
 enum Role {
@@ -167,6 +168,7 @@ model Product {
 
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   variants ProductVariant[]
+  images   ProductImage[]
 
   @@unique([tenantId, slug])
   @@index([tenantId])
@@ -210,6 +212,58 @@ model ProductVariant {
 
   @@unique([productId, sku])
   @@index([productId])
+}
+
+/// Product media (M5 #184). A product has zero or more images, rendered on the
+/// card, listing, search, and the PDP gallery; an image-less product falls back
+/// to a placeholder. The bytes live in object storage behind the
+/// `StorageProvider` seam (Vercel Blob in prod, a local-disk mock in dev/test/CI,
+/// #185); this row keeps only the public `url` for rendering and the
+/// provider-opaque `key` for clean deletes and provider portability.
+model ProductImage {
+  id String @id @default(cuid())
+  // Own `tenantId` — a DELIBERATE divergence from ProductVariant, which carries
+  // none and is scoped only through its parent Product. Two reasons: golden rule
+  // 1 (every business table carries its own tenant scope, so an image read/delete
+  // is tenant-checked directly, not only via a join), and storage-key namespacing
+  // — the object key is `tenants/<tenantId>/products/<productId>/…`, so the tenant
+  // is a first-class fact of the row, not something re-derived on every write.
+  tenantId  String
+  productId String
+  // Public URL used to render the image: a Blob CDN URL in prod, or a
+  // root-relative `/uploads/…` (local mock) / `/seed/…` (demo seed) path.
+  url String
+  // Provider-opaque storage key/pathname — the object's identity in the bucket,
+  // kept separate from `url` so a delete can target the object directly and a
+  // provider swap (Vercel Blob ↔ R2) never has to re-parse public URLs.
+  key String
+  // Optional alt text (accessibility); falls back to the product title at render.
+  altText String?
+  // Display order within the gallery. The create path appends at `max + 1` (so a
+  // delete can leave a harmless gap, never a duplicate slot); reorder rewrites the
+  // whole set contiguous.
+  position Int
+  // Intrinsic pixel dimensions, captured client-side before upload. Load-bearing:
+  // `next/image` requires an explicit width/height for a remote `src` (it can't
+  // read remote files at build time), so these prevent layout shift. Nullable so
+  // a row whose dims weren't measured is still valid.
+  width  Int?
+  height Int?
+  // Reserved for a base64 blur placeholder; UNUSED in v1 (blur is deferred to a
+  // CSS shimmer, which keeps `sharp` out of the dependency tree). Kept on the
+  // model so adding blur later is a code change, not a migration.
+  blurDataUrl String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  // The dominant read: a product's images in gallery order (composite so the
+  // productId filter + position sort is index-served, not a sort per product).
+  @@index([productId, position])
+  // Tenant-scoped access (golden rule 1) — direct tenant filters and deletes.
+  @@index([tenantId])
 }
 
 // ---------------------------------------------------------------------------

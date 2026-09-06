@@ -95,6 +95,28 @@ database, since the columns land before any order reaches those states in practi
 Per-field intent lives in `prisma/schema.prisma`'s comments; the fulfillment behaviour these
 columns support is in `docs/ARCHITECTURE.md` §6 and `docs/milestones/M4-fulfillment/`.
 
+### A wholly new table (the M5 `ProductImage` migration)
+
+`20260905195858_add_product_image` (M5 #184) is the **cleanest additive case** — a
+brand-new table, so the "`NOT NULL` needs a `DEFAULT`" guard doesn't even come into play:
+
+- The migration is a single `CREATE TABLE "ProductImage"` (plus its two indexes and two
+  `ON DELETE CASCADE` foreign keys) — **no `ALTER TABLE … ADD COLUMN` anywhere**.
+  `position INTEGER NOT NULL` is safe without a `DEFAULT` precisely because it lands on a
+  table created in the same migration: there are no existing rows to backfill.
+  `pnpm db:check-migrations` passes trivially — it scans for `ADD COLUMN … NOT NULL`
+  without a `DEFAULT`, and this file has no `ADD COLUMN` at all.
+- **`ProductImage` carries its own `tenantId`** (with an `@@index([tenantId])`) — a
+  deliberate divergence from `ProductVariant`, which has none and is tenant-scoped only
+  through its parent `Product`. Golden rule 1 (every business table scoped directly), plus
+  storage-key namespacing (`tenants/<tenantId>/products/<productId>/…`, M5 #185), make the
+  tenant a first-class column here, not a value re-derived from the product on every write.
+- **No backfill; a provider-independent seed.** Existing products simply have zero image
+  rows (the storefront falls back to a placeholder). `prisma/seed.ts` adds a few demo rows
+  for the `demo` store from committed sample files under `public/seed/` (`url` = `/seed/…`,
+  `key` = `seed/…`), idempotently by a derived id (`ProductImage` has no natural unique
+  key) — no storage provider or bucket required. Rendering arrives with M5 #188.
+
 ## Deploying onto a database seeded before a migration
 
 If `prisma migrate deploy` aborts with `column "…" contains null values` (and blocks later

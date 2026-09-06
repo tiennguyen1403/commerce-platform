@@ -43,5 +43,23 @@ export default defineConfig({
     // dev server this harness is meant to avoid.
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
+    // Run the served app in NODE_ENV=test so the product-image E2E can reach the
+    // local-disk storage mock. Like the fulfillment mock, storage's mock is gated
+    // OFF in production: `getStorageProvider()` returns null and the upload sink
+    // `PUT /api/uploads/local/[...key]` 404s when `env.NODE_ENV === "production"`
+    // (src/server/storage/index.ts, src/app/api/uploads/local/[...key]/route.ts).
+    // `next start` defaults NODE_ENV to "production", so without this override the
+    // upload step would deterministically fail. `src/lib/env.ts` reads NODE_ENV
+    // *live* at runtime (it parses the whole `process.env`, not the discrete
+    // `process.env.NODE_ENV` literal that `next build` freezes), so flipping it
+    // here — for this spawned server only, never the prior `pnpm build` — swaps
+    // the storage (and fulfillment) selectors to their mocks while the production
+    // client bundle is untouched. Playwright merges this over the inherited
+    // `process.env`, so DATABASE_URL / auth / Stripe vars are all preserved. This
+    // reaches only a server Playwright *spawns*: a server you already have on
+    // :3000 (reused per `reuseExistingServer` above) must itself have been started
+    // with NODE_ENV=test, or the image upload hits the production-gated null
+    // provider and a 404 sink. CI always spawns fresh, so it's unaffected.
+    env: { NODE_ENV: "test" },
   },
 });

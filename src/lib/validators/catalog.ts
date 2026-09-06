@@ -149,3 +149,229 @@ export const searchProductsParamsSchema = z.object({
 export type SearchProductsParamsInput = z.infer<
   typeof searchProductsParamsSchema
 >;
+
+// --- Image uploads (#185, M5) ------------------------------------------------
+
+/**
+ * Content types a product image may be uploaded as. Business-rule allowlist (like
+ * `MAX_PRICE_CENTS`/`MAX_STOCK` above) — a constant, deliberately NOT env: it
+ * shapes validation, not deployment. Shared by the upload form (pre-check the
+ * picked file) and the sign step (authoritative re-check) — one list, both sides.
+ * JPEG/PNG/WebP cover what a browser file picker reliably produces; HEIC/AVIF are
+ * omitted (patchy browser support, and v1 does no transcode — no `sharp`).
+ */
+export const ALLOWED_IMAGE_CONTENT_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+] as const;
+export type AllowedImageContentType =
+  (typeof ALLOWED_IMAGE_CONTENT_TYPES)[number];
+
+/**
+ * The stored file extension per allowed content type — one source of truth for the
+ * "which image formats" fact. `satisfies` keeps it exhaustive (adding a content type
+ * to the allowlist without an extension here fails to compile). Consumers: the
+ * storage mock derives an object's extension from its content type, and the local
+ * upload sink allows exactly these extensions to be written (so a direct caller
+ * can't drop a `.html` into the web-served uploads dir).
+ */
+export const IMAGE_CONTENT_TYPE_EXTENSIONS = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+} satisfies Record<AllowedImageContentType, string>;
+
+/**
+ * Hard ceiling on a single uploaded product image, in bytes (5 MB). Enforced at
+ * sign time (server, authoritative) and mirrored by the local sink as defence in
+ * depth. Generous for a web product photo, small enough to keep a tampered/runaway
+ * upload off the storage bill — the analogue of `MAX_PRICE_CENTS` for uploads.
+ */
+export const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Max images one product may hold. The gallery is a small hero + thumbnails, so
+ * this is a UX/cost guard, not a technical limit; the create/count-cap service
+ * enforces it and the admin form surfaces it.
+ */
+export const MAX_IMAGES_PER_PRODUCT = 8;
+
+/**
+ * Max length of an image's alt text (caption). Generous for a real caption yet
+ * capped so a tampered payload can't store an unbounded string. A business-rule
+ * constant like the price/stock ceilings — the single source of truth shared by
+ * the admin form (client pre-check) and the Server Action (authoritative parse).
+ */
+export const IMAGE_ALT_TEXT_MAX = 300;
+
+/**
+ * A single stored/rendered image, serialized for the client. The admin image
+ * manager and (later, M5-05) the storefront read it; a plain type — never a
+ * Prisma import — so it stays client-safe. `altText`/`width`/`height` are nullable
+ * (alt text is admin-entered, dims are client-measured and may be absent).
+ */
+export type ProductImageDto = {
+  id: string;
+  url: string;
+  key: string;
+  altText: string | null;
+  width: number | null;
+  height: number | null;
+  position: number;
+};
+
+/**
+ * Is `url` safe to persist and later render as an `<img src>` on the public
+ * storefront? The `url` is client-supplied in the persist step (the browser echoes
+ * back the `publicUrl` the sign step minted), so the boundary re-checks it rather
+ * than trusting it. Allows exactly the two shapes a provider mints — a root-relative
+ * path (`/uploads/…`, the local mock) or a well-formed absolute `https://` URL
+ * (Vercel Blob) — and rejects everything else: `javascript:`/`data:` schemes, plain
+ * `http:`, and any form that resolves to an external origin.
+ *
+ * A deliberately narrow allowlist, and — the lesson of the repeated `?redirect=`
+ * open-redirect fixes (#99 → #103 → #128) — NOT a naive `startsWith("/")` prefix
+ * test: browsers strip TAB/LF/CR from a URL and treat `\` as `/` before resolving,
+ * so `"/\evil.com"` or `"/<TAB>/evil.com"` would sail past a `/`-prefix check yet
+ * load from `//evil.com`. So we reject those characters outright, then parse (not
+ * prefix-test) the absolute form and require a single-slash root-relative otherwise.
+ */
+export function isSafeImageUrl(url: string): boolean {
+  // Control chars (incl. TAB U+0009 / LF / CR / NUL) and backslashes first: an
+  // interior one can smuggle a `//host` past the root-relative branch below.
+  if (/[\x00-\x1f\x7f\\]/.test(url)) return false;
+
+  // Absolute form → must be a well-formed https URL. Parsing, not a prefix test, so
+  // a malformed authority can't slip through.
+  if (/^https:\/\//i.test(url)) {
+    try {
+      return new URL(url).protocol === "https:";
+    } catch {
+      return false;
+    }
+  }
+
+  // Otherwise the only accepted form is a root-relative path — a single leading
+  // slash (the mock's `/uploads/…`), never `//host`. With control chars and
+  // backslashes already rejected, this can no longer resolve off-origin.
+  return url.startsWith("/") && !url.startsWith("//");
+}
+
+/**
+ * Should this image `src` bypass Next's on-demand image optimizer (render
+ * `unoptimized`)? The optimizer route (`/_next/image`) `require()`s `sharp`, which
+ * we deliberately don't install (M5 renders raw bytes — no transcode), so under
+ * `next start` in dev/CI any optimized image would throw. Same-origin sources — the
+ * demo seed (`/seed/…`) and the local upload mock (`/uploads/…`), i.e. any
+ * root-relative path — gain nothing from the optimizer and are rendered
+ * `unoptimized`; only a remote `https://` URL goes through the loader.
+ *
+ * `isSafeImageUrl` already guarantees a stored `url` is either `https://…` or a
+ * single-slash root-relative path, so in practice "not https" is exactly
+ * "same-origin". A `data:` URI also classifies as unoptimized (matching
+ * `next/image`'s own built-in handling), which keeps this a safe total classifier —
+ * though none is ever actually stored, since `isSafeImageUrl` rejects `data:`.
+ *
+ * The `https://` (optimized) branch additionally needs the Blob host added to
+ * `images.remotePatterns` in `next.config.ts` to render at all — a hard requirement
+ * regardless of where optimization runs. That config lands with the real Blob
+ * adapter in M5-06; until then every stored URL is root-relative and this returns
+ * `true`, so the optimizer is never reached.
+ */
+export function isUnoptimizedImageSrc(url: string): boolean {
+  return !/^https:\/\//i.test(url);
+}
+
+/**
+ * The alt-text (caption) field, shared by the add and update image schemas. Trims,
+ * length-caps, and collapses a blank/whitespace-only value to `undefined` (never
+ * `""`, never `null`) — so "no caption" is one canonical value from the validation
+ * boundary onward, and the schema stays idempotent (re-parsing its own output is a
+ * fixed point) for the double-parse convention.
+ */
+const imageAltTextField = z
+  .string()
+  .trim()
+  .max(IMAGE_ALT_TEXT_MAX)
+  .transform((value) => (value === "" ? undefined : value))
+  .optional();
+
+/**
+ * Payload for the sign step (`getImageUploadUrlAction`). Shape-guards the request
+ * — present, typed, bounded — before it reaches the service; the authoritative
+ * content-type-allowlist and size-cap checks (with their friendly, limit-aware
+ * messages) live in `imageService.requestUpload`, so they are deliberately NOT
+ * duplicated here.
+ */
+export const imageUploadRequestSchema = z.object({
+  contentType: z.string().trim().min(1).max(100),
+  fileName: z.string().trim().min(1).max(200),
+  sizeBytes: z.int().min(0),
+});
+
+export type ImageUploadRequestInput = z.infer<typeof imageUploadRequestSchema>;
+
+/**
+ * Payload for the persist step (`addProductImageAction`), sent after the browser's
+ * direct PUT succeeds. Idempotent like the catalog schemas — `altText` outputs
+ * `string | undefined`, never `null` — so the Server Action can safely re-parse the
+ * client's already-parsed data (the double-parse convention). `width`/`height` are
+ * the client-measured intrinsic dimensions (omitted when the browser couldn't
+ * decode them). `url` is allowlist-checked; `key` is stored opaque.
+ */
+export const addImageSchema = z.object({
+  url: z
+    .string()
+    .trim()
+    .min(1)
+    .max(2048)
+    .refine(isSafeImageUrl, { error: "Unsupported image URL." }),
+  key: z.string().trim().min(1).max(1024),
+  altText: imageAltTextField,
+  width: z.int().positive().max(50_000).optional(),
+  height: z.int().positive().max(50_000).optional(),
+});
+
+export type AddImageInputParsed = z.infer<typeof addImageSchema>;
+
+/**
+ * Payload for `reorderProductImagesAction`: the full set of the product's image
+ * ids in their new order. The service authoritatively checks it's a permutation of
+ * the product's current images; this only shape-bounds it (a generous sanity cap,
+ * not the soft per-product limit, so a legitimately over-cap product — the
+ * documented append race — can still be reordered).
+ */
+export const reorderImagesSchema = z.object({
+  orderedIds: z.array(z.string().min(1)).min(1).max(100),
+});
+
+/**
+ * Payload for `updateImageAltTextAction`. Idempotent (`altText` → `string |
+ * undefined`, a blank caption collapsing to `undefined`), so the action re-parses
+ * safely; the service then persists `undefined` as `null` to clear the caption.
+ */
+export const updateImageAltTextSchema = z.object({
+  imageId: z.string().min(1),
+  altText: imageAltTextField,
+});
+
+/** Shared failure shape for the image actions — a single inline message the
+ *  manager surfaces (near the uploader or the affected image), rather than the
+ *  field-keyed errors the product form uses. */
+export type ImageActionError = { ok: false; error: string };
+
+/** `getImageUploadUrlAction` success carries the direct-PUT target plus the
+ *  `publicUrl`/`key` the client echoes back to the persist step. */
+export type SignUploadResult =
+  | { ok: true; uploadUrl: string; publicUrl: string; key: string }
+  | ImageActionError;
+
+/** `addProductImageAction` success returns the created row so the manager can
+ *  render it without a full refetch. */
+export type AddImageResult =
+  { ok: true; image: ProductImageDto } | ImageActionError;
+
+/** Reorder / alt-text / delete: the client already holds the resulting state, so
+ *  success needs no payload. */
+export type ImageMutationResult = { ok: true } | ImageActionError;

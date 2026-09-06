@@ -3,10 +3,14 @@ import {
   productInputSchema,
   variantInputSchema,
   PRODUCT_STATUSES,
+  isSafeImageUrl,
+  isUnoptimizedImageSrc,
+  addImageSchema,
 } from "@/lib/validators/catalog";
 
 type VariantOverrides = Partial<Record<string, unknown>>;
 type ProductOverrides = Partial<Record<string, unknown>>;
+type ImageOverrides = Partial<Record<string, unknown>>;
 
 const validVariant = (o: VariantOverrides = {}) => ({
   sku: "TEE-S",
@@ -21,6 +25,12 @@ const validProduct = (o: ProductOverrides = {}) => ({
   slug: "classic-tee",
   status: "ACTIVE",
   variants: [validVariant()],
+  ...o,
+});
+
+const validImage = (o: ImageOverrides = {}) => ({
+  url: "/uploads/x.png",
+  key: "tenants/t/products/p/x.png",
   ...o,
 });
 
@@ -185,5 +195,110 @@ describe("productInputSchema", () => {
         validProduct({ description: "x".repeat(2001) }),
       ).success,
     ).toBe(false);
+  });
+});
+
+describe("isSafeImageUrl", () => {
+  it("accepts a root-relative path and a well-formed absolute https URL", () => {
+    expect(isSafeImageUrl("/uploads/tenants/t/products/p/a.png")).toBe(true);
+    expect(isSafeImageUrl("https://host.blob.vercel-storage.com/x.png")).toBe(
+      true,
+    );
+  });
+
+  it("rejects non-https schemes, protocol-relative, and empty URLs", () => {
+    for (const url of [
+      "//evil.com/x", // protocol-relative → loads from an external origin
+      "http://x", // plain http, not the allowed https
+      "javascript:alert(1)",
+      "data:image/png;base64,AAAA",
+      "https://", // scheme only, no authority → not a real URL
+      "",
+    ]) {
+      expect(isSafeImageUrl(url), url).toBe(false);
+    }
+  });
+
+  it("rejects the smuggling vectors a naive `/`-prefix check would miss", () => {
+    // Each starts with a single `/` yet resolves off-origin: a browser treats `\`
+    // as `/` and strips interior TAB/LF/CR before resolving, yielding `//evil.com`.
+    for (const url of [
+      "/\\evil.com/x.jpg", // backslash
+      "/\t/evil.com/x.jpg", // interior TAB
+      "/\n//evil.com", // interior LF
+      "/\r/evil.com", // interior CR
+    ]) {
+      expect(isSafeImageUrl(url), JSON.stringify(url)).toBe(false);
+    }
+  });
+});
+
+describe("isUnoptimizedImageSrc", () => {
+  it("marks same-origin (root-relative) sources unoptimized — the seed/mock/CI path", () => {
+    // These render without hitting the sharp-requiring optimizer, so `next start`
+    // in dev/CI never throws for a demo seed or a locally-uploaded image.
+    for (const url of [
+      "/seed/classic-tee-front.png",
+      "/uploads/tenants/t/products/p/a.png",
+      "/some-other-root-relative.png",
+    ]) {
+      expect(isUnoptimizedImageSrc(url), url).toBe(true);
+    }
+  });
+
+  it("classifies a data: URI as unoptimized too (defensive — never actually stored)", () => {
+    // isSafeImageUrl rejects data:, so no stored url is ever a data: URI; the helper
+    // still classifies it (staying a total function, matching next/image's own
+    // data:-handling) rather than accidentally routing it to the sharp optimizer.
+    expect(isUnoptimizedImageSrc("data:image/png;base64,AAAA")).toBe(true);
+  });
+
+  it("optimizes only remote https URLs (Vercel Blob, no sharp in our bundle)", () => {
+    expect(
+      isUnoptimizedImageSrc(
+        "https://host.public.blob.vercel-storage.com/x.png",
+      ),
+    ).toBe(false);
+    // Scheme match is case-insensitive, mirroring isSafeImageUrl.
+    expect(isUnoptimizedImageSrc("HTTPS://host/x.png")).toBe(false);
+  });
+});
+
+describe("addImageSchema", () => {
+  it("accepts a well-formed root-relative or https image", () => {
+    expect(addImageSchema.safeParse(validImage()).success).toBe(true);
+    expect(
+      addImageSchema.safeParse(validImage({ url: "https://host/x.png" }))
+        .success,
+    ).toBe(true);
+  });
+
+  it("rejects an unsafe url", () => {
+    expect(
+      addImageSchema.safeParse(validImage({ url: "//evil.com/x.png" })).success,
+    ).toBe(false);
+  });
+
+  it("collapses a blank/whitespace-only altText to undefined (canonical 'no caption')", () => {
+    // The shared alt-text field trims, then maps "" → undefined, so a blank caption
+    // is one canonical value (never "") from the boundary onward and re-parsing is
+    // a fixed point.
+    expect(
+      addImageSchema.parse(validImage({ altText: "  " })).altText,
+    ).toBeUndefined();
+    expect(
+      addImageSchema.parse(validImage({ altText: "" })).altText,
+    ).toBeUndefined();
+  });
+
+  it("re-parses its own parsed output (the double-parse contract)", () => {
+    const input = validImage({
+      altText: "  A cozy tee  ",
+      width: 800,
+      height: 600,
+    });
+    const once = addImageSchema.parse(input);
+    const twice = addImageSchema.parse(addImageSchema.parse(input));
+    expect(twice).toEqual(once);
   });
 });

@@ -212,7 +212,7 @@ All nine checklist items in `GOAL.md` — the source of truth transcribed verbat
 
 ## Key decisions
 
-Also appended to the `docs/ARCHITECTURE.md` §8 decision log.
+Also appended to the `docs/ARCHITECTURE.md` §9 decision log.
 
 - **Transactional email outbox, not a direct send from the webhook** — the PENDING →
   PAID transaction only enqueues an `OutboxMessage` (`order.repository.ts:402-409`); a

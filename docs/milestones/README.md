@@ -55,3 +55,4 @@ docs/milestones/
 | M2        | production-grade | ✅ done |
 | M3        | platform         | ✅ done |
 | M4        | fulfillment      | ✅ done |
+| M5        | product-images   | ✅ done |

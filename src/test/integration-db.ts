@@ -62,6 +62,9 @@ export async function deleteTenantDeep(tenantId: string): Promise<void> {
   await prisma.orderItem.deleteMany({ where: { order: { tenantId } } });
   await prisma.order.deleteMany({ where: { tenantId } });
   await prisma.productVariant.deleteMany({ where: { product: { tenantId } } });
+  // ProductImage cascades from both Tenant and Product; clear it before Product so
+  // neither cascade path has to (matching the explicit-order rationale above).
+  await prisma.productImage.deleteMany({ where: { tenantId } });
   await prisma.product.deleteMany({ where: { tenantId } });
   await prisma.tenant.delete({ where: { id: tenantId } });
 }

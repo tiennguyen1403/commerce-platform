@@ -3,18 +3,11 @@
 import { useState, useTransition } from "react";
 import Link from "next/link";
 import { Check, Info, Loader2, ShoppingCart } from "lucide-react";
-import { formatMoney } from "@/lib/utils";
+import { cn, formatMoney } from "@/lib/utils";
 import { LOW_STOCK_THRESHOLD } from "@/config/constants";
 import { addToCartAction } from "@/app/(storefront)/cart/actions";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 
 export type PurchaseVariant = {
   id: string;
@@ -66,7 +59,7 @@ export function PurchasePanel({
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-col gap-2" aria-live="polite">
-        <p className="text-2xl font-semibold tracking-tight tabular-nums">
+        <p className="text-3xl font-semibold tracking-tight tabular-nums">
           {formatMoney(selected.priceCents, currency)}
         </p>
         {soldOut ? (
@@ -79,39 +72,51 @@ export function PurchasePanel({
           </span>
         ) : (
           <span className="text-muted-foreground inline-flex items-center gap-1.5 text-sm">
-            <Check className="size-4" />
+            <Check className="text-accent-foreground size-4" />
             In stock
           </span>
         )}
       </div>
 
       {hasChoice ? (
-        <div className="flex flex-col gap-2">
-          <label htmlFor="variant" className="text-sm font-medium">
-            Variant
-          </label>
-          <Select
-            value={selected.id}
-            onValueChange={(value) => {
-              if (value) {
-                setSelectedId(value);
-                setStatus("idle");
-              }
-            }}
+        <div className="flex flex-col gap-2.5">
+          <span className="text-sm font-medium">Variant</span>
+          <div
+            className="flex flex-wrap gap-2"
+            role="radiogroup"
+            aria-label="Variant"
           >
-            <SelectTrigger id="variant" className="w-full sm:w-72">
-              <SelectValue>
-                {(value) => variants.find((v) => v.id === value)?.name}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {variants.map((v) => (
-                <SelectItem key={v.id} value={v.id} disabled={v.available <= 0}>
-                  {v.available <= 0 ? `${v.name} — sold out` : v.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            {variants.map((v) => {
+              const isSelected = v.id === selected.id;
+              const isOff = v.available <= 0;
+              return (
+                <button
+                  key={v.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={isSelected}
+                  disabled={isOff}
+                  onClick={() => {
+                    setSelectedId(v.id);
+                    setStatus("idle");
+                  }}
+                  className={cn(
+                    "focus-visible:ring-ring/50 inline-flex h-10 items-center justify-center rounded-lg border px-4 text-sm font-medium transition-colors focus-visible:ring-3 focus-visible:outline-none",
+                    isOff &&
+                      "text-muted-foreground cursor-not-allowed line-through opacity-60",
+                    !isOff &&
+                      isSelected &&
+                      "border-primary bg-accent text-accent-foreground font-semibold",
+                    !isOff &&
+                      !isSelected &&
+                      "border-border hover:border-foreground/30",
+                  )}
+                >
+                  {v.name}
+                </button>
+              );
+            })}
+          </div>
         </div>
       ) : (
         <p className="text-muted-foreground text-sm">{selected.name}</p>
@@ -123,7 +128,7 @@ export function PurchasePanel({
           size="lg"
           disabled={soldOut || isPending}
           onClick={addToCart}
-          className="w-full sm:w-auto"
+          className="h-12 w-full text-[15px] font-semibold"
         >
           {isPending ? <Loader2 className="animate-spin" /> : <ShoppingCart />}
           {soldOut ? "Sold out" : isPending ? "Adding…" : "Add to cart"}
@@ -133,7 +138,7 @@ export function PurchasePanel({
             role="status"
             className="text-muted-foreground inline-flex items-center gap-1.5 text-sm"
           >
-            <Check className="size-4" />
+            <Check className="text-accent-foreground size-4" />
             Added to cart ·{" "}
             <Link
               href="/cart"

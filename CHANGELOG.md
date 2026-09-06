@@ -8,11 +8,30 @@ for the full M1 writeup,
 [`docs/milestones/M2-production-grade/handoff.md`](docs/milestones/M2-production-grade/handoff.md)
 for the full M2 writeup,
 [`docs/milestones/M3-platform/handoff.md`](docs/milestones/M3-platform/handoff.md)
-for the full M3 writeup, and
+for the full M3 writeup,
 [`docs/milestones/M4-fulfillment/handoff.md`](docs/milestones/M4-fulfillment/handoff.md)
-for the full M4 writeup.
+for the full M4 writeup, and
+[`docs/milestones/M5-product-images/handoff.md`](docs/milestones/M5-product-images/handoff.md)
+for the full M5 writeup.
 
 ## [Unreleased]
+
+## [vM5] — product-images — 2026-09-06
+
+Products can now have real photos — admins add, reorder, caption, and remove them right
+in the product form; the storefront shows them on product cards and a new image gallery
+on the product page, with a clean placeholder for products that have none.
+
+### Added
+
+- The admin product form now has an image manager: upload photos, move them up or down
+  to reorder the gallery, give one a caption, or remove it — changes save immediately.
+- The storefront product card, listing, and search results now show a product's first
+  photo instead of a placeholder icon.
+- The product page now has a real photo gallery: a large main image with a row of
+  thumbnails underneath when there's more than one photo.
+- Products with no photos yet still show a clean placeholder — nothing breaks for
+  existing products.
 
 ## [vM4] — fulfillment — 2026-09-05
 
@@ -169,7 +188,8 @@ Stripe test-mode purchase; an admin manages the catalog behind auth.
   details — it verifies against the live Stripe payment first, closing an
   information-disclosure gap.
 
-[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM4...HEAD
+[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM5...HEAD
+[vm5]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM5
 [vm4]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM4
 [vm3]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM3
 [vm2]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM2
