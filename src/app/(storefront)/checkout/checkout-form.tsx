@@ -14,14 +14,14 @@ import {
   useElements,
   useStripe,
 } from "@stripe/react-stripe-js";
-import { Loader2, Lock } from "lucide-react";
+import { Check, Loader2, Lock } from "lucide-react";
 import {
   checkoutInputSchema,
   SHIPPING_COUNTRIES,
   SHIPPING_COUNTRY_LABELS,
   type ShippingCountry,
 } from "@/lib/validators/checkout";
-import { formatMoney } from "@/lib/utils";
+import { cn, formatMoney } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -164,33 +164,38 @@ export function CheckoutForm() {
   // Phase 2: the PaymentIntent exists — mount the Payment Element for it.
   if (started) {
     return (
-      <div className="flex flex-col gap-4">
-        <div className="text-muted-foreground flex flex-col gap-1 text-sm">
-          <p>
-            Paying as{" "}
-            <span className="text-foreground font-medium">{email}</span>
-          </p>
-          <p>
-            Shipping to{" "}
-            <span className="text-foreground font-medium">{address.name}</span>{" "}
-            ·{" "}
-            {[address.city, address.state, address.postalCode]
-              .filter(Boolean)
-              .join(", ")}
-          </p>
+      <div className="flex flex-col gap-6">
+        <CheckoutSteps current={2} />
+        <div className="flex flex-col gap-4">
+          {/* A read-back of what was collected in step one, before the card. */}
+          <dl className="border-border bg-muted/40 flex flex-col gap-2 rounded-lg border px-4 py-3 text-sm">
+            <div className="flex items-start justify-between gap-4">
+              <dt className="text-muted-foreground shrink-0">Contact</dt>
+              <dd className="text-right font-medium">{email}</dd>
+            </div>
+            <div className="flex items-start justify-between gap-4">
+              <dt className="text-muted-foreground shrink-0">Ship to</dt>
+              <dd className="text-right font-medium">
+                {address.name} ·{" "}
+                {[address.city, address.state, address.postalCode]
+                  .filter(Boolean)
+                  .join(", ")}
+              </dd>
+            </div>
+          </dl>
+          <Elements
+            stripe={stripePromise}
+            options={{
+              clientSecret: started.clientSecret,
+              appearance,
+            }}
+          >
+            <PaymentStep
+              totalCents={started.totalCents}
+              currency={started.currency}
+            />
+          </Elements>
         </div>
-        <Elements
-          stripe={stripePromise}
-          options={{
-            clientSecret: started.clientSecret,
-            appearance,
-          }}
-        >
-          <PaymentStep
-            totalCents={started.totalCents}
-            currency={started.currency}
-          />
-        </Elements>
       </div>
     );
   }
@@ -199,30 +204,39 @@ export function CheckoutForm() {
   // creates the intent + PENDING order (with the address) server-side.
   return (
     <form onSubmit={onStart} className="flex flex-col gap-6" noValidate>
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="email">Email</Label>
-        <Input
-          id="email"
-          name="email"
-          type="email"
-          autoComplete="email"
-          placeholder="you@example.com"
-          aria-invalid={fieldErrors.email ? true : undefined}
-          aria-describedby={fieldErrors.email ? "email-error" : undefined}
-          value={email}
-          onChange={(event) => setEmail(event.target.value)}
-          required
-        />
-        {fieldErrors.email ? (
-          <p id="email-error" role="alert" className="text-destructive text-sm">
-            {fieldErrors.email}
-          </p>
-        ) : (
-          <p className="text-muted-foreground text-xs">
-            Your receipt and order updates go here.
-          </p>
-        )}
-      </div>
+      <CheckoutSteps current={1} />
+
+      <fieldset className="flex flex-col gap-4">
+        <legend className="text-sm font-medium">Contact</legend>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="email">Email</Label>
+          <Input
+            id="email"
+            name="email"
+            type="email"
+            autoComplete="email"
+            placeholder="you@example.com"
+            aria-invalid={fieldErrors.email ? true : undefined}
+            aria-describedby={fieldErrors.email ? "email-error" : undefined}
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            required
+          />
+          {fieldErrors.email ? (
+            <p
+              id="email-error"
+              role="alert"
+              className="text-destructive text-sm"
+            >
+              {fieldErrors.email}
+            </p>
+          ) : (
+            <p className="text-muted-foreground text-xs">
+              Your receipt and order updates go here.
+            </p>
+          )}
+        </div>
+      </fieldset>
 
       <fieldset className="flex flex-col gap-4">
         <legend className="text-sm font-medium">Shipping address</legend>
@@ -328,11 +342,70 @@ export function CheckoutForm() {
           {error}
         </p>
       ) : null}
-      <Button type="submit" size="lg" disabled={pending} className="w-full">
-        {pending ? <Loader2 className="animate-spin" /> : null}
-        Continue to payment
-      </Button>
+      <div className="flex flex-col gap-2">
+        <Button type="submit" size="lg" disabled={pending} className="w-full">
+          {pending ? <Loader2 className="animate-spin" /> : null}
+          Continue to payment
+        </Button>
+        <p className="text-muted-foreground text-center text-xs">
+          You won&apos;t be charged until you confirm payment.
+        </p>
+      </div>
     </form>
+  );
+}
+
+/** The checkout's two-phase progress: "Details" (collect email + address) then
+ *  "Payment" (the mounted Payment Element). The active step takes the accent and
+ *  the completed step a check; the numbers and hairline connector are decorative
+ *  (`aria-hidden`), while `aria-current="step"` names the live step to assistive
+ *  tech. Module scope, so it never remounts between phases. */
+function CheckoutSteps({ current }: { current: 1 | 2 }) {
+  const steps = [
+    { n: 1, label: "Details" },
+    { n: 2, label: "Payment" },
+  ] as const;
+
+  return (
+    <nav aria-label="Checkout progress">
+      <ol className="flex items-center gap-3">
+        {steps.map((step) => {
+          const done = current > step.n;
+          const active = current === step.n;
+          return (
+            <li
+              key={step.n}
+              aria-current={active ? "step" : undefined}
+              className={cn("flex items-center gap-2", step.n > 1 && "flex-1")}
+            >
+              {step.n > 1 ? (
+                <span aria-hidden className="bg-border h-px flex-1" />
+              ) : null}
+              <span
+                aria-hidden
+                className={cn(
+                  "flex size-7 shrink-0 items-center justify-center rounded-full text-xs font-semibold tabular-nums",
+                  done || active
+                    ? "bg-primary text-primary-foreground"
+                    : "border-border text-muted-foreground border",
+                )}
+              >
+                {done ? <Check className="size-4" /> : step.n}
+              </span>
+              <span
+                className={cn(
+                  "text-sm font-medium whitespace-nowrap",
+                  active || done ? "text-foreground" : "text-muted-foreground",
+                )}
+              >
+                {step.label}
+                {done ? <span className="sr-only"> completed</span> : null}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
   );
 }
 
