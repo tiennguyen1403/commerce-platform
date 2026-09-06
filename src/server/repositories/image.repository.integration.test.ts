@@ -111,6 +111,39 @@ describe("imageRepository lifecycle (integration)", () => {
     expect(listed.map((image) => image.position)).toEqual([0, 1]);
   });
 
+  it("appends after the max (not the count), so a delete-then-add can't collide (#195)", async () => {
+    const tenant = await freshTenant();
+    const product = await seedProduct(tenant.id);
+
+    const a = expectImage(
+      await imageRepository.createImage(tenant.id, product.id, imageInput()),
+    );
+    const b = expectImage(
+      await imageRepository.createImage(tenant.id, product.id, imageInput()),
+    );
+    const c = expectImage(
+      await imageRepository.createImage(tenant.id, product.id, imageInput()),
+    );
+    expect([a.position, b.position, c.position]).toEqual([0, 1, 2]);
+
+    // Delete the FIRST (non-last) image: the rows now sit at positions {1, 2} with
+    // a gap at 0. A count-based append would compute position = count = 2 and
+    // collide with `c`; `max + 1` must instead land the new row at 3.
+    expectImage(await imageRepository.deleteImage(tenant.id, product.id, a.id));
+    const d = expectImage(
+      await imageRepository.createImage(tenant.id, product.id, imageInput()),
+    );
+    expect(d.position).toBe(3);
+
+    // Positions are collision-free (all distinct) and the gallery lists in a
+    // stable, strictly-increasing order — the ambiguity the count-based slot caused.
+    const listed = await imageRepository.listImages(tenant.id, product.id);
+    const positions = listed.map((image) => image.position);
+    expect(positions).toEqual([1, 2, 3]);
+    expect(new Set(positions).size).toBe(positions.length);
+    expect(listed.map((image) => image.id)).toEqual([b.id, c.id, d.id]);
+  });
+
   it("reorders the whole set and reports the rows moved", async () => {
     const tenant = await freshTenant();
     const product = await seedProduct(tenant.id);

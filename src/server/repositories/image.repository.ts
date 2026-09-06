@@ -23,8 +23,9 @@ import { prisma } from "@/server/db";
  * Fields the service persists for one image. `url`/`key` come from the storage
  * provider's `getUploadUrl`; `altText`/`width`/`height` are optional (dims are
  * measured client-side, alt text is admin-entered). `position` is NOT here — the
- * create path always computes it as the next append slot, so callers can't create
- * a gap or a collision.
+ * create path computes it as the next append slot (`max + 1`), so callers can't
+ * collide with an existing image (a delete can leave a harmless gap, never a
+ * duplicate slot).
  */
 export type CreateImageInput = {
   url: string;
@@ -67,15 +68,18 @@ export const imageRepository = {
   },
 
   /**
-   * Persist one image, appended at the end of the gallery. Returns the created row,
-   * or `null` if the product isn't the tenant's (the cross-tenant-attachment gate).
-   * `position` is computed as the current count — a contiguous 0,1,2,… append — in
-   * the same transaction as the ownership check and the insert, so the read that
-   * computes it and the write that uses it can't be split. (Two truly-concurrent
-   * appends could still pick the same slot under READ COMMITTED; that's a benign,
-   * admin-fixable tie the gallery breaks by id and any reorder resolves — never a
-   * correctness or tenancy issue, so it needs no heavier lock for this low-rate,
-   * single-admin write.)
+   * Persist one image, appended after the current gallery max. Returns the created
+   * row, or `null` if the product isn't the tenant's (the cross-tenant-attachment
+   * gate). `position` is computed as `max(position) + 1` (0 for the first image),
+   * NOT the row count — a delete of a non-last image leaves a gap, and a count-based
+   * slot would then reuse a live position and collide with it ({0,1,2} → delete 0 →
+   * {1,2}; count = 2 would clash with the surviving position-2 row). `max + 1` yields
+   * {1,2,3}: a harmless gap (position is only a sort key), never a duplicate. The max
+   * read and the insert share one transaction with the ownership check, so they can't
+   * be split. (Two truly-concurrent appends can still read the same max and pick the
+   * same slot under READ COMMITTED — a benign tie whose two rows then sort arbitrarily
+   * until any reorder rewrites the set; never a correctness or tenancy issue, so it
+   * needs no heavier lock for this low-rate, single-admin write.)
    */
   async createImage(
     tenantId: string,
@@ -89,9 +93,14 @@ export const imageRepository = {
       });
       if (!owned) return null;
 
-      const position = await tx.productImage.count({
+      // `max(position) + 1`, not the row count: a delete leaves a gap, so a
+      // count-based slot would reuse a live position and collide (see the docstring).
+      // `_max.position` is null only for a product with no images → first lands at 0.
+      const { _max } = await tx.productImage.aggregate({
         where: { tenantId, productId },
+        _max: { position: true },
       });
+      const position = (_max.position ?? -1) + 1;
 
       return tx.productImage.create({
         data: {

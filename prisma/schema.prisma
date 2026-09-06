@@ -239,8 +239,9 @@ model ProductImage {
   key String
   // Optional alt text (accessibility); falls back to the product title at render.
   altText String?
-  // Display order within the gallery. The create path always computes a
-  // contiguous 0,1,2,… sequence; reorder rewrites it for the whole set.
+  // Display order within the gallery. The create path appends at `max + 1` (so a
+  // delete can leave a harmless gap, never a duplicate slot); reorder rewrites the
+  // whole set contiguous.
   position Int
   // Intrinsic pixel dimensions, captured client-side before upload. Load-bearing:
   // `next/image` requires an explicit width/height for a remote `src` (it can't
