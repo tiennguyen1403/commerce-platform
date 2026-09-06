@@ -81,15 +81,15 @@ I evaluated Printful, Printify, and a mock-only path against current (fetched) d
 `https://developers.printify.com/docs/` — since neither is in `node_modules` and my training
 data is not authoritative here.
 
-| | Printful v1 | Printful v2 (beta) | Printify |
-|---|---|---|---|
-| Auth | Private Token (store-scoped or account-level + `X-PF-Store-Id`) | same tokens as v1 | Personal Access Token, spans **all shops** in one account |
-| Order create | `POST /orders`, one call with `confirm: true/false` | `POST /orders` (draft only) then a separate `POST /v2/orders/{id}/confirm`; confirm can fail while `costs.calculation_status` is pending | `POST /v1/shops/{shop_id}/orders.json` |
-| Catalog mapping | `items[].variant_id` = a **global catalog** variant id (no per-store "sync product" step required) — or `sync_variant_id` if you do pre-sync | `items[].catalog_variant_id`, `source: "catalog"` — same flat model as v1's `variant_id` | 3-level: blueprint then print provider then variant; line items reference provider-specific variant ids |
-| Sandbox | **None.** `confirm: false` creates a draft that "does not trigger production or billing" — the closest thing to a free sandbox | same draft mechanism | **None documented** |
-| Webhooks | Event names incl. `package_shipped`, `order_failed`, `order_canceled`, `order_refunded`; **signature scheme not clearly documented for v1** | Documented HMAC-SHA256 signing: `x-pf-webhook-public-key` + `x-pf-webhook-signature` headers | Documented HMAC-SHA256: `X-Pfy-Signature: sha256={hex}` over the raw body — cleanly precedented, closest in shape to our own Stripe `constructEvent` verification |
-| Rate limit | 120 req/min general | same | 600 req/min per integration, 100/min for catalog endpoints |
-| Idempotency key | Not documented (only `external_id`, a free-form reference field) | not documented | not documented |
+|                 | Printful v1                                                                                                                                  | Printful v2 (beta)                                                                                                                       | Printify                                                                                                                                                          |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Auth            | Private Token (store-scoped or account-level + `X-PF-Store-Id`)                                                                              | same tokens as v1                                                                                                                        | Personal Access Token, spans **all shops** in one account                                                                                                         |
+| Order create    | `POST /orders`, one call with `confirm: true/false`                                                                                          | `POST /orders` (draft only) then a separate `POST /v2/orders/{id}/confirm`; confirm can fail while `costs.calculation_status` is pending | `POST /v1/shops/{shop_id}/orders.json`                                                                                                                            |
+| Catalog mapping | `items[].variant_id` = a **global catalog** variant id (no per-store "sync product" step required) — or `sync_variant_id` if you do pre-sync | `items[].catalog_variant_id`, `source: "catalog"` — same flat model as v1's `variant_id`                                                 | 3-level: blueprint then print provider then variant; line items reference provider-specific variant ids                                                           |
+| Sandbox         | **None.** `confirm: false` creates a draft that "does not trigger production or billing" — the closest thing to a free sandbox               | same draft mechanism                                                                                                                     | **None documented**                                                                                                                                               |
+| Webhooks        | Event names incl. `package_shipped`, `order_failed`, `order_canceled`, `order_refunded`; **signature scheme not clearly documented for v1**  | Documented HMAC-SHA256 signing: `x-pf-webhook-public-key` + `x-pf-webhook-signature` headers                                             | Documented HMAC-SHA256: `X-Pfy-Signature: sha256={hex}` over the raw body — cleanly precedented, closest in shape to our own Stripe `constructEvent` verification |
+| Rate limit      | 120 req/min general                                                                                                                          | same                                                                                                                                     | 600 req/min per integration, 100/min for catalog endpoints                                                                                                        |
+| Idempotency key | Not documented (only `external_id`, a free-form reference field)                                                                             | not documented                                                                                                                           | not documented                                                                                                                                                    |
 
 **Recommendation: Printful v1**, for four concrete reasons grounded in what's above:
 
@@ -163,7 +163,7 @@ countries are allow-listed.
 
 **Idempotent, atomic reconciliation — mirror the Stripe refund webhook exactly.** The pattern
 to copy is `orderRepository.markRefundedByPaymentIntent`
-(`order.repository.ts:741-762`): a single guarded `updateMany` with the *source* status in the
+(`order.repository.ts:741-762`): a single guarded `updateMany` with the _source_ status in the
 `WHERE` (`status: { in: ["PAID", "FULFILLED"] }`) is the one-way-door idempotency point — of N
 racing callers, exactly one gets `count: 1`; everyone else (a duplicate delivery, a retry, a
 concurrent cron run) gets `count: 0` and is a safe no-op. The same shape drives
@@ -194,7 +194,7 @@ A future push-based fast-follow (lower tracking latency) is a legitimate later u
 the v1/v2 webhook-signing story is confirmed — not required for this milestone's exit
 criteria.
 
-**Reuse the transactional outbox for provider *submission*, not just email.** This is the
+**Reuse the transactional outbox for provider _submission_, not just email.** This is the
 strongest structural finding of this research. `outboxService.dispatchOne`
 (`outbox.service.ts:183-214`) already implements exactly the primitive M4 needs for
 "submit a PAID order to an external system, at-least-once, with retry/backoff/dead-letter,
@@ -309,7 +309,7 @@ immediately greppable in the Printful dashboard.
 
 One more concrete implementation note: `FulfillmentResult.status: "submitted" | "failed"`
 (`provider.ts:22-25`) already normalizes a **soft rejection** (e.g. an invalid address) into a
-*resolved* value, not a thrown error. `sendMessage`'s new case should treat
+_resolved_ value, not a thrown error. `sendMessage`'s new case should treat
 `result.status === "failed"` by persisting `FulfillmentStatus.FAILED` directly and returning
 normally (not throwing) — retrying an address Printful already rejected would just burn
 attempts for nothing; that's what the `permanent` branch of `settleFailure`
@@ -360,7 +360,7 @@ same handling `EmailNotConfiguredError` already gets (`outbox.service.ts:141,151
 Concretely: `PRINTFUL_API_KEY: optionalEnvString` in the schema (`env.ts:18-48`). This also
 directly answers "how local dev/build still work without a real key" — identically to how
 Resend already works today (no dummy-secret injection required beyond what local builds
-already need for the *required* Stripe/Better Auth keys). Never `NEXT_PUBLIC_*`; read only
+already need for the _required_ Stripe/Better Auth keys). Never `NEXT_PUBLIC_*`; read only
 inside `src/server/fulfillment/**`.
 
 ### Testing
@@ -466,38 +466,38 @@ Five to nine small, one-PR-each, dependency-ordered issues:
 1. **Schema migration** — `Order` shipping-address plus fulfillment-tracking columns,
    `FulfillmentStatus` enum, `ProductVariant.providerVariantId`, extend
    `OutboxMessageType` with `FULFILLMENT_SUBMISSION` plus `SHIPPING_CONFIRMATION`. Pure
-   Prisma/migration plus `pnpm db:check-migrations`; no application code. *(Foundation —
-   everything else depends on this.)*
+   Prisma/migration plus `pnpm db:check-migrations`; no application code. _(Foundation —
+   everything else depends on this.)_
 2. **Shipping-address checkout step** — extend `checkoutInputSchema` plus a
    `SHIPPING_COUNTRIES` allowlist, extend `CheckoutForm`/`startCheckoutAction`/
    `orderService.startCheckout`/`orderRepository.createWithItems` to collect and persist the
-   address; unit plus Playwright coverage. *(Depends on #1.)*
+   address; unit plus Playwright coverage. _(Depends on #1.)_
 3. **Admin catalog-mapping field** — add `providerVariantId` to the product/variant admin
-   form, validators, and repository write path. *(Depends on #1; independent of #2 —
-   parallelizable.)*
+   form, validators, and repository write path. _(Depends on #1; independent of #2 —
+   parallelizable.)_
 4. **Mock fulfillment provider plus `fulfillmentService` skeleton** —
    `src/server/fulfillment/mock.ts`, a new `fulfillmentService` that resolves the
    variant-to-provider mapping via the repository, builds `CreateFulfillmentInput`, and calls
    an injected `FulfillmentProvider`; unit-tested entirely against the mock. No real Printful
-   yet. *(Depends on #1, #3.)*
+   yet. _(Depends on #1, #3.)_
 5. **Printful provider adapter** — implement `PrintfulProvider.createOrder`/`getTracking`
    against the real v1 API; `PRINTFUL_API_KEY` added to `env.ts` (optional, per the Resend
    pattern); verify the exact recipient-field/status vocabulary against the live spec;
-   document the manual `confirm:false` smoke test. *(Depends on #4's interface shape.)*
+   document the manual `confirm:false` smoke test. _(Depends on #4's interface shape.)_
 6. **Submission wiring via the outbox** — enqueue `FULFILLMENT_SUBMISSION` in the PAID
    transaction (only when an address is present); `outbox.service.ts`'s `sendMessage` gains
-   the new case plus the `SUBMITTING` order-level guard; integration-tested. *(Depends on #4,
-   #5.)*
+   the new case plus the `SUBMITTING` order-level guard; integration-tested. _(Depends on #4,
+   #5.)_
 7. **Poll-fulfillment cron plus reconciliation** — new `/api/cron/poll-fulfillment` route
    (mirrors `sweep-orders`/`dispatch-outbox`), a guarded `PAID -> FULFILLED` plus
    tracking-field write, registered in `.github/workflows/cron.yml` and `vercel.json`;
-   integration-tested. *(Depends on #6.)*
+   integration-tested. _(Depends on #6.)_
 8. **Shipping-confirmation email** — `emailService.sendShippingConfirmation` plus outbox
-   wiring, enqueued by #7's reconciliation transaction. *(Depends on #7.)*
+   wiring, enqueued by #7's reconciliation transaction. _(Depends on #7.)_
 9. **Surface tracking in the UI** — admin order detail plus shopper `/account/orders/[id]`
    show the address, fulfillment status, and carrier/tracking link; update the manual "Mark
    fulfilled" button copy to read as a documented override now that automatic fulfillment
-   exists. *(Depends on #1; best landed last so it can show real end-to-end data from #2-#8.)*
+   exists. _(Depends on #1; best landed last so it can show real end-to-end data from #2-#8.)_
 
 ## References
 
