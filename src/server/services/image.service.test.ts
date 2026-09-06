@@ -39,7 +39,13 @@ vi.mock("@/server/repositories/image.repository", () => ({
     deleteImage: vi.fn(),
   },
 }));
-vi.mock("@/server/storage", () => ({ getStorageProvider: vi.fn() }));
+// Mock only the provider selector; keep the real `isSafeObjectKey` (a pure key-shape
+// predicate the service calls in `addImage`) so the traversal guard is exercised for
+// real, not stubbed out.
+vi.mock("@/server/storage", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/server/storage")>();
+  return { ...actual, getStorageProvider: vi.fn() };
+});
 
 const listImages = vi.mocked(imageRepository.listImages);
 const getImageCountForOwnedProduct = vi.mocked(
@@ -215,6 +221,19 @@ describe("imageService.addImage", () => {
       imageService.addImage(TENANT, PRODUCT, {
         url: "/uploads/tenants/tenant_2/products/prod_9/x.png",
         key: "tenants/tenant_2/products/prod_9/x.png",
+      }),
+    ).rejects.toBeInstanceOf(InvalidImageKeyError);
+    expect(createImage).not.toHaveBeenCalled();
+  });
+
+  it("rejects a prefix-valid key with an interior `..` traversal (defense-in-depth beyond startsWith)", async () => {
+    // Starts with the tenant's own prefix — so a startsWith-only pin would pass it —
+    // but the interior `..` resolves into another tenant's namespace, which the Blob
+    // adapter's `del` would forward verbatim. `isSafeObjectKey` refuses it.
+    await expect(
+      imageService.addImage(TENANT, PRODUCT, {
+        url: `/uploads/tenants/${TENANT}/products/${PRODUCT}/x.png`,
+        key: `tenants/${TENANT}/../tenant_2/products/prod_9/x.png`,
       }),
     ).rejects.toBeInstanceOf(InvalidImageKeyError);
     expect(createImage).not.toHaveBeenCalled();

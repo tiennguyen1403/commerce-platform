@@ -18,6 +18,9 @@ export type {
 } from "./provider";
 export { MockStorageProvider } from "./mock";
 export { VercelBlobStorageProvider } from "./vercel-blob";
+// The traversal-free key predicate, re-exported so callers outside this module (the
+// image service's `addImage` key gate) never deep-import `./object-key` directly.
+export { isSafeObjectKey } from "./object-key";
 
 // Lazily-constructed singletons (the `getStripe`/`getFulfillmentProvider` pattern).
 let mockSingleton: MockStorageProvider | null = null;
