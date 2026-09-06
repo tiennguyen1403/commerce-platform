@@ -259,6 +259,31 @@ export function isSafeImageUrl(url: string): boolean {
 }
 
 /**
+ * Should this image `src` bypass Next's on-demand image optimizer (render
+ * `unoptimized`)? The optimizer route (`/_next/image`) `require()`s `sharp`, which
+ * we deliberately don't install (M5 renders raw bytes — no transcode), so under
+ * `next start` in dev/CI any optimized image would throw. Same-origin sources — the
+ * demo seed (`/seed/…`) and the local upload mock (`/uploads/…`), i.e. any
+ * root-relative path — gain nothing from the optimizer and are rendered
+ * `unoptimized`; only a remote `https://` URL goes through the loader.
+ *
+ * `isSafeImageUrl` already guarantees a stored `url` is either `https://…` or a
+ * single-slash root-relative path, so in practice "not https" is exactly
+ * "same-origin". A `data:` URI also classifies as unoptimized (matching
+ * `next/image`'s own built-in handling), which keeps this a safe total classifier —
+ * though none is ever actually stored, since `isSafeImageUrl` rejects `data:`.
+ *
+ * The `https://` (optimized) branch additionally needs the Blob host added to
+ * `images.remotePatterns` in `next.config.ts` to render at all — a hard requirement
+ * regardless of where optimization runs. That config lands with the real Blob
+ * adapter in M5-06; until then every stored URL is root-relative and this returns
+ * `true`, so the optimizer is never reached.
+ */
+export function isUnoptimizedImageSrc(url: string): boolean {
+  return !/^https:\/\//i.test(url);
+}
+
+/**
  * The alt-text (caption) field, shared by the add and update image schemas. Trims,
  * length-caps, and collapses a blank/whitespace-only value to `undefined` (never
  * `""`, never `null`) — so "no caption" is one canonical value from the validation

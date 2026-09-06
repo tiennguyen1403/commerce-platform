@@ -42,9 +42,13 @@ async function ProductGrid() {
 
   return (
     <ul className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
-      {products.map((product) => (
+      {products.map((product, index) => (
         <li key={product.id}>
-          <ProductCard product={product} currency={currency} />
+          <ProductCard
+            product={product}
+            currency={currency}
+            preload={index === 0}
+          />
         </li>
       ))}
     </ul>
