@@ -60,7 +60,8 @@ Server Action, query, and tenant scope untouched.
 
 ## Out of scope (defer)
 
-- Any data / business-logic / schema change; new features (no "forgot password", no
+- Any data / business-logic / schema change; new features (no "forgot password" logic —
+  the M6-09 v2 _visual_ placeholder is recorded under Exceptions below — no
   related-products rail, no new routes).
 - Widening a query to feed the UI (e.g. cart-row thumbnails) — if the data isn't already
   loaded, that's a data change; defer, or note it here as an explicit exception.
@@ -92,6 +93,16 @@ deliberately crossed, per the escape hatch in Out of scope above._
     `cartService.resolveLine` (the add/update mutation path) also calls
     `findVariantsForTenant` and simply ignores the extra image field — a one-row
     over-fetch, the accepted cost of keeping a single tenant-scoped repo method.
+- **M6-09 v2 · planned sign-in affordances (#214, PR #226).** By an explicit product
+  decision on 2026-09-07, the storefront sign-in / sign-up cards ship the Direction A
+  design from the "Auth Redesign v2" canvas **including** two affordances the platform does
+  not implement yet: a "Forgot password?" link and a "Continue with Google / Apple" row.
+  They render as **disabled controls labelled "Coming soon"** — no auth logic, route, or
+  provider was added, so the UI-only rule still holds; they are visual placeholders for
+  later auth work (a new milestone, not M6). This overrides the issue text's "do not add
+  forgot password" guardrail for the visual layer only. The platform `(auth)` pages are
+  untouched (the shared `SignInForm` only gained an optional `passwordAction` slot the
+  platform never passes).
 
 ## Exit criteria
 
