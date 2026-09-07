@@ -12,9 +12,50 @@ for the full M3 writeup,
 [`docs/milestones/M4-fulfillment/handoff.md`](docs/milestones/M4-fulfillment/handoff.md)
 for the full M4 writeup, and
 [`docs/milestones/M5-product-images/handoff.md`](docs/milestones/M5-product-images/handoff.md)
-for the full M5 writeup.
+for the full M5 writeup, and
+[`docs/milestones/M6-ui-redesign/handoff.md`](docs/milestones/M6-ui-redesign/handoff.md)
+for the full M6 writeup.
 
 ## [Unreleased]
+
+## [vM6] — ui-redesign — 2026-09-08
+
+A visual refresh across the whole storefront and the platform's landing page — the same
+pages, carts, and checkout flow you had before, restyled to a calmer, more considered
+look with a consistent type scale, spacing, and one accent color throughout.
+
+### Added
+
+- Two new shared building blocks — a loading skeleton and a breadcrumb trail — used
+  across the redesigned pages.
+- A slide-out mobile navigation menu, replacing the old mobile header controls.
+
+### Changed
+
+- The storefront header, footer, and mobile menu have a new layout: navigation on the
+  left, search/cart/account grouped on the right, and a proper multi-column footer.
+- The product listing and search pages now show how many results there are and a clearer
+  empty state when nothing matches; search results also get a real numbered pager.
+- The cart now shows a small photo next to each item, carried through into the checkout
+  order summary too.
+- Checkout is now organized into clear, labeled sections (Contact, Shipping address,
+  Payment) with a step indicator, instead of one long form.
+- The order confirmation page now presents a clear summary of what happened — order
+  details and shipping address included — with a distinct look for a failed payment.
+- The account page, order history, and order detail page have a cleaner layout, with a
+  breadcrumb trail on the order detail page.
+- The sign-in and sign-up pages have a new card-based look and a show/hide toggle on the
+  password field. They also preview two upcoming options — signing in with Google/Apple,
+  and "Forgot password?" — shown as disabled "coming soon" controls; neither is
+  functional yet.
+- The platform's home page (the one you land on before picking or creating a store) has
+  been redesigned with a real hero section, a "what's live" overview, and a milestone
+  timeline, replacing the old placeholder badge.
+
+### Fixed
+
+- Opening the account menu on the storefront, or the store switcher in the admin, could
+  crash the page; both now open reliably.
 
 ## [vM5] — product-images — 2026-09-06
 
@@ -188,7 +229,8 @@ Stripe test-mode purchase; an admin manages the catalog behind auth.
   details — it verifies against the live Stripe payment first, closing an
   information-disclosure gap.
 
-[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM5...HEAD
+[unreleased]: https://github.com/tiennguyen1403/commerce-platform/compare/vM6...HEAD
+[vm6]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM6
 [vm5]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM5
 [vm4]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM4
 [vm3]: https://github.com/tiennguyen1403/commerce-platform/releases/tag/vM3

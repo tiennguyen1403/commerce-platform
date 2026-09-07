@@ -30,7 +30,7 @@ import { LandingStage } from "./landing-stage";
  */
 
 /** The status chip. Refresh at each milestone handoff (`/milestone-handoff`). */
-const STATUS = "Milestone 6 · UI redesign in progress";
+const STATUS = "Milestone 7 · Storefront v2 up next";
 
 const STACK = [
   "Next.js 16",
@@ -44,7 +44,7 @@ const STACK = [
   "Playwright",
 ];
 
-/** The roadmap (`docs/milestones/README.md`); `active` marks the one in progress. */
+/** The roadmap (`docs/milestones/README.md`); `active` marks the one up next. */
 const MILESTONES: ReadonlyArray<{
   id: string;
   label: string;
@@ -56,7 +56,8 @@ const MILESTONES: ReadonlyArray<{
   { id: "M3", label: "Platform" },
   { id: "M4", label: "Fulfillment" },
   { id: "M5", label: "Product images" },
-  { id: "M6", label: "UI redesign", active: true },
+  { id: "M6", label: "UI redesign" },
+  { id: "M7", label: "Storefront v2", active: true },
 ];
 
 /** What is live, per surface — every line is a shipped capability. */
@@ -258,7 +259,7 @@ export default function Home() {
                     <span className="text-muted-foreground text-xs">
                       {id}
                       {active ? (
-                        " · in progress"
+                        " · up next"
                       ) : (
                         <span className="sr-only"> · shipped</span>
                       )}
