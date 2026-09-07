@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { z } from "zod";
@@ -8,13 +8,28 @@ import { authClient } from "@/server/auth/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { PasswordInput } from "./password-input";
 
 const schema = z.object({
   email: z.email({ error: "Enter a valid email." }),
   password: z.string().min(1, { error: "Enter your password." }),
 });
 
-export function SignInForm({ redirectTo }: { redirectTo: string }) {
+/**
+ * Shared by the storefront's `/account/sign-in` and the platform's `/sign-in`
+ * (admin + onboarding). `passwordAction` is an optional slot rendered beside the
+ * Password label — the storefront passes its "Forgot password?" affordance; the
+ * platform pages pass nothing and render exactly as before. The `<Label
+ * htmlFor>` ↔ `id` association is untouched either way, so the E2E
+ * `getByLabel("Password")` keeps resolving to the input alone.
+ */
+export function SignInForm({
+  redirectTo,
+  passwordAction,
+}: {
+  redirectTo: string;
+  passwordAction?: ReactNode;
+}) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -64,11 +79,17 @@ export function SignInForm({ redirectTo }: { redirectTo: string }) {
         />
       </div>
       <div className="flex flex-col gap-2">
-        <Label htmlFor="password">Password</Label>
-        <Input
+        {passwordAction ? (
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="password">Password</Label>
+            {passwordAction}
+          </div>
+        ) : (
+          <Label htmlFor="password">Password</Label>
+        )}
+        <PasswordInput
           id="password"
           name="password"
-          type="password"
           autoComplete="current-password"
           aria-invalid={invalidField === "password" || undefined}
           required
