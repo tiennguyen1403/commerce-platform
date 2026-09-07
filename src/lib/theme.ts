@@ -116,19 +116,32 @@ function declarations(
  * `globals.css` uses, the dark recipe — so the accent follows the OS scheme
  * exactly like the base tokens do — for two selectors: the in-flow wrapper
  * ({@link TENANT_THEME_SELECTOR}) and any overlay portaled out of it
- * ({@link TENANT_THEME_PORTAL_SELECTOR}, #113). `hue` is validated here (the
- * interpolation boundary), so any caller value is safe.
+ * ({@link TENANT_THEME_PORTAL_SELECTOR}, #113). `hue` is validated in
+ * {@link scopedThemeCss} (the interpolation boundary), so any caller value is safe.
  */
 export function tenantThemeCss(hue: number): string {
-  const safe = resolveThemeHue(hue);
   // Theme the in-flow wrapper and any overlay portaled out of it (#113) from the
   // one recipe. The portal selector is document-wide, but this rule lives only in
   // the storefront subtree's <style>, so it never reaches (admin)/(auth).
-  const scope = `${TENANT_THEME_SELECTOR},${TENANT_THEME_PORTAL_SELECTOR}`;
+  return scopedThemeCss(
+    `${TENANT_THEME_SELECTOR},${TENANT_THEME_PORTAL_SELECTOR}`,
+    hue,
+  );
+}
+
+/**
+ * The same recipe scoped to an arbitrary selector — for a surface that shows a
+ * store's accent *outside* the storefront subtree, where several hues can sit
+ * side by side (the landing page's store illustrations, #215). `selector` is
+ * interpolated verbatim into CSS, so it must be a literal the caller owns, never
+ * user input; `hue` is validated here like everywhere else.
+ */
+export function scopedThemeCss(selector: string, hue: number): string {
+  const safe = resolveThemeHue(hue);
   return (
-    `${scope}{${declarations(TOKEN_RECIPE.light, safe)}}\n` +
+    `${selector}{${declarations(TOKEN_RECIPE.light, safe)}}\n` +
     `@media (prefers-color-scheme:dark){` +
-    `${scope}{${declarations(TOKEN_RECIPE.dark, safe)}}}`
+    `${selector}{${declarations(TOKEN_RECIPE.dark, safe)}}}`
   );
 }
 
