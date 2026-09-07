@@ -11,12 +11,19 @@ import { test, expect } from "@playwright/test";
  * subdomain (`RESERVED_SUBDOMAINS`). Chromium resolves `*.localhost` to
  * loopback on its own, so no DNS or hosts-file setup is involved.
  */
-const LANDING_URL = "http://www.localhost:3000/";
+/** The suite's `baseURL` moved onto the reserved `www.` subdomain, at `/`. */
+function landingUrl(baseURL: string | undefined): string {
+  const url = new URL(baseURL ?? "http://localhost:3000");
+  url.hostname = `www.${url.hostname}`;
+  url.pathname = "/";
+  return url.href;
+}
 
 test("landing page renders with its four unchanged targets", async ({
   page,
+  baseURL,
 }) => {
-  await page.goto(LANDING_URL);
+  await page.goto(landingUrl(baseURL));
 
   await expect(
     page.getByRole("heading", {

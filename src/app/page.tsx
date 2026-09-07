@@ -44,7 +44,7 @@ const STACK = [
   "Playwright",
 ];
 
-/** The roadmap (`docs/milestones/README.md`); the last entry is the active one. */
+/** The roadmap (`docs/milestones/README.md`); `active` marks the one in progress. */
 const MILESTONES: ReadonlyArray<{
   id: string;
   label: string;
@@ -87,7 +87,7 @@ const PILLARS: ReadonlyArray<{
     icon: Truck,
     title: "Fulfillment",
     lines: [
-      "Pluggable provider interface, mock adapter today",
+      "Printful and mock adapters behind one provider interface",
       "Idempotent submission via a transactional outbox",
       "Polled tracking marks orders fulfilled",
     ],
@@ -257,7 +257,11 @@ export default function Home() {
                   <span className="flex flex-col">
                     <span className="text-muted-foreground text-xs">
                       {id}
-                      {active ? " · in progress" : null}
+                      {active ? (
+                        " · in progress"
+                      ) : (
+                        <span className="sr-only"> · shipped</span>
+                      )}
                     </span>
                     <span className="text-sm font-medium">{label}</span>
                   </span>
@@ -273,7 +277,7 @@ export default function Home() {
               {STACK.map((item) => (
                 <li
                   key={item}
-                  className="bg-muted text-muted-foreground rounded-md px-2.5 py-1 text-sm"
+                  className="bg-secondary text-secondary-foreground rounded-md px-2.5 py-1 text-sm"
                 >
                   {item}
                 </li>
@@ -283,14 +287,17 @@ export default function Home() {
         </section>
 
         <section
-          aria-label="Create your store"
+          aria-labelledby="landing-cta"
           className="mx-auto w-full max-w-6xl px-4 pb-16 md:px-6 lg:pb-20"
         >
           <div className="bg-accent flex flex-col gap-5 rounded-2xl p-6 sm:p-8 lg:flex-row lg:items-center lg:justify-between lg:gap-8 lg:px-12 lg:py-10">
             <div className="flex max-w-xl flex-col gap-2">
-              <p className="text-2xl font-semibold tracking-tight text-pretty sm:text-3xl">
+              <h2
+                id="landing-cta"
+                className="text-2xl font-semibold tracking-tight text-pretty sm:text-3xl"
+              >
                 Start a store on its own subdomain.
-              </p>
+              </h2>
               <p className="text-accent-foreground text-sm text-pretty sm:text-base">
                 Name it, pick a subdomain, and it is live with its own admin,
                 accent, and checkout.

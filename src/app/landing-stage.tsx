@@ -25,6 +25,7 @@ const AURORA_HUE = 285;
 type StoreWindowSpec = {
   id: "demo" | "aurora";
   name: string;
+  /** What the store's listing counts — ACTIVE products only, never drafts. */
   count: number;
   products: ReadonlyArray<{ title: string; price: string }>;
 };
@@ -32,7 +33,7 @@ type StoreWindowSpec = {
 const DEMO: StoreWindowSpec = {
   id: "demo",
   name: "Demo Store",
-  count: 5,
+  count: 4,
   products: [
     { title: "Classic Tee", price: "From $19.99" },
     { title: "Everyday Hoodie", price: "From $49.00" },
@@ -68,7 +69,7 @@ export function LandingStage() {
         {/* Aurora sits behind and to the left, so its brand tile and name show
             beside the front window: the second store's accent at a glance. */}
         <div className="absolute top-0 left-0 w-[calc(100%-2.5rem)] sm:w-[420px]">
-          <StoreWindow store={AURORA} />
+          <StoreWindow store={AURORA} back />
         </div>
         <div className="relative pl-10 sm:pl-[100px]">
           <StoreWindow store={DEMO} className="w-full sm:w-[420px]" />
@@ -84,23 +85,29 @@ export function LandingStage() {
  * miniature switches at `sm` rather than the chrome's `md` because that is
  * where its 420px desktop width first fits the 568px stage), the count
  * toolbar, and the product grid (two tiles on the mobile row, three from `sm`).
+ *
+ * `back` marks the window that sits behind the other: only its left edge stays
+ * visible, so the header's nav and utilities — which would be cut mid-word by
+ * the front window — are omitted there.
  */
 function StoreWindow({
   store,
+  back = false,
   className,
 }: {
   store: StoreWindowSpec;
+  back?: boolean;
   className?: string;
 }) {
   return (
     <div
       data-store-window={store.id}
       className={cn(
-        "bg-card text-card-foreground ring-foreground/10 overflow-hidden rounded-xl text-xs shadow-[0_16px_40px_-16px_rgba(0,0,0,0.22)] ring-1",
+        "bg-card text-card-foreground ring-foreground/10 overflow-hidden rounded-xl text-xs shadow-lg ring-1",
         className,
       )}
     >
-      <div className="bg-muted text-muted-foreground flex h-7 items-center gap-2 border-b px-3 text-[11px] whitespace-nowrap">
+      <div className="bg-muted text-muted-foreground flex h-7 items-center gap-2 border-b px-3 whitespace-nowrap">
         <Globe className="size-3 shrink-0" />
         <span>
           <span className="text-foreground font-medium">{store.id}</span>
@@ -116,31 +123,31 @@ function StoreWindow({
           </span>
           {store.name}
         </span>
-        <span className="hidden font-medium sm:inline">Products</span>
-        <span className="ml-auto hidden items-center gap-1.5 sm:flex">
-          <span className="border-input text-muted-foreground flex h-6 w-22 items-center rounded-md border px-2 text-[11px]">
-            Search…
-          </span>
-          <span className="flex h-6 items-center gap-1 rounded-md border px-2 text-[11px] font-medium whitespace-nowrap">
-            <ShoppingCart className="size-3" />
-            Cart
-          </span>
-          <span className="flex h-6 items-center gap-1 px-1 text-[11px] font-medium whitespace-nowrap">
-            <LogIn className="size-3" />
-            Sign in
-          </span>
-        </span>
-        <ShoppingCart className="ml-auto size-4 shrink-0 sm:hidden" />
+        {back ? null : (
+          <>
+            <span className="hidden font-medium sm:inline">Products</span>
+            <span className="ml-auto hidden items-center gap-1.5 sm:flex">
+              <span className="border-input text-muted-foreground flex h-6 w-18 items-center rounded-md border px-2">
+                Search…
+              </span>
+              <span className="flex h-6 items-center gap-1 rounded-md border px-2 font-medium whitespace-nowrap">
+                <ShoppingCart className="size-3" />
+                Cart
+              </span>
+              <span className="flex h-6 items-center gap-1 px-1 font-medium whitespace-nowrap">
+                <LogIn className="size-3" />
+                Sign in
+              </span>
+            </span>
+            <ShoppingCart className="ml-auto size-4 shrink-0 sm:hidden" />
+          </>
+        )}
       </div>
 
       <div className="p-3.5">
         <div className="mb-2.5 flex items-baseline justify-between gap-2">
-          <span className="text-[13px] font-semibold tracking-tight">
-            All products
-          </span>
-          <span className="text-muted-foreground text-[11px]">
-            {store.count} products
-          </span>
+          <span className="font-semibold tracking-tight">All products</span>
+          <span className="text-muted-foreground">{store.count} products</span>
         </div>
         <ul className="grid grid-cols-2 gap-2.5 sm:grid-cols-3">
           {store.products.map((product, index) => (

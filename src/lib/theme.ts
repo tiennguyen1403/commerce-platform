@@ -116,8 +116,8 @@ function declarations(
  * `globals.css` uses, the dark recipe — so the accent follows the OS scheme
  * exactly like the base tokens do — for two selectors: the in-flow wrapper
  * ({@link TENANT_THEME_SELECTOR}) and any overlay portaled out of it
- * ({@link TENANT_THEME_PORTAL_SELECTOR}, #113). `hue` is validated here (the
- * interpolation boundary), so any caller value is safe.
+ * ({@link TENANT_THEME_PORTAL_SELECTOR}, #113). `hue` is validated in
+ * {@link scopedThemeCss} (the interpolation boundary), so any caller value is safe.
  */
 export function tenantThemeCss(hue: number): string {
   // Theme the in-flow wrapper and any overlay portaled out of it (#113) from the
