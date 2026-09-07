@@ -157,7 +157,7 @@ jobs:
       # Playwright boots `pnpm start` (prod build) itself and runs the whole e2e/
       # suite: the checkout flow above plus the admin auth-gate spec.
       - run: pnpm test:e2e
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         # Upload the report on failures too (it's how a red run is diagnosed), but
         # not when the job was cancelled.
         if: ${{ !cancelled() }}
