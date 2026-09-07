@@ -70,6 +70,10 @@ export type CartItem = {
   lineTotalCents: number;
   /** Sellable units (`stock - reserved`) — the qty ceiling shown on the cart. */
   available: number;
+  /** The product's primary image for the cart-row thumbnail, or `null` when it
+   *  has none. Display-only (`ProductImageFrame`-renderable) — the cart never
+   *  prices or reconciles from it. Added in M6-05 (see `getCartView`). */
+  image: { url: string; altText: string | null } | null;
 };
 
 // --- Pure reducers ---------------------------------------------------------

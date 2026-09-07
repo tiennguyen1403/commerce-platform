@@ -66,17 +66,24 @@ export default async function AccountOrdersPage({
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-10">
       <div className="flex flex-col gap-1">
         <h1 className="text-2xl font-semibold tracking-tight">My orders</h1>
-        <p className="text-muted-foreground text-sm">
-          Review the orders you&rsquo;ve placed with this store.
-        </p>
+        {total > 0 ? (
+          <p className="text-muted-foreground text-sm tabular-nums">
+            {total} {total === 1 ? "order" : "orders"}
+          </p>
+        ) : null}
       </div>
 
       {total === 0 ? (
         <Card>
-          <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
-            <Receipt className="text-muted-foreground size-8" aria-hidden />
+          <CardContent className="flex flex-col items-center gap-4 py-14 text-center">
+            <span
+              aria-hidden
+              className="bg-muted text-muted-foreground flex size-14 items-center justify-center rounded-full"
+            >
+              <Receipt className="size-7" />
+            </span>
             <div className="flex flex-col gap-1">
-              <p className="font-medium">No orders yet</p>
+              <p className="text-base font-medium">No orders yet</p>
               <p className="text-muted-foreground text-sm">
                 Your orders will appear here once you complete checkout.
               </p>
@@ -109,7 +116,7 @@ export default async function AccountOrdersPage({
           <Card className="py-0">
             <Table>
               <TableHeader>
-                <TableRow>
+                <TableRow className="bg-muted/50">
                   <TableHead>Order</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">Total</TableHead>
@@ -123,7 +130,9 @@ export default async function AccountOrdersPage({
                   <TableRow key={order.id}>
                     <TableCell className="font-medium">
                       <div className="flex flex-col">
-                        <span>{order.orderNumber}</span>
+                        <span className="tabular-nums">
+                          {order.orderNumber}
+                        </span>
                         <span className="text-muted-foreground text-xs">
                           {formatDate(order.createdAt)}
                         </span>
@@ -134,12 +143,13 @@ export default async function AccountOrdersPage({
                         {ORDER_STATUS_LABELS[order.status]}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-right">
+                    <TableCell className="text-right tabular-nums">
                       {formatMoney(order.totalCents, order.currency)}
                     </TableCell>
                     <TableCell className="text-right">
                       <Link
                         href={`/account/orders/${order.id}`}
+                        aria-label={`View order ${order.orderNumber}`}
                         className={buttonVariants({
                           variant: "outline",
                           size: "sm",

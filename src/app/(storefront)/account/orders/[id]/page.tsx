@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
-import { ArrowLeft, Truck } from "lucide-react";
+import { Receipt, Truck } from "lucide-react";
 import { getShopperSession } from "@/server/auth/shopper-context";
 import { getStoreTenant } from "@/server/store-context";
 import { orderService } from "@/server/services/order.service";
@@ -15,7 +15,15 @@ import {
 } from "@/lib/validators/orders";
 import { Badge } from "@/components/ui/badge";
 import { buttonVariants } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
+import { Card } from "@/components/ui/card";
 import {
   Table,
   TableBody,
@@ -24,6 +32,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { SectionPanel } from "../../section-panel";
 
 export const metadata: Metadata = { title: "Order" };
 
@@ -57,7 +66,7 @@ export default async function AccountOrderDetailPage({
   // different store all resolve to null. Awaited directly (not wrapped in
   // Suspense) and this segment has no `loading.tsx`, so `notFound()` yields a
   // real 404 — a streamed boundary would turn it into a soft-404 (a 200 with the
-  // not-found UI).
+  // not-found UI). Do NOT add a route-level loading boundary under this segment.
   const order = await orderService.getOrderForUser(
     tenantId,
     session.user.id,
@@ -81,33 +90,46 @@ export default async function AccountOrderDetailPage({
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-10">
-      <div className="flex flex-col gap-2">
-        <Link
-          href="/account/orders"
-          className="text-muted-foreground hover:text-foreground inline-flex w-fit items-center gap-1 text-sm font-medium"
-        >
-          <ArrowLeft className="size-4" aria-hidden />
-          Back to orders
-        </Link>
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-semibold tracking-tight">
-              {order.orderNumber}
-            </h1>
-            <Badge variant={ORDER_STATUS_BADGE[status]}>
-              {ORDER_STATUS_LABELS[status]}
-            </Badge>
-          </div>
-          <p className="text-muted-foreground text-sm">
-            Placed {formatDate(order.createdAt, true)}
-          </p>
+      {/* Breadcrumb replaces the old "Back to orders" link (#M6-01 primitive);
+          the "Orders" crumb is the way back. */}
+      <Breadcrumb>
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            <BreadcrumbLink render={<Link href="/account" />}>
+              Account
+            </BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbLink render={<Link href="/account/orders" />}>
+              Orders
+            </BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem className="min-w-0">
+            <BreadcrumbPage>{order.orderNumber}</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+
+      <div className="flex flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {order.orderNumber}
+          </h1>
+          <Badge variant={ORDER_STATUS_BADGE[status]}>
+            {ORDER_STATUS_LABELS[status]}
+          </Badge>
         </div>
+        <p className="text-muted-foreground text-sm">
+          Placed {formatDate(order.createdAt, true)}
+        </p>
       </div>
 
       <Card className="py-0">
         <Table>
           <TableHeader>
-            <TableRow>
+            <TableRow className="hover:bg-transparent">
               <TableHead>Item</TableHead>
               <TableHead className="text-right">Qty</TableHead>
               <TableHead className="text-right">Unit price</TableHead>
@@ -120,13 +142,13 @@ export default async function AccountOrderDetailPage({
                 <TableCell className="font-medium">
                   {item.titleSnapshot}
                 </TableCell>
-                <TableCell className="text-muted-foreground text-right">
+                <TableCell className="text-muted-foreground text-right tabular-nums">
                   {item.quantity}
                 </TableCell>
-                <TableCell className="text-muted-foreground text-right">
+                <TableCell className="text-muted-foreground text-right tabular-nums">
                   {formatMoney(item.priceCents, order.currency)}
                 </TableCell>
-                <TableCell className="text-right">
+                <TableCell className="text-right tabular-nums">
                   {formatMoney(item.priceCents * item.quantity, order.currency)}
                 </TableCell>
               </TableRow>
@@ -135,7 +157,7 @@ export default async function AccountOrderDetailPage({
               <TableCell colSpan={3} className="font-semibold">
                 Total
               </TableCell>
-              <TableCell className="text-right font-semibold">
+              <TableCell className="text-right font-semibold tabular-nums">
                 {formatMoney(order.totalCents, order.currency)}
               </TableCell>
             </TableRow>
@@ -144,11 +166,12 @@ export default async function AccountOrderDetailPage({
       </Card>
 
       {showShipping ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Shipping</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-5 text-sm">
+        <SectionPanel
+          icon={Truck}
+          title="Shipping"
+          description="Delivery status and where it's headed."
+        >
+          <div className="flex flex-col gap-5 text-sm">
             {shipment ? (
               <div className="flex flex-col gap-1">
                 <p className="font-medium">{shipment.label}</p>
@@ -167,7 +190,9 @@ export default async function AccountOrderDetailPage({
                 {order.trackingNumber ? (
                   <div className="flex flex-col gap-1">
                     <dt className="text-muted-foreground">Tracking number</dt>
-                    <dd className="break-all">{order.trackingNumber}</dd>
+                    <dd className="break-all tabular-nums">
+                      {order.trackingNumber}
+                    </dd>
                   </div>
                 ) : null}
               </dl>
@@ -197,27 +222,26 @@ export default async function AccountOrderDetailPage({
                 </address>
               </div>
             ) : null}
-          </CardContent>
-        </Card>
+          </div>
+        </SectionPanel>
       ) : null}
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Details</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <dl className="grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
-            <div className="flex flex-col gap-1">
-              <dt className="text-muted-foreground">Placed</dt>
-              <dd>{formatDate(order.createdAt, true)}</dd>
-            </div>
-            <div className="flex flex-col gap-1">
-              <dt className="text-muted-foreground">Confirmation sent to</dt>
-              <dd className="break-words">{order.email}</dd>
-            </div>
-          </dl>
-        </CardContent>
-      </Card>
+      <SectionPanel
+        icon={Receipt}
+        title="Order details"
+        description="Order and contact information."
+      >
+        <dl className="grid gap-x-6 gap-y-4 text-sm sm:grid-cols-2">
+          <div className="flex flex-col gap-1">
+            <dt className="text-muted-foreground">Placed</dt>
+            <dd>{formatDate(order.createdAt, true)}</dd>
+          </div>
+          <div className="flex flex-col gap-1">
+            <dt className="text-muted-foreground">Confirmation sent to</dt>
+            <dd className="break-words">{order.email}</dd>
+          </div>
+        </dl>
+      </SectionPanel>
     </div>
   );
 }

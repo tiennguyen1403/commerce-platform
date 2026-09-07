@@ -56,3 +56,4 @@ docs/milestones/
 | M3        | platform         | ✅ done |
 | M4        | fulfillment      | ✅ done |
 | M5        | product-images   | ✅ done |
+| M6        | ui-redesign      | ✅ done |

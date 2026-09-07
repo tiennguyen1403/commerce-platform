@@ -1,12 +1,20 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { ArrowLeft, Info, ShoppingCart } from "lucide-react";
+import { ArrowLeft, Info, Lock, ShoppingCart } from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
 import { readCart } from "@/server/cart-cookie";
 import { cartService } from "@/server/services/cart.service";
 import { formatMoney } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardFooter,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { ProductImageFrame } from "../products/product-image";
 import { CheckoutForm } from "./checkout-form";
 
 export const metadata: Metadata = {
@@ -34,10 +42,17 @@ export default async function CheckoutPage() {
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-8 px-6 py-10">
         <header className="flex flex-col gap-1">
           <h1 className="text-3xl font-semibold tracking-tight">Checkout</h1>
+          <p className="text-muted-foreground">
+            Enter your details and pay securely to place your order.
+          </p>
         </header>
+        {/* The house tinted-circle empty state, shared with /cart, /products and
+            /search — a neutral circle, not the success/error tints. */}
         <Card>
-          <CardContent className="flex flex-col items-center gap-4 py-16 text-center">
-            <ShoppingCart className="text-muted-foreground size-8" />
+          <CardContent className="flex flex-col items-center gap-5 py-16 text-center">
+            <span className="bg-muted text-muted-foreground flex size-14 items-center justify-center rounded-full">
+              <ShoppingCart className="size-7" aria-hidden />
+            </span>
             <div className="flex flex-col gap-1">
               <p className="font-medium">Your cart is empty</p>
               <p className="text-muted-foreground text-sm">
@@ -77,11 +92,7 @@ export default async function CheckoutPage() {
             </div>
           ) : null}
 
-          <Card>
-            <CardContent className="py-6">
-              <CheckoutForm />
-            </CardContent>
-          </Card>
+          <CheckoutForm />
 
           <Button
             variant="ghost"
@@ -98,20 +109,29 @@ export default async function CheckoutPage() {
         <Card className="lg:sticky lg:top-6">
           <CardHeader>
             <CardTitle>Order summary</CardTitle>
+            <CardDescription>{itemLabel(cart.itemCount)}</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4 text-sm">
             <ul className="flex flex-col gap-3">
               {cart.items.map((item) => (
-                <li
-                  key={item.variantId}
-                  className="flex items-start justify-between gap-3"
-                >
-                  <div className="flex min-w-0 flex-col">
+                <li key={item.variantId} className="flex items-center gap-3">
+                  {/* Recognition thumbnail — display-only, not a link (checkout
+                      shouldn't invite navigating away). The frame owns the square;
+                      ProductImageFrame fills it or shows the placeholder icon. */}
+                  <span className="bg-muted relative flex size-12 shrink-0 items-center justify-center overflow-hidden rounded-md border">
+                    <ProductImageFrame
+                      image={item.image}
+                      productTitle={item.productTitle}
+                      sizes="48px"
+                      iconClassName="size-5"
+                    />
+                  </span>
+                  <div className="flex min-w-0 flex-1 flex-col">
                     <span className="truncate font-medium">
                       {item.productTitle}
                     </span>
-                    <span className="text-muted-foreground">
-                      {item.variantName} · {itemLabel(item.qty)}
+                    <span className="text-muted-foreground text-xs">
+                      {item.variantName} · Qty {item.qty}
                     </span>
                   </div>
                   <span className="shrink-0 font-medium tabular-nums">
@@ -128,6 +148,12 @@ export default async function CheckoutPage() {
               </span>
             </div>
           </CardContent>
+          <CardFooter>
+            <p className="text-muted-foreground flex items-center gap-1.5 text-xs">
+              <Lock className="size-3 shrink-0" aria-hidden />
+              Secure, encrypted checkout.
+            </p>
+          </CardFooter>
         </Card>
       </div>
     </div>

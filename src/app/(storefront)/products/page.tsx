@@ -27,8 +27,10 @@ async function ProductGrid() {
   if (products.length === 0) {
     return (
       <Card>
-        <CardContent className="flex flex-col items-center gap-3 py-16 text-center">
-          <PackageX className="text-muted-foreground size-8" />
+        <CardContent className="flex flex-col items-center gap-5 py-16 text-center">
+          <span className="bg-muted text-muted-foreground flex size-14 items-center justify-center rounded-full">
+            <PackageX className="size-7" aria-hidden />
+          </span>
           <div className="flex flex-col gap-1">
             <p className="font-medium">No products yet</p>
             <p className="text-muted-foreground text-sm">
@@ -41,17 +43,28 @@ async function ProductGrid() {
   }
 
   return (
-    <ul className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
-      {products.map((product, index) => (
-        <li key={product.id}>
-          <ProductCard
-            product={product}
-            currency={currency}
-            preload={index === 0}
-          />
-        </li>
-      ))}
-    </ul>
+    <div className="flex flex-col gap-5">
+      {/* Result count. A sort/filter affordance would sit on the right, but any
+          control that reorders/narrows the grid would change the query — out of
+          scope for this UI-only pass, so the slot stays reserved for later. */}
+      <div className="border-border flex items-center justify-between border-b pb-4 text-sm">
+        <p className="text-muted-foreground tabular-nums">
+          {products.length} {products.length === 1 ? "product" : "products"}
+        </p>
+      </div>
+
+      <ul className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
+        {products.map((product, index) => (
+          <li key={product.id}>
+            <ProductCard
+              product={product}
+              currency={currency}
+              preload={index === 0}
+            />
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 

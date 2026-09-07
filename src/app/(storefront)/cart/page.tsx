@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { ArrowLeft, Info, ShoppingCart } from "lucide-react";
+import { ArrowLeft, Info, Lock, ShoppingCart } from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
 import { readCart } from "@/server/cart-cookie";
 import { cartService } from "@/server/services/cart.service";
@@ -47,9 +47,12 @@ export default async function CartPage() {
       </header>
 
       {cart.items.length === 0 ? (
+        // The house tinted-circle empty state, shared with /products and /search.
         <Card>
-          <CardContent className="flex flex-col items-center gap-4 py-16 text-center">
-            <ShoppingCart className="text-muted-foreground size-8" />
+          <CardContent className="flex flex-col items-center gap-5 py-16 text-center">
+            <span className="bg-muted text-muted-foreground flex size-14 items-center justify-center rounded-full">
+              <ShoppingCart className="size-7" aria-hidden />
+            </span>
             <div className="flex flex-col gap-1">
               <p className="font-medium">Your cart is empty</p>
               <p className="text-muted-foreground text-sm">
@@ -145,7 +148,8 @@ export default async function CartPage() {
               >
                 Checkout
               </Button>
-              <p className="text-muted-foreground text-center text-xs">
+              <p className="text-muted-foreground flex items-center justify-center gap-1.5 text-center text-xs">
+                <Lock className="size-3 shrink-0" aria-hidden />
                 You won&apos;t be charged until you confirm payment.
               </p>
             </CardFooter>

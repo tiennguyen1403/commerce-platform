@@ -2,16 +2,18 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { cache } from "react";
-import {
-  ChevronRight,
-  Globe,
-  ImageIcon,
-  ShieldCheck,
-  Truck,
-} from "lucide-react";
+import { Globe, ImageIcon, ShieldCheck, Truck } from "lucide-react";
 import { getStoreTenant } from "@/server/store-context";
 import { catalogService } from "@/server/services/catalog.service";
 import { availableUnits } from "@/lib/inventory";
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
 import { PurchasePanel } from "./purchase-panel";
 import { ProductGallery } from "./product-gallery";
 
@@ -59,18 +61,19 @@ export default async function ProductDetailPage({
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 px-6 py-10">
       {/* Breadcrumb (replaces the old back link). */}
-      <nav
-        aria-label="Breadcrumb"
-        className="text-muted-foreground flex items-center gap-2 text-sm"
-      >
-        <Link href="/products" className="hover:text-foreground font-medium">
-          All products
-        </Link>
-        <ChevronRight className="size-4 shrink-0" aria-hidden />
-        <span className="text-foreground min-w-0 truncate font-medium">
-          {product.title}
-        </span>
-      </nav>
+      <Breadcrumb>
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            <BreadcrumbLink render={<Link href="/products" />}>
+              All products
+            </BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem className="min-w-0">
+            <BreadcrumbPage>{product.title}</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2 md:gap-12">
         {/* Gallery: a real main image + thumbnail rail when the product has images,
