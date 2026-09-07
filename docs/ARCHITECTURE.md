@@ -358,5 +358,31 @@ of `FulfillmentNotConfiguredError`).
   a Cloudflare account, a custom domain for public reads, and the heaviest SDK — so the seam
   makes swapping to it a one-adapter change rather than the default. See
   `docs/milestones/M5-product-images/research.md`.
+- **UI-only milestone discipline as a first-class constraint** (M6) — restyle
+  presentation, never data: every restyle PR keeps its client component's props and
+  Server Action calls byte-identical (`PurchasePanel`/`CartItems`/`CheckoutForm`). The one
+  sanctioned crossing this milestone — a minimal cart-row image read (#210) — is recorded
+  by name in `docs/milestones/M6-ui-redesign/GOAL.md` → Exceptions rather than left
+  implicit.
+- **Shared UI primitives added on demand, not upfront** (M6) — `Skeleton` + `Breadcrumb`
+  shipped first (#206, both already had consumers); `Sheet` landed only once the mobile
+  chrome needed a drawer (#207). Both follow the base-nova pattern (`useRender`/
+  `mergeProps`, a `render` prop rather than `asChild`, server-safe, no `"use client"`
+  unless truly interactive); any new body-portal overlay stamps
+  `TENANT_THEME_PORTAL_ATTR`.
+- **`scopedThemeCss(selector, hue)` extracted from `tenantThemeCss`** (M6, #215) — lets
+  the apex landing page paint two seeded store themes on one static page
+  (`src/app/landing-stage.tsx`); `tenantThemeCss` now delegates to it, byte-identical
+  output asserted in `theme.test.ts`; the hue is still validated to an int 0–359 before
+  either function touches it.
+- **The `SectionPanel` idiom (Card + accent icon chip + heading + description)** (M6) —
+  unifies checkout, order-confirmation, and account visually, but is kept as small local,
+  server-safe copies per surface rather than extracted into a shared component after only
+  three call sites.
+- **The apex landing page kept inside the UI-only milestone by explicit scope decision**
+  (M6, #215) — it is the platform's `/`, not a `(storefront)` screen (a tenant host's `/`
+  redirects to `/products`), so research recommended it out of scope; kept in for
+  portfolio leverage. It stays fully static — no tenant/session/DB read — and prerenders
+  at build.
 
 Update this log whenever a structural decision is made (the `scribe` agent owns this).
