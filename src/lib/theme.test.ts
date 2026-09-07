@@ -4,8 +4,34 @@ import {
   TENANT_THEME_SELECTOR,
   TENANT_THEME_PORTAL_SELECTOR,
   resolveThemeHue,
+  scopedThemeCss,
   tenantThemeCss,
 } from "@/lib/theme";
+
+describe("scopedThemeCss", () => {
+  it("emits the same light + dark recipe under the caller's selector", () => {
+    const css = scopedThemeCss('[data-store-window="aurora"]', 285);
+    expect(css).toContain(
+      '[data-store-window="aurora"]{--primary:oklch(0.5 0.12 285);',
+    );
+    expect(css).toContain(
+      '@media (prefers-color-scheme:dark){[data-store-window="aurora"]{--primary:oklch(0.72 0.14 285);',
+    );
+    // Scoped to the selector only — never the root, never the storefront wrapper.
+    expect(css).not.toContain(":root");
+    expect(css).not.toContain(TENANT_THEME_SELECTOR);
+  });
+
+  it("is what tenantThemeCss is built on (one recipe, no drift)", () => {
+    const scope = `${TENANT_THEME_SELECTOR},${TENANT_THEME_PORTAL_SELECTOR}`;
+    expect(tenantThemeCss(285)).toBe(scopedThemeCss(scope, 285));
+  });
+
+  it("validates the hue like every other entry point", () => {
+    const css = scopedThemeCss(".x", 999);
+    expect(css).toContain(`--primary:oklch(0.5 0.12 ${DEFAULT_THEME_HUE});`);
+  });
+});
 
 describe("resolveThemeHue", () => {
   it("passes through a valid integer hue in [0, 359]", () => {
