@@ -1,6 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { UserPlus } from "lucide-react";
 import { SignUpForm } from "@/components/auth/sign-up-form";
+import {
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+} from "@/components/ui/card";
 import { safeInternalPath } from "@/lib/safe-redirect";
 import { getStoreTenant } from "@/server/store-context";
 
@@ -31,26 +38,39 @@ export default async function ShopperSignUpPage({
     : "/account/sign-in";
 
   return (
-    <div className="mx-auto flex w-full max-w-sm flex-col gap-6 px-6 py-16">
-      <div className="flex flex-col gap-2">
-        <h1 className="text-2xl font-semibold tracking-tight">
-          Create your account
-        </h1>
-        <p className="text-muted-foreground text-sm">
-          Sign up to check out faster and keep track of your {tenantName}{" "}
-          orders.
-        </p>
-      </div>
-      <SignUpForm redirectTo={redirectTo} />
-      <p className="text-muted-foreground text-center text-sm">
-        Already have an account?{" "}
-        <Link
-          href={signInHref}
-          className="text-foreground font-medium underline underline-offset-4"
-        >
-          Sign in
-        </Link>
-      </p>
+    <div className="mx-auto w-full max-w-sm px-6 py-16">
+      <Card>
+        <CardHeader>
+          <div className="flex items-start gap-3">
+            <span className="bg-accent text-primary flex size-9 shrink-0 items-center justify-center rounded-lg">
+              <UserPlus className="size-5" aria-hidden />
+            </span>
+            <div className="flex flex-col gap-1">
+              <h1 className="text-lg font-semibold tracking-tight">
+                Create your account
+              </h1>
+              <p className="text-muted-foreground text-sm">
+                Sign up to check out faster and keep track of your {tenantName}{" "}
+                orders.
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <SignUpForm redirectTo={redirectTo} />
+        </CardContent>
+        <CardFooter className="justify-center">
+          <p className="text-muted-foreground text-sm">
+            Already have an account?{" "}
+            <Link
+              href={signInHref}
+              className="text-foreground font-medium underline underline-offset-4"
+            >
+              Sign in
+            </Link>
+          </p>
+        </CardFooter>
+      </Card>
     </div>
   );
 }

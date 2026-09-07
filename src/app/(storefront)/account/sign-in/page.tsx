@@ -1,6 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { LogIn } from "lucide-react";
 import { SignInForm } from "@/components/auth/sign-in-form";
+import {
+  Card,
+  CardContent,
+  CardFooter,
+  CardHeader,
+} from "@/components/ui/card";
 import { safeInternalPath } from "@/lib/safe-redirect";
 import { getStoreTenant } from "@/server/store-context";
 
@@ -38,23 +45,39 @@ export default async function ShopperSignInPage({
     : "/account/sign-up";
 
   return (
-    <div className="mx-auto flex w-full max-w-sm flex-col gap-6 px-6 py-16">
-      <div className="flex flex-col gap-2">
-        <h1 className="text-2xl font-semibold tracking-tight">Welcome back</h1>
-        <p className="text-muted-foreground text-sm">
-          Sign in to {tenantName} to check out faster and track your orders.
-        </p>
-      </div>
-      <SignInForm redirectTo={redirectTo} />
-      <p className="text-muted-foreground text-center text-sm">
-        New to {tenantName}?{" "}
-        <Link
-          href={signUpHref}
-          className="text-foreground font-medium underline underline-offset-4"
-        >
-          Create an account
-        </Link>
-      </p>
+    <div className="mx-auto w-full max-w-sm px-6 py-16">
+      <Card>
+        <CardHeader>
+          <div className="flex items-start gap-3">
+            <span className="bg-accent text-primary flex size-9 shrink-0 items-center justify-center rounded-lg">
+              <LogIn className="size-5" aria-hidden />
+            </span>
+            <div className="flex flex-col gap-1">
+              <h1 className="text-lg font-semibold tracking-tight">
+                Welcome back
+              </h1>
+              <p className="text-muted-foreground text-sm">
+                Sign in to {tenantName} to check out faster and track your
+                orders.
+              </p>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <SignInForm redirectTo={redirectTo} />
+        </CardContent>
+        <CardFooter className="justify-center">
+          <p className="text-muted-foreground text-sm">
+            New to {tenantName}?{" "}
+            <Link
+              href={signUpHref}
+              className="text-foreground font-medium underline underline-offset-4"
+            >
+              Create an account
+            </Link>
+          </p>
+        </CardFooter>
+      </Card>
     </div>
   );
 }
