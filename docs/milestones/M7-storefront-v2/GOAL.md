@@ -162,7 +162,10 @@ here if building forces a change._
    (`qty` int 1–`MAX_CART_QTY` = 99, default 1) — no Server Action, schema, or service
    change. "Add" is an increment and the service clamps to live stock, so the stepper caps
    at `min(available, 99)`. The default still adds one unit, so `checkout.spec.ts`'s "Add to
-   cart" flow is byte-identical.
+   cart" flow is byte-identical. _Amended while building #237:_ `PurchasePanel` also gains a
+   display-only `productTitle` prop (the mobile buy bar names the product; the page already
+   holds the title, so no new read) — a client prop-shape growth of the same kind as
+   Exception 2's `GalleryImage`, not a data or action change.
 2. **One viewer dependency + a display-only client shape (M7-03).** The fullscreen viewer
    is `yet-another-react-lightbox` (v3.32.2 at research time; MIT; zero runtime
    dependencies; React 19 peer; ~31 KB gzipped for core + Zoom / Thumbnails / Slideshow,
