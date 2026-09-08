@@ -129,11 +129,11 @@ export default async function StorefrontLayout({
       <main className="flex-1">{children}</main>
 
       <footer className="border-t">
-        <div className="mx-auto w-full max-w-6xl px-6 py-12">
+        <div className="mx-auto w-full max-w-6xl px-4 py-12 md:px-6">
           <div className="grid grid-cols-1 gap-8 sm:grid-cols-[2fr_1fr_1fr]">
             <div className="flex flex-col gap-3">
               <StoreBrand tenantName={tenantName} />
-              <p className="text-muted-foreground max-w-xs text-sm leading-6">
+              <p className="text-muted-foreground max-w-xs text-sm leading-6 text-pretty">
                 Made to order by our print partner and shipped from the US.
               </p>
             </div>
