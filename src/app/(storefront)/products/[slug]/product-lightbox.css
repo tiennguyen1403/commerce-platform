@@ -1,0 +1,21 @@
+/*
+ * The viewer's one stylesheet of our own, imported by product-lightbox.tsx right
+ * after the library's sheets (so it ships in the viewer's chunk, never on a PDP
+ * that has not opened it). The library sets `outline: none` on every control and
+ * its only `:focus-visible` treatment is an 82% → 100% white colour step — not a
+ * visible focus indicator (docs/DESIGN.md). It declares no `box-shadow` on
+ * `.yarl__button`, so this rule needs no cascade-order tricks against its
+ * unlayered CSS (research Risk #6); the recipe is the thumbnails' own focus ring,
+ * with the tenant-hued `--ring` token the portal inherits.
+ */
+.yarl__button:focus-visible {
+  box-shadow:
+    0 0 0 2px oklch(0.145 0 0),
+    0 0 0 4px var(--ring);
+}
+
+/* Toolbar buttons are square boxes with no radius in the library; round the ring
+   corners the way every other storefront control is (`rounded-lg` = 10px). */
+.yarl__toolbar .yarl__button {
+  border-radius: 10px;
+}

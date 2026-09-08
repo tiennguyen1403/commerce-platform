@@ -88,9 +88,10 @@ re-deriving it per canvas.
   (cart/checkout), `max-w-3xl`/`2xl` (account), `max-w-lg` (confirmation). V11/V12 change
   padding and rhythm, not widths.
 - **Performance guardrail.** Exactly one `preload`ed LCP image per page (the PDP cover, the
-  first grid card); thumbnails and viewer slides lazy-load; the viewer's JS loads only on
-  the PDP, via `next/dynamic` from inside the client gallery (`ssr:false` is illegal from a
-  Server Component), and only when opened.
+  first grid card); rail thumbnails lazy-load; the viewer's slides (at most eight) load
+  together on open because its thumbnail strip needs them (amended while building #236);
+  the viewer's JS and CSS load only on the PDP, via `next/dynamic` from inside the client
+  gallery (`ssr:false` is illegal from a Server Component), and only when opened.
 
 ## In scope
 

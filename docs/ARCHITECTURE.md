@@ -389,8 +389,8 @@ of `FulfillmentNotConfiguredError`).
   (M7, #236) — the frozen PDP v2 canvas specifies pinch / scroll / double-click zoom,
   drag-to-pan, swipe, a slideshow and thumbnails; hand-rolling that is several hundred
   lines of the repo's least testable code, past `docs/DESIGN.md`'s restraint. The library
-  is MIT, has zero runtime dependencies and a React 19 peer range, weighs ~31 KB gzipped
-  (core + Zoom / Thumbnails / Slideshow) and loads in its own chunk via `next/dynamic`
+  is MIT, has zero runtime dependencies and a React 19 peer range, weighs ~21 KB gzipped as built
+  (19 KB JS + 2 KB CSS for core + Zoom / Thumbnails / Slideshow; research estimated 31) and loads in its own chunk via `next/dynamic`
   from _inside_ the client gallery, only once a shopper opens it — the PDP's initial
   JS/CSS and LCP path are unchanged (for calibration, M3 rejected Recharts at ~50 KB for
   two charts; this is smaller and buys more). It is token-friendly: everything is a
@@ -398,8 +398,8 @@ of `FulfillmentNotConfiguredError`).
   iframe, so the Stripe OKLCH→hex conversion trap does not apply), and its portal mounts
   inside `[data-tenant-theme]` so the tenant accent reaches it by inheritance while the
   library's own `inert` on the portal's siblings doubles as the focus trap (a small
-  document-level keydown handler adds Esc-from-anywhere and Tab wrap-around, which the
-  library scopes to its controller element only). Rejected:
+  document-level keydown handler adds Esc with focus on the portal root or `<body>` and
+  Tab wrap-around, both of which the library leaves to the browser). Rejected:
   PhotoSwipe 5 (vanilla — a wrapper plus imperative wiring), react-photo-view (no
   slideshow / thumbnails), lightGallery (GPLv3), shadcn `carousel` / Embla (solves only
   the mobile swipe, which a CSS scroll-snap track does with no JS). The on-page gallery

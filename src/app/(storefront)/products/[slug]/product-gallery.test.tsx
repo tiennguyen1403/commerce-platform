@@ -285,8 +285,10 @@ describe("ProductGallery", () => {
       const previous = screen.getByRole("button", { name: "Previous image" });
       const next = screen.getByRole("button", { name: "Next image" });
 
-      expect(previous).toBeDisabled();
-      expect(next).not.toBeDisabled();
+      // `aria-disabled` (not `disabled`): the arrow keeps keyboard focus when it
+      // reaches its end instead of dropping focus onto <body>.
+      expect(previous).toHaveAttribute("aria-disabled", "true");
+      expect(next).not.toHaveAttribute("aria-disabled");
 
       fireEvent.click(previous);
       expect(scrollToMock).not.toHaveBeenCalled();
@@ -295,8 +297,8 @@ describe("ProductGallery", () => {
       fireEvent.click(next);
       fireEvent.click(next);
       expect(screen.getByText("3 / 3")).toBeInTheDocument();
-      expect(next).toBeDisabled();
-      expect(previous).not.toBeDisabled();
+      expect(next).toHaveAttribute("aria-disabled", "true");
+      expect(previous).not.toHaveAttribute("aria-disabled");
       expect(scrollToMock).toHaveBeenCalledTimes(2);
 
       fireEvent.click(next);

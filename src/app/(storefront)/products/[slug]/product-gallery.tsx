@@ -48,7 +48,7 @@ const COVER_SIZES = "(min-width: 1200px) 644px, (min-width: 768px) 58vw, 100vw";
 const THUMB_SIZES = "(min-width: 1200px) 112px, 10vw";
 
 const overlayButton =
-  "bg-background/90 text-foreground ring-foreground/10 hover:bg-background focus-visible:ring-ring/50 inline-flex items-center justify-center rounded-full ring-1 backdrop-blur-sm transition-colors outline-none focus-visible:ring-3 disabled:pointer-events-none disabled:opacity-50";
+  "bg-background/90 text-foreground ring-foreground/10 hover:bg-background focus-visible:ring-ring/50 inline-flex items-center justify-center rounded-full ring-1 backdrop-blur-sm transition-colors outline-none focus-visible:ring-3 aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-background/90";
 
 function prefersReducedMotion() {
   return (
@@ -113,9 +113,12 @@ export function ProductGallery({
       setActive(next);
       const track = trackRef.current;
       if (!track) return;
-      targetRef.current = next;
+      const left = next * track.clientWidth;
+      // Already there (the viewer re-syncing on open, the active thumb tapped):
+      // no scroll event will follow, so don't arm a hold that nothing releases.
+      targetRef.current = Math.abs(track.scrollLeft - left) > 1 ? next : null;
       track.scrollTo({
-        left: next * track.clientWidth,
+        left,
         behavior: instant || prefersReducedMotion() ? "instant" : "smooth",
       });
     },
@@ -146,18 +149,21 @@ export function ProductGallery({
     const onScroll = () => {
       if (!frame) frame = requestAnimationFrame(sync);
     };
-    // A touch, drag or wheel takes control back from a programmatic scroll.
+    // A touch, drag, wheel or arrow key (Chrome makes the track keyboard-
+    // focusable) takes control back from a programmatic scroll.
     const release = () => {
       targetRef.current = null;
     };
     track.addEventListener("scroll", onScroll, { passive: true });
     track.addEventListener("pointerdown", release, { passive: true });
     track.addEventListener("wheel", release, { passive: true });
+    track.addEventListener("keydown", release, { passive: true });
     return () => {
       if (frame) cancelAnimationFrame(frame);
       track.removeEventListener("scroll", onScroll);
       track.removeEventListener("pointerdown", release);
       track.removeEventListener("wheel", release);
+      track.removeEventListener("keydown", release);
     };
   }, [count, many]);
 
@@ -237,11 +243,15 @@ export function ProductGallery({
 
         {many ? (
           <>
+            {/* `aria-disabled`, not `disabled`: an arrow that reaches its end
+                while focused must keep the focus rather than drop it on <body>. */}
             <button
               type="button"
               aria-label="Previous image"
-              disabled={active === 0}
-              onClick={() => goTo(active - 1)}
+              aria-disabled={active === 0 || undefined}
+              onClick={() => {
+                if (active > 0) goTo(active - 1);
+              }}
               className={cn(
                 overlayButton,
                 "absolute top-1/2 left-3 hidden size-9 -translate-y-1/2 md:inline-flex",
@@ -252,8 +262,10 @@ export function ProductGallery({
             <button
               type="button"
               aria-label="Next image"
-              disabled={active === count - 1}
-              onClick={() => goTo(active + 1)}
+              aria-disabled={active === count - 1 || undefined}
+              onClick={() => {
+                if (active < count - 1) goTo(active + 1);
+              }}
               className={cn(
                 overlayButton,
                 "absolute top-1/2 right-3 hidden size-9 -translate-y-1/2 md:inline-flex",
@@ -342,7 +354,7 @@ export function ProductGallery({
                     aria-hidden
                     className={cn(
                       "size-1.5 rounded-full transition-colors",
-                      isActive ? "bg-foreground" : "bg-foreground/25",
+                      isActive ? "bg-foreground" : "bg-foreground/45",
                     )}
                   />
                 </button>

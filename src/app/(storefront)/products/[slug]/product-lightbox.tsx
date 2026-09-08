@@ -9,6 +9,7 @@
 // `styles` slots, never with Tailwind classes on its nodes (research Risk #6).
 import "yet-another-react-lightbox/styles.css";
 import "yet-another-react-lightbox/plugins/thumbnails.css";
+import "./product-lightbox.css";
 
 import { useEffect, useRef, useState } from "react";
 import Lightbox, {
@@ -35,10 +36,11 @@ import { TENANT_THEME_SELECTOR } from "@/lib/theme";
 
 /**
  * A viewer slide: the plain `{ src, alt, width, height }` the library renders as
- * a bare `<img>`. Every stored product URL is root-relative and therefore already
- * on the PDP's `unoptimized` path (`isUnoptimizedImageSrc`), so the slides bypass
- * `next/image` on purpose — the library's Zoom plugin needs a real `<img>` it can
- * size from `width`/`height`, and there is no optimizer output to feed it anyway.
+ * a bare `<img>`. The slides bypass `next/image` on purpose: the Zoom plugin needs
+ * a real `<img>` it can size from `width`/`height`. A root-relative URL (seed,
+ * local mock) is already the PDP's `unoptimized` path (`isUnoptimizedImageSrc`);
+ * a Blob `https://` URL simply loads the original — which is what a zoomable
+ * fullscreen slide wants anyway.
  */
 export type ViewerSlide = Pick<SlideImage, "src" | "alt" | "width" | "height">;
 
@@ -100,10 +102,10 @@ const VIEWER_STYLES: SlotStyles = {
     "--yarl__thumbnails_thumbnail_active_border_color": INK,
     "--yarl__thumbnails_thumbnail_focus_box_shadow": `0 0 0 2px oklch(0.145 0 0), 0 0 0 4px var(--ring)`,
   },
-  // Reserve the toolbar band above the image and the caption band below it, so a
-  // tall photo never sits under the controls: the library subtracts the
-  // container's padding when it sizes slides.
-  container: { paddingTop: 48, paddingBottom: 32 },
+  // Reserve the toolbar band (40px buttons + 8px padding each side) above the
+  // image and the caption band below it, so a tall photo never sits under the
+  // controls: the library subtracts the container's padding when it sizes slides.
+  container: { paddingTop: 56, paddingBottom: 32 },
   navigationPrev: { ...NAV_BUTTON, left: 16 },
   navigationNext: { ...NAV_BUTTON, right: 16 },
 };
@@ -198,9 +200,10 @@ function ViewerHud({ zoom }: { zoom: number }) {
  * behind), focus moved into the viewer on open and restored on close, backdrop /
  * pull-down to close, arrows + keyboard + swipe, and a `prefers-reduced-motion`
  * gate on its fade, swipe and zoom animations. Two keyboard gaps are closed here
- * (see the effect below): its Escape handling listens on the controller element
- * only, and Tab pauses on `<body>` between the last control and the first. The
- * slideshow never autoplays; it only runs when the shopper presses Play.
+ * (see the effect below): Esc is dead while focus sits on the portal root or on
+ * `<body>` (where Tab lands between the last control and the first), and Tab does
+ * not wrap. The slideshow never autoplays; it only runs when the shopper presses
+ * Play.
  *
  * Tenant accent (#113 / Risk #4): the portal mounts *inside* the storefront's
  * `[data-tenant-theme]` wrapper (`portal.root`) rather than on `<body>`, so the
@@ -220,10 +223,10 @@ export default function ProductLightbox({
   // A single image needs no prev/next, thumbnails or slideshow — only zoom.
   const single = slides.length <= 1;
 
-  // Keyboard, document-wide while open. The library's own Escape handling
-  // listens on its controller element only, so a shopper who has tabbed onto a
-  // thumbnail (a sibling of the controller) — or past the last control onto
-  // `<body>` — would find Esc dead. So Esc closes from anywhere (the library's
+  // Keyboard, document-wide while open. The library's own Escape handling lives
+  // on the sensors of its controller and its thumbnails track, so a shopper whose
+  // focus has moved to the portal root or past the last control onto `<body>`
+  // would find Esc dead. So Esc closes from anywhere (the library's
   // `closeOnEscape` is off, keeping exactly one handler), and Tab / Shift+Tab
   // wrap inside the dialog instead of pausing on `<body>`, as the APG dialog
   // pattern asks. Only visible, enabled controls count (the thumbnail strip pads
@@ -250,17 +253,18 @@ export default function ProductLightbox({
           getComputedStyle(element).visibility !== "hidden",
       );
       if (controls.length === 0) return;
-      const first = controls[0];
-      const last = controls[controls.length - 1];
-      const current = document.activeElement;
-      const outside = !current || !root.contains(current);
+      // Focus on `<body>`, on the portal root or on the library's `tabIndex="-1"`
+      // controller (where it lands on open) is "outside" the ring of controls, so
+      // a first Shift+Tab reaches the last control instead of the browser chrome.
+      const position = controls.indexOf(document.activeElement as HTMLElement);
+      const outside = position === -1;
       if (
         event.shiftKey
-          ? outside || current === first
-          : outside || current === last
+          ? outside || position === 0
+          : outside || position === controls.length - 1
       ) {
         event.preventDefault();
-        (event.shiftKey ? last : first).focus();
+        (event.shiftKey ? controls[controls.length - 1] : controls[0]).focus();
       }
     };
     document.addEventListener("keydown", onKeyDown);
