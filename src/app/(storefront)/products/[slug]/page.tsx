@@ -80,10 +80,17 @@ export default async function ProductDetailPage({
             else the placeholder frame (image-less products stay fully server-rendered). */}
         {product.images.length > 0 ? (
           <ProductGallery
+            // Keyed by product so a client-side hop to another PDP remounts the
+            // gallery: its active-slide and viewer state must never carry over.
+            key={product.id}
             images={product.images.map((image) => ({
               id: image.id,
               url: image.url,
               altText: image.altText,
+              // Display-only intrinsic size for the viewer's slides (M7 GOAL.md
+              // → Exceptions 2); read from the same query, no widening.
+              width: image.width,
+              height: image.height,
             }))}
             productTitle={product.title}
           />

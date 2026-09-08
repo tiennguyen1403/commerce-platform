@@ -770,6 +770,12 @@ footer + drawer as shipped vs. the v2 pass). Tweak "Tenant accent" re-hues the b
 the `src/lib/theme.ts` recipe. Generator: session scratchpad `dl-v2/build.mjs`
 (session-scoped, like `pdp-v2/`).
 
+**PDP cover · crop vs letterbox canvas** (M7-03 / #236, `/design`, 2026-09-08):
+https://claude.ai/code/artifact/8184c42a-0349-4e6b-a140-5b4575805e27 — the built 4:5 cover
+(`object-cover`, recommended and shipped) beside the `object-contain` alternative, on four
+fixture aspect ratios (square, 4:5, landscape 3:2, portrait 2:3) with the exact trim / band
+percentages; decision note on the canvas.
+
 **Next 16.3.3 installed docs** (`node_modules/next/dist/docs/01-app/`):
 `03-api-reference/04-functions/not-found.md:80-122`;
 `03-api-reference/02-components/image.md:291-293,1404`;
