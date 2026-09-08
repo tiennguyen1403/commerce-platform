@@ -112,9 +112,15 @@ Twelve issues, ~one PR each, via `/design` (the user gates every screen on the r
    `/design` round.
 4. **M7-04 · PDP v2 — page layout** — the Direction A buy column (`7fr/5fr`, sticky on
    desktop via the cart's recipe), the V1 ladder, honest info rows, Details = the real
-   description, the mobile sticky bottom buy bar (`IntersectionObserver` reveal, `md:hidden`,
+   description, the mobile sticky bottom buy bar (`md:hidden`,
    `max(1rem, env(safe-area-inset-bottom))` padding), and the quantity stepper
-   (Exception 1).
+   (Exception 1). _As built (#237):_ the bar is revealed once the add-to-cart row has
+   scrolled above the viewport by a frame-throttled scroll listener, not the planned
+   `IntersectionObserver` — an observer misses a jump or fast fling that carries the row
+   across the viewport between frames — and it steps aside within its own height of the
+   document's end instead of relying on a spacer, which cannot protect a footer that sits
+   after `<main>`; it is never mounted at `md` and up, so no second "Add to cart" exists at
+   the E2E viewport.
 5. **M7-05 · Product listing v2** (card stays square; skeleton mirrors the new header).
 6. **M7-06 · Search results v2.**
 7. **M7-07 · Cart v2.**
@@ -162,7 +168,10 @@ here if building forces a change._
    (`qty` int 1–`MAX_CART_QTY` = 99, default 1) — no Server Action, schema, or service
    change. "Add" is an increment and the service clamps to live stock, so the stepper caps
    at `min(available, 99)`. The default still adds one unit, so `checkout.spec.ts`'s "Add to
-   cart" flow is byte-identical.
+   cart" flow is byte-identical. _Amended while building #237:_ `PurchasePanel` also gains a
+   display-only `productTitle` prop (the mobile buy bar names the product; the page already
+   holds the title, so no new read) — a client prop-shape growth of the same kind as
+   Exception 2's `GalleryImage`, not a data or action change.
 2. **One viewer dependency + a display-only client shape (M7-03).** The fullscreen viewer
    is `yet-another-react-lightbox` (v3.32.2 at research time; MIT; zero runtime
    dependencies; React 19 peer; ~31 KB gzipped for core + Zoom / Thumbnails / Slideshow,
