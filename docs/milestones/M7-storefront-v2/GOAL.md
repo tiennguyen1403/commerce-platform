@@ -169,9 +169,10 @@ here if building forces a change._
    specifies pinch/scroll/double-click zoom, drag-to-pan, swipe, slideshow and thumbnails —
    several hundred lines of the least testable code in the repo to hand-roll — and it is
    token-friendly (`--yarl__*` custom properties take our native `oklch()` values; it is not
-   an iframe, unlike Stripe). It is the **only** `package.json` change of the milestone and
-   gets a `docs/ARCHITECTURE.md` §9 decision-log entry. Alongside it, the gallery's own
-   client image shape (`GalleryImage`, `product-gallery.tsx`) gains display-only `width` /
+   an iframe, unlike Stripe). It is the **only** dependency added in the milestone
+   (Dependabot minor / patch bumps excepted) and gets a `docs/ARCHITECTURE.md` §9
+   decision-log entry. Alongside it, the gallery's own client image shape
+   (`GalleryImage`, `product-gallery.tsx`) gains display-only `width` /
    `height` (already stored on `ProductImage`) for the viewer's slides — a client prop-shape
    growth, not a query change.
 3. **Shared `SectionPanel` (M7-08).** A pure refactor of three near-identical local copies
@@ -208,7 +209,8 @@ _Finalized at `/milestone-start`. Adjust only with a note here if building force
       (Payment Element theming, Risk #3); the viewer verified on a themed (non-162-hue)
       tenant so the accent reaches the portal.
 - [ ] **Dependencies:** only the viewer library (Exception 2), with its decision-log entry;
-      no other `package.json` / `pnpm-lock.yaml` diff; primitives added only on demand;
+      no other dependency **added** — Dependabot minor / patch bumps excepted (softened at
+      M7-01, 2026-09-08: they are not milestone work); primitives added only on demand;
       every new body-portal overlay reaches the tenant accent.
 - [ ] **Posture unchanged:** `force-dynamic` on every tenant/DB-reading page; no route-level
       `loading.tsx` under `/products/[slug]` or `/account/orders/[id]`; exactly one
@@ -232,6 +234,22 @@ _Finalized at `/milestone-start`. Adjust only with a note here if building force
   renders inside it, and the frozen canvas assumes today's chrome); the PDP first among
   screens (it sets the bar); the three panel screens last, after their shared shell is
   extracted; auth last as in M6 (shared-form blast radius).
+- **Chrome decision (M7-01, 2026-09-08):** the shared chrome does **not** change structurally
+  in M7 — the header stays static (not sticky, not translucent), so every sticky offset
+  (cart / checkout `lg:top-6`, the canvas's PDP buy box at `top-6`) and the frozen PDP canvas
+  stay valid, and M7-03 starts immediately. Rationale (canvas page "Chrome decision"):
+  neither v2 surface is sticky; the PDP's own sticky buy box + mobile buy bar already keep
+  commerce controls in reach; any sticky header would move every offset together
+  (`top-[calc(57px+1.5rem)]`) and pin 53px of every phone screen on top of the 73px buy bar,
+  and a scroll-reactive one (B / C: shadow on scroll, blur) would also cost a client island in
+  the shell on every page. M7-02 therefore becomes a **late consistency check** (with M7-12):
+  the footer moves to V11 `px-4 md:px-6` and gets `text-pretty` on its tagline; the drawer is
+  unchanged. Also settled there: V11 padding and V12 rhythm are adopted storefront-wide, the
+  V9 elevation policy is two levels (`shadow-sm` hover lift, `shadow-lg` free-floating; a
+  border on edge-anchored bars), and V10 cards stay square — all recorded in
+  `docs/DESIGN.md` → "Storefront idioms (v2)". The frozen PDP canvas was drawn at `py-10 px-6`
+  on desktop and mobile; the build applies V11 / V12 (`px-4 md:px-6`, `py-12 lg:py-16`) — a
+  frame delta, not a structural change.
 - **Versions:** the brief was verified against the installed tree (Next 16.3.3, React
   19.2.8, Base UI 1.7.0, Tailwind 4.3.3, Playwright 1.62.1). Dependabot PR #228 (Next
   16.3.4, lucide 1.40, …) is open; if it merges first, re-check the version-bound claims in
