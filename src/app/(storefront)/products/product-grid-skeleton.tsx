@@ -17,16 +17,19 @@ export function ProductGridSkeleton() {
       <div className="border-border flex items-center justify-between border-b pb-4 text-sm">
         <Skeleton className="h-5 w-24" />
       </div>
-      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
+      {/* Mirrors the grid and the card v2 anatomy (product-card.tsx): a square
+          well, then title / price / meta at their line heights. */}
+      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3 lg:gap-6">
         {Array.from({ length: 6 }).map((_, i) => (
           <div
             key={i}
             className="ring-foreground/10 overflow-hidden rounded-xl ring-1"
           >
             <Skeleton className="aspect-square rounded-none" />
-            <div className="flex flex-col gap-2 p-4">
-              <Skeleton className="h-5 w-3/4" />
-              <Skeleton className="h-4 w-1/3" />
+            <div className="flex flex-col gap-1 p-4">
+              <Skeleton className="h-6 w-3/4" />
+              <Skeleton className="h-5 w-1/4" />
+              <Skeleton className="h-5 w-1/2" />
             </div>
           </div>
         ))}
