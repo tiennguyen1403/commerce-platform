@@ -24,14 +24,15 @@ export type CardImage = {
   altText: string | null;
 };
 
-// A card fills one grid column: a third of the 1152px container at `lg` (355px
-// once the gutters and gaps are taken), half at `sm`, the full width below.
+// A card fills one grid column: a third of the 1152px container at `lg` (352px
+// once the 24px gutters and two 24px gaps are taken), half at `sm`, the full
+// width below.
 const CARD_SIZES =
-  "(min-width: 1200px) 355px, (min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw";
+  "(min-width: 1200px) 352px, (min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw";
 
 // The PDP gallery's overlay-control recipe (product-gallery.tsx), sized for a card.
 const overlayButton =
-  "bg-background/90 text-foreground ring-foreground/10 hover:bg-background focus-visible:ring-ring/50 pointer-events-auto absolute top-1/2 inline-flex size-8 -translate-y-1/2 items-center justify-center rounded-full ring-1 backdrop-blur-sm transition-colors outline-none focus-visible:ring-3 aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-background/90";
+  "bg-background/90 text-foreground ring-foreground/10 hover:bg-background focus-visible:ring-ring/50 absolute top-1/2 inline-flex size-8 -translate-y-1/2 items-center justify-center rounded-full ring-1 backdrop-blur-sm transition-colors outline-none focus-visible:ring-3 aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-background/90";
 
 function prefersReducedMotion() {
   return (
@@ -51,7 +52,10 @@ function prefersReducedMotion() {
  * fine pointers — `pointer-coarse:hidden`, so a phone never gets an invisible
  * button between a tap and the link. Interactive controls are invalid inside an
  * `<a>`, so the arrows, the dots and the live-region counter sit *beside* the
- * link as siblings in an overlay that mirrors the square well.
+ * link as siblings in an overlay that mirrors the square well. The dots are
+ * real "Show image N" buttons (the touch / assistive-tech path, as on the PDP)
+ * but `tabIndex={-1}`: eight of them on each of a dozen cards would bury the
+ * grid in tab stops, and the arrows already cover the keyboard.
  *
  * Only the active slide is exposed to assistive tech (`aria-hidden` on the
  * rest, per the APG carousel pattern): every slide's alt falls back to the
@@ -82,15 +86,20 @@ export function ProductCardMedia({
   const count = images.length;
   const many = count > 1;
   const [active, setActive] = useState(0);
+  // Rendered index: `active` clamped to the current image list, so an image
+  // list that shrinks while the card stays mounted (a Server Action re-render
+  // after an admin removed a photo — the grid keys cards by product id) can't
+  // leave every slide `aria-hidden` with no dot lit until the next interaction.
+  const current = Math.min(active, Math.max(0, count - 1));
 
   const trackRef = useRef<HTMLDivElement>(null);
   // The slide a programmatic scroll is travelling to, or `null` while the shopper
   // is in control of the track (a swipe, a drag, the wheel).
   const targetRef = useRef<number | null>(null);
-  const activeRef = useRef(0);
+  const currentRef = useRef(0);
   useEffect(() => {
-    activeRef.current = active;
-  }, [active]);
+    currentRef.current = current;
+  }, [current]);
 
   /** Show slide `index` by scrolling the track to it. Finite: the arrows disable
    *  at either end instead of wrapping, like the PDP gallery. */
@@ -158,7 +167,7 @@ export function ProductCardMedia({
     if (!track || !many || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       track.scrollTo({
-        left: activeRef.current * track.clientWidth,
+        left: currentRef.current * track.clientWidth,
         behavior: "instant",
       });
     });
@@ -194,7 +203,7 @@ export function ProductCardMedia({
               {images.map((image, index) => (
                 <div
                   key={image.id}
-                  aria-hidden={index === active ? undefined : true}
+                  aria-hidden={index === current ? undefined : true}
                   className="relative h-full w-full shrink-0 snap-start"
                 >
                   <ProductImageFrame
@@ -218,26 +227,28 @@ export function ProductCardMedia({
 
       {many ? (
         // Mirrors the square well; clicks fall through to the link everywhere
-        // but on the arrows.
+        // but on the controls.
         <div
           role="group"
           aria-label={`${productTitle} images`}
           className="pointer-events-none absolute inset-x-0 top-0 aspect-square"
         >
           <span className="sr-only" aria-live="polite" aria-atomic="true">
-            Image {active + 1} of {count}
+            Image {current + 1} of {count}
           </span>
           {/* `aria-disabled`, not `disabled`: an arrow that reaches its end while
               focused must keep the focus rather than drop it on <body>. The
-              reveal opacity sits on this wrapper so it can't fight the arrows'
-              own `aria-disabled:opacity-50`. */}
-          <div className="opacity-0 group-focus-within/media:opacity-100 group-hover/media:opacity-100 motion-safe:transition-opacity pointer-coarse:hidden">
+              reveal — opacity AND pointer events — sits on this wrapper so an
+              invisible arrow can never take a click meant for the link (a fine
+              pointer with no hover) and so it can't fight the arrows' own
+              `aria-disabled:opacity-50`. */}
+          <div className="opacity-0 group-focus-within/media:pointer-events-auto group-focus-within/media:opacity-100 group-hover/media:pointer-events-auto group-hover/media:opacity-100 motion-safe:transition-opacity pointer-coarse:hidden">
             <button
               type="button"
               aria-label="Previous image"
-              aria-disabled={active === 0 || undefined}
+              aria-disabled={current === 0 || undefined}
               onClick={() => {
-                if (active > 0) goTo(active - 1);
+                if (current > 0) goTo(current - 1);
               }}
               className={cn(overlayButton, "left-3")}
             >
@@ -246,30 +257,41 @@ export function ProductCardMedia({
             <button
               type="button"
               aria-label="Next image"
-              aria-disabled={active === count - 1 || undefined}
+              aria-disabled={current === count - 1 || undefined}
               onClick={() => {
-                if (active < count - 1) goTo(active + 1);
+                if (current < count - 1) goTo(current + 1);
               }}
               className={cn(overlayButton, "right-3")}
             >
               <ChevronRight className="size-4" aria-hidden />
             </button>
           </div>
-          {/* Dots: one per image, decorative (the live region above carries the
-              same fact); on a pill so they read on any photo, light or dark. */}
-          <div
-            aria-hidden
-            className="bg-background/90 ring-foreground/10 absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full px-2 py-1.5 ring-1 backdrop-blur-sm"
-          >
-            {images.map((image, index) => (
-              <span
-                key={image.id}
-                className={cn(
-                  "size-1.5 rounded-full transition-colors",
-                  index === active ? "bg-foreground" : "bg-foreground/35",
-                )}
-              />
-            ))}
+          {/* Dots: one per image, on a pill so they read on any photo, light or
+              dark — the same "Show image N" controls as the PDP's dots, out of
+              the tab order (see the component note). */}
+          <div className="bg-background/90 ring-foreground/10 pointer-events-auto absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center rounded-full px-1 ring-1 backdrop-blur-sm">
+            {images.map((image, index) => {
+              const isActive = index === current;
+              return (
+                <button
+                  key={image.id}
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={`Show image ${index + 1}`}
+                  aria-current={isActive ? "true" : undefined}
+                  onClick={() => goTo(index)}
+                  className="focus-visible:ring-ring/50 flex size-5 items-center justify-center rounded-full outline-none focus-visible:ring-3"
+                >
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "size-1.5 rounded-full transition-colors",
+                      isActive ? "bg-foreground" : "bg-foreground/35",
+                    )}
+                  />
+                </button>
+              );
+            })}
           </div>
         </div>
       ) : null}

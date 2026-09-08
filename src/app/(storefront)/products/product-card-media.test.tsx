@@ -401,4 +401,107 @@ describe("ProductCardMedia", () => {
       ).toBeInTheDocument();
     });
   });
+
+  describe("dots", () => {
+    it('renders one "Show image N" control per image outside the link and out of the tab order; the active one is aria-current; a click jumps straight to that slide', () => {
+      render(
+        <ProductCardMedia
+          href="/products/tee"
+          images={threeImages}
+          productTitle={THREE_IMAGES_TITLE}
+        >
+          <h2>Card body</h2>
+        </ProductCardMedia>,
+      );
+
+      const link = screen.getByRole("link");
+      const dots = [1, 2, 3].map((n) =>
+        screen.getByRole("button", { name: `Show image ${n}` }),
+      );
+      for (const dot of dots) {
+        expect(link).not.toContainElement(dot);
+        // The arrows are the keyboard path; the dots stay reachable by touch and
+        // assistive tech without adding a tab stop per image per card.
+        expect(dot).toHaveAttribute("tabindex", "-1");
+      }
+      expect(dots[0]).toHaveAttribute("aria-current", "true");
+      expect(dots[1]).not.toHaveAttribute("aria-current");
+      expect(dots[2]).not.toHaveAttribute("aria-current");
+
+      fireEvent.click(dots[2]);
+
+      expect(screen.getByText("Image 3 of 3")).toBeInTheDocument();
+      expect(dots[2]).toHaveAttribute("aria-current", "true");
+      expect(dots[0]).not.toHaveAttribute("aria-current");
+      // Slide 3 has no altText, so its exposed image is named by the title.
+      expect(
+        screen.getByRole("img", { name: THREE_IMAGES_TITLE }),
+      ).toBeInTheDocument();
+      expect(screen.getAllByRole("img")).toHaveLength(1);
+      expect(scrollToMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("a shrinking image list", () => {
+    it("clamps the active slide when images are removed while mounted, so one image stays exposed and the controls stay consistent", () => {
+      const { rerender } = render(
+        <ProductCardMedia
+          href="/products/tee"
+          images={threeImages}
+          productTitle={THREE_IMAGES_TITLE}
+        >
+          <h2>Card body</h2>
+        </ProductCardMedia>,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Next image" }));
+      fireEvent.click(screen.getByRole("button", { name: "Next image" }));
+      expect(screen.getByText("Image 3 of 3")).toBeInTheDocument();
+
+      // A Server Action re-render after an admin removed the last photo: the
+      // grid keys cards by product id, so this instance stays mounted with a
+      // shorter list. The stale index 2 must clamp to the new last slide (1).
+      rerender(
+        <ProductCardMedia
+          href="/products/tee"
+          images={threeImages.slice(0, 2)}
+          productTitle={THREE_IMAGES_TITLE}
+        >
+          <h2>Card body</h2>
+        </ProductCardMedia>,
+      );
+
+      expect(screen.getByText("Image 2 of 2")).toBeInTheDocument();
+      expect(
+        screen.getByRole("img", { name: "Back view" }),
+      ).toBeInTheDocument();
+      expect(screen.getAllByRole("img")).toHaveLength(1);
+      expect(
+        screen.getByRole("button", { name: "Show image 2" }),
+      ).toHaveAttribute("aria-current", "true");
+      expect(
+        screen.getByRole("button", { name: "Next image" }),
+      ).toHaveAttribute("aria-disabled", "true");
+
+      // Down to a single image: no controls at all, the one image exposed.
+      rerender(
+        <ProductCardMedia
+          href="/products/tee"
+          images={threeImages.slice(0, 1)}
+          productTitle={THREE_IMAGES_TITLE}
+        >
+          <h2>Card body</h2>
+        </ProductCardMedia>,
+      );
+
+      expect(
+        screen.getByRole("img", { name: "Front view" }),
+      ).toBeInTheDocument();
+      expect(screen.getAllByRole("img")).toHaveLength(1);
+      expect(
+        screen.queryByRole("button", { name: "Next image" }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(/^Image \d+ of \d+$/)).not.toBeInTheDocument();
+    });
+  });
 });
