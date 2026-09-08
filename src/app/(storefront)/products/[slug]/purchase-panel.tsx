@@ -35,6 +35,10 @@ const BELOW_MD = "not all and (min-width: 48rem)";
 const stepperButton =
   "relative h-full w-10 rounded-none px-0 focus-visible:z-10 aria-disabled:pointer-events-none aria-disabled:opacity-50";
 
+// The CTAs while an add is in flight: `focusableWhenDisabled` again, so the
+// same `aria-disabled` dimming as the stepper.
+const ctaPending = "aria-disabled:pointer-events-none aria-disabled:opacity-50";
+
 /**
  * PDP purchase controls: pick a variant, see its live price and stock, choose a
  * quantity and add it to the cookie-backed cart via the `addToCart` Server
@@ -273,12 +277,16 @@ export function PurchasePanel({
               <Plus />
             </Button>
           </div>
+          {/* Pending keeps the focus (`aria-disabled`, like the stepper) so the
+              status line lands next to it; sold out is a real `disabled` — a
+              permanently dead control should not be a tab stop. */}
           <Button
             type="button"
             size="lg"
             disabled={soldOut || isPending}
+            focusableWhenDisabled={!soldOut}
             onClick={addToCart}
-            className="h-12 flex-1 text-[15px] font-semibold"
+            className={cn("h-12 flex-1 text-[15px] font-semibold", ctaPending)}
           >
             {ctaIcon}
             {ctaLabel}
@@ -309,6 +317,10 @@ export function PurchasePanel({
         ) : null}
       </div>
 
+      {/* Mounted on reveal and unmounted on hide (see the effect): a shopper who
+          tabbed into the bar and then scrolls the row back into view loses that
+          focus to <body> — the price of keeping a hidden second "Add to cart"
+          out of the accessibility tree. */}
       {barVisible && !soldOut ? (
         <div
           className={cn(
@@ -345,7 +357,7 @@ export function PurchasePanel({
                   </Link>
                 </span>
               ) : status === "error" ? (
-                <span className="text-destructive truncate text-xs">
+                <span className="text-destructive text-xs">
                   Couldn&apos;t add to cart. Please try again.
                 </span>
               ) : (
@@ -358,8 +370,12 @@ export function PurchasePanel({
             <Button
               type="button"
               disabled={isPending}
+              focusableWhenDisabled
               onClick={addToCart}
-              className="h-11 shrink-0 px-4 text-[15px] font-semibold"
+              className={cn(
+                "h-11 shrink-0 px-4 text-[15px] font-semibold",
+                ctaPending,
+              )}
             >
               {ctaIcon}
               {ctaLabel}

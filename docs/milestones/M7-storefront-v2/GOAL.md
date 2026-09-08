@@ -112,9 +112,15 @@ Twelve issues, ~one PR each, via `/design` (the user gates every screen on the r
    `/design` round.
 4. **M7-04 · PDP v2 — page layout** — the Direction A buy column (`7fr/5fr`, sticky on
    desktop via the cart's recipe), the V1 ladder, honest info rows, Details = the real
-   description, the mobile sticky bottom buy bar (`IntersectionObserver` reveal, `md:hidden`,
+   description, the mobile sticky bottom buy bar (`md:hidden`,
    `max(1rem, env(safe-area-inset-bottom))` padding), and the quantity stepper
-   (Exception 1).
+   (Exception 1). _As built (#237):_ the bar is revealed once the add-to-cart row has
+   scrolled above the viewport by a frame-throttled scroll listener, not the planned
+   `IntersectionObserver` — an observer misses a jump or fast fling that carries the row
+   across the viewport between frames — and it steps aside within its own height of the
+   document's end instead of relying on a spacer, which cannot protect a footer that sits
+   after `<main>`; it is never mounted at `md` and up, so no second "Add to cart" exists at
+   the E2E viewport.
 5. **M7-05 · Product listing v2** (card stays square; skeleton mirrors the new header).
 6. **M7-06 · Search results v2.**
 7. **M7-07 · Cart v2.**
