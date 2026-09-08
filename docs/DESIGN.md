@@ -102,8 +102,9 @@ items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium` with a
 justify-center rounded-lg` + a `size-5` icon; on the tint invert to
   `bg-card ring-foreground/10 ring-1`. One per panel header.
 - **V9 · Elevation** — two levels for storefront-authored surfaces:
-  `group-hover:shadow-sm motion-safe:group-hover:-translate-y-0.5` (the product-card hover
-  lift) and `ring-foreground/10 shadow-lg ring-1` on a free-floating surface (menus, the
+  `hover:shadow-sm motion-safe:hover:-translate-y-0.5` (the product-card hover lift — on
+  the `Card` itself since M7-05, whose controls sit beside the link) and
+  `ring-foreground/10 shadow-lg ring-1` on a free-floating surface (menus, the
   viewer chrome, a window on a stage). An edge-anchored bar (the `Sheet`, the mobile buy
   bar) carries a border on its anchored edge instead of a downward shadow — the buy bar adds
   `bg-background/95` + `backdrop-blur` while content scrolls beneath it. In-flow cards,

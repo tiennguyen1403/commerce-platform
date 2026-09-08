@@ -192,6 +192,13 @@ here if building forces a change._
    `src/components/ui/section-panel.tsx`, server-safe, with an `idPrefix`; no visual or data
    change on its own — unless M7-01 changed the panel shell, in which case the new shell is
    applied there once and said so in the PR.
+4. **Listing card media island (M7-05).** _Added while building #238._ The product card's
+   mini slider needs client state (the active slide, `aria-hidden` on the rest), so the card's
+   image well + link became `ProductCardMedia`, a `"use client"` island fed a display-only
+   `CardImage` `{ id, url, altText }[]` shape (the `GalleryImage` idea without the viewer's
+   size) and the server-rendered card body as children; `ProductCard` itself stays a Server
+   Component and its props are unchanged. The same kind of client prop-shape growth as
+   Exceptions 1–2 — read from the rows the listing query already loads, no query widened.
 
 ## Exit criteria
 
