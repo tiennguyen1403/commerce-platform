@@ -761,6 +761,15 @@ gallery-B note at `:185` and the mobile note at `:177`; `build.mjs` — `buyColu
 `stickyBar` at `:487`, `galleryMobile` at `:309`, the related-products card at `:466`;
 `final.part.mjs:6-31` (gallery B) and `:44-96` (the viewer).
 
+**Design language v2 canvas** (M7-01 / #234, `/design`, 2026-09-08):
+https://claude.ai/code/artifact/63fc0585-32f2-4bd7-a002-f713f770d8bc — page "Vocabulary ·
+V1–V14" (light + dark boards of V1–V14 with specimens, verbatim recipes and file:line
+sources; the M6 idioms; the four answers), page "Chrome decision" (A static header as shipped
+/ B sticky solid / C sticky translucent, each scrolled 320px; the mobile viewport budget;
+footer + drawer as shipped vs. the v2 pass). Tweak "Tenant accent" re-hues the boards with
+the `src/lib/theme.ts` recipe. Generator: session scratchpad `dl-v2/build.mjs`
+(session-scoped, like `pdp-v2/`).
+
 **Next 16.3.3 installed docs** (`node_modules/next/dist/docs/01-app/`):
 `03-api-reference/04-functions/not-found.md:80-122`;
 `03-api-reference/02-components/image.md:291-293,1404`;
