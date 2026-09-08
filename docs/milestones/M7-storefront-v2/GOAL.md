@@ -164,8 +164,10 @@ here if building forces a change._
    cart" flow is byte-identical.
 2. **One viewer dependency + a display-only client shape (M7-03).** The fullscreen viewer
    is `yet-another-react-lightbox` (v3.32.2 at research time; MIT; zero runtime
-   dependencies; React 19 peer; ~31 KB gzipped for core + Zoom / Thumbnails / Slideshow /
-   Counter, deferred with `next/dynamic`). Why a dependency at all: the frozen canvas
+   dependencies; React 19 peer; ~31 KB gzipped for core + Zoom / Thumbnails / Slideshow,
+   deferred with `next/dynamic`; the `k / N` counter is drawn by the viewer's own HUD so
+   the zoom-level pill can sit beside it, in place of the Counter plugin — amended while
+   building #236). Why a dependency at all: the frozen canvas
    specifies pinch/scroll/double-click zoom, drag-to-pan, swipe, slideshow and thumbnails —
    several hundred lines of the least testable code in the repo to hand-roll — and it is
    token-friendly (`--yarl__*` custom properties take our native `oklch()` values; it is not
@@ -250,6 +252,9 @@ _Finalized at `/milestone-start`. Adjust only with a note here if building force
   `docs/DESIGN.md` → "Storefront idioms (v2)". The frozen PDP canvas was drawn at `py-10 px-6`
   on desktop and mobile; the build applies V11 / V12 (`px-4 md:px-6`, `py-12 lg:py-16`) — a
   frame delta, not a structural change.
+- **Cover fit decision (M7-03, 2026-09-08):** the 4:5 cover **crops** (`object-cover`), the
+  viewer shows the whole photo — recorded in `docs/DESIGN.md` → V10; the crop-vs-letterbox
+  canvas is linked from `research.md` → References.
 - **Versions:** the brief was verified against the installed tree (Next 16.3.3, React
   19.2.8, Base UI 1.7.0, Tailwind 4.3.3, Playwright 1.62.1). Dependabot PR #228 (Next
   16.3.4, lucide 1.40, …) is open; if it merges first, re-check the version-bound claims in

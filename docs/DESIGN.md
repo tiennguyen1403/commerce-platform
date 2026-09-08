@@ -110,7 +110,10 @@ justify-center rounded-lg` + a `size-5` icon; on the tint invert to
   panels, tables, forms and the sticky buy box stay flat rings; no `shadow-xl` / `2xl`, no
   colored glows; shadcn primitives keep their own defaults.
 - **V10 · Image aspect** — cards, rail thumbs and cart / checkout thumbnails stay square; only
-  the PDP cover is 4:5.
+  the PDP cover is 4:5. Every frame **crops** (`object-cover`, centred) rather than
+  letterboxing on the muted well — decided for the cover at M7-03 (#236, 2026-09-08): the
+  catalog's photography is square by default (Printful mockups, the seed), a 10% side trim
+  is invisible on a centred garment, and the fullscreen viewer shows every photo whole.
 - **V11 · Container padding** — `px-4 md:px-6` on every page container and the footer; the
   width-by-density containers (`max-w-6xl` listing / PDP / search, `5xl` cart / checkout,
   `3xl` orders, `2xl` account home, `lg` confirmation) do not change.
